@@ -20,10 +20,13 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import pickle
+import shutil
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from pprint import pprint
 from typing import Optional
 
@@ -36,7 +39,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.experimental.dataset.sampler import AbstractBatchSampler, AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -44,12 +47,19 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    compute_agent_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    process_vsearch_validation_metrics,
 )
-from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.reward import (
+    compute_reward,
+    compute_reward_async,
+    compute_reward_async_thread,
+    get_async_reward_thread,
+)
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -239,6 +249,49 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+        subagent_advantage_estimator = config.get("subagent_advantage_estimator")
+        if not subagent_advantage_estimator:
+            return data
+
+        adv_new = data.batch["advantages"].clone()
+        job_id_arr = data.non_tensor_batch["job_id"]
+        root_job_id_arr = data.non_tensor_batch["root_job_id"]
+        jobid_to_idx = {jid: idx for idx, jid in enumerate(job_id_arr)}
+
+        if "broadcast" in subagent_advantage_estimator:
+            # Replace the advantages and returns of subagent jobs by those of their root jobs
+            # For each sample, if job_id != root_job_id, replace its adv/ret with those of its root
+            for idx, (jid, rjid) in enumerate(zip(job_id_arr, root_job_id_arr, strict=False)):
+                if jid != rjid:
+                    root_idx = jobid_to_idx[rjid]
+                    adv_new[idx] = advantages[root_idx]
+                    if subagent_advantage_estimator == "broadcast_tool_only":
+                        adv_new[idx] *= data.non_tensor_batch["tool_reward"][idx]
+                        
+        elif "global_norm" in subagent_advantage_estimator:
+            # For subagents, the iou_reward has been updated with pseudo_iou_reward in compute_score_batch
+            # based on caller_feedback and root's accuracy_reward. Here we just use it for advantage estimation.
+            rewards = []
+            for idx, (jid, rjid) in enumerate(zip(job_id_arr, root_job_id_arr, strict=False)):
+                # Only process subagents (where job_id != root_job_id)
+                if jid != rjid:
+                    reward = data.batch["token_level_scores"][idx].sum().item()
+                    rewards.append((idx, reward))
+            if "no_global_norm" in config.subagent_advantage_estimator:
+                for idx, reward in rewards:
+                    adv_new[idx] = reward
+            else:
+                reward_mean = np.mean([reward for _, reward in rewards])
+                reward_std = np.std([reward for _, reward in rewards])
+                for idx, reward in rewards:
+                    adv_new[idx] = (reward - reward_mean) / (reward_std + 1e-6)
+        else:
+            raise ValueError(f"Invalid subagent advantage estimator type: {config.subagent_advantage_estimator}")
+
+        data.batch["advantages"] = adv_new
+        data.batch["returns"] = adv_new
+
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -366,14 +419,22 @@ class RayPPOTrainer:
 
         num_workers = self.config.data["dataloader_num_workers"]
 
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=num_workers,
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=train_sampler,
-        )
+        if isinstance(train_sampler, AbstractBatchSampler):
+            self.train_dataloader = StatefulDataLoader(
+                dataset=self.train_dataset,
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+                batch_sampler=train_sampler,
+            )
+        else:
+            self.train_dataloader = StatefulDataLoader(
+                dataset=self.train_dataset,
+                batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+                num_workers=num_workers,
+                drop_last=True,
+                collate_fn=collate_fn,
+                sampler=train_sampler,
+            )
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
@@ -441,6 +502,70 @@ class RayPPOTrainer:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _dump_batch_sample(self, batch, dump_dir, num_groups=5, packet_id=None):
+        if num_groups is None:
+            selected_batch = batch
+        else:
+            # Get the root job indexes
+            if "parent_job_id" in batch.non_tensor_batch:
+                root_job_idxs = (batch.non_tensor_batch["parent_job_id"] == None).nonzero()[0]  # noqa: E711
+            else:
+                root_job_idxs = np.arange(len(batch))
+
+            # Group the root jobs by uid
+            root_job_idxs_by_uid = defaultdict(list)
+            for idx in root_job_idxs:
+                root_job_idxs_by_uid[batch.non_tensor_batch["uid"][idx]].append(idx)
+
+            # Randomly select at most num_groups
+            rng = np.random.default_rng(42)
+            uids = list(root_job_idxs_by_uid.keys())
+            selected_uids = rng.choice(uids, min(num_groups, len(uids)), replace=False)
+
+            # For each selected group, select the top, middle, and bottom jobs sorted by reward scores (if given)
+            if "token_level_scores" in batch.batch:
+                scores = batch.batch["token_level_scores"].sum(dim=-1).cpu().numpy()
+                selected_idxs = []
+                for uid in selected_uids:
+                    idxs = root_job_idxs_by_uid[uid]
+                    idxs_argsort = np.argsort(scores[idxs])
+                    selected_idxs.extend([idxs[idxs_argsort[i]] for i in [-1, len(idxs) // 2, 0]])
+            else:
+                selected_idxs = []
+                for uid in selected_uids:
+                    idxs = root_job_idxs_by_uid[uid]
+                    selected_idxs.extend([idxs[i] for i in [-1, len(idxs) // 2, 0]])
+
+            # Get the extra jobs derived from the selected jobs
+            if "parent_job_id" in batch.non_tensor_batch:
+                selected_root_job_ids = batch.non_tensor_batch["job_id"][selected_idxs]
+                selected_extra_job_idxs = []
+                for idx in range(len(batch)):
+                    if batch.non_tensor_batch["parent_job_id"][idx] is None:
+                        continue
+                    if batch.non_tensor_batch["root_job_id"][idx] in selected_root_job_ids:
+                        selected_extra_job_idxs.append(idx)
+                selected_idxs.extend(selected_extra_job_idxs)
+
+            selected_batch = batch.select_idxs(selected_idxs)
+
+        # pop pixel_values (if any) to save disk space
+        if "multi_modal_inputs" in selected_batch.non_tensor_batch:
+            for mm_inputs in selected_batch.non_tensor_batch["multi_modal_inputs"]:
+                if isinstance(mm_inputs, dict) and "pixel_values" in mm_inputs:
+                    mm_inputs.pop("pixel_values", None)
+
+        if packet_id is not None:
+            dump_dir = Path(dump_dir, f"global_step_{self.global_steps}")
+            dump_path = Path(dump_dir, f"packet_{packet_id}.pickle")
+        else:
+            dump_dir = Path(dump_dir)
+            dump_path = Path(dump_dir, f"global_step_{self.global_steps}.pickle")
+
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        with dump_path.open("wb") as f:
+            pickle.dump(selected_batch, f)
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -515,7 +640,7 @@ class RayPPOTrainer:
 
         return gen_batch
 
-    def _validate(self):
+    def _validate(self, val_trial_idx: int = 0):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -527,7 +652,9 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
 
-        for test_data in self.val_dataloader:
+        packets_count_by_data_source = defaultdict(int)
+
+        for test_data in tqdm(self.val_dataloader, desc="Validation Progress"):
             test_batch = DataProto.from_single_dict(test_data)
 
             if "uid" not in test_batch.non_tensor_batch:
@@ -544,18 +671,6 @@ class RayPPOTrainer:
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
-            # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
-
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
-
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -566,6 +681,9 @@ class RayPPOTrainer:
                 "global_steps": self.global_steps,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+
+            if "extra_info" in test_batch.non_tensor_batch:
+                test_gen_batch.non_tensor_batch["extra_info"] = test_batch.non_tensor_batch.pop("extra_info")
 
             # pad to be divisible by dp_size
             size_divisor = (
@@ -580,17 +698,33 @@ class RayPPOTrainer:
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
             # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_batch, test_output_gen_batch, new_pad_size = self._reorganize_batch(
+                test_batch, test_output_gen_batch_padded, pad_size
+            )
 
             print("validation generation end")
+
+            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch.meta_info["validate"] = True
+
+            # Store input prompts
+            input_ids = test_output_gen_batch.batch["prompts"]
+            # TODO: Can we keep special tokens except for padding tokens?
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            # Store ground truths
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
-
-            test_batch = test_batch.union(test_output_gen_batch)
-            test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -607,11 +741,34 @@ class RayPPOTrainer:
                     reward_extra_infos_dict[key].extend(lst)
                     print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
 
+            assert all(key not in test_batch.non_tensor_batch for key in reward_extra_infos_dict), (
+                f"{test_batch.non_tensor_batch.keys()=}, {reward_extra_infos_dict.keys()=}"
+            )
+            test_batch.non_tensor_batch.update(
+                {k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()}
+            )
+
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            sample_data_sources = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            data_source_lst.append(sample_data_sources)
+
+            # for each data source, dump a small sample to disk
+            if dump_dir := self.config.trainer.get("val_dump_dir", None):
+                max_val_sample_dump_per_data_source = self.config.trainer.get("max_val_sample_dump_per_data_source", 1)
+                for idx, data_source in enumerate(sample_data_sources):
+                    # skip if already dumped enough samples for this data source
+                    if packets_count_by_data_source[data_source] >= max_val_sample_dump_per_data_source:
+                        continue
+                    self._dump_batch_sample(
+                        test_batch[idx : idx + 1],
+                        str(Path(dump_dir, data_source, f"trial_{val_trial_idx}")),
+                        num_groups=None,
+                        packet_id=packets_count_by_data_source[data_source],
+                    )
+                    packets_count_by_data_source[data_source] += 1
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -632,12 +789,63 @@ class RayPPOTrainer:
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
+
+        if "compute_score_success" in reward_extra_infos_dict and self.config.data.val_batch_size is None:
+            # compute compute_score_success rate
+            compute_score_success = reward_extra_infos_dict.pop("compute_score_success")
+            compute_score_success_by_source = defaultdict(list)
+            for i, data_source in enumerate(data_sources):
+                if compute_score_success[i] is not None:  # None means the score computation was skipped
+                    compute_score_success_by_source[data_source].append(compute_score_success[i])
+
+            for data_source, success_lst in compute_score_success_by_source.items():
+                success_rate = np.mean(success_lst)
+                metric_dict[f"val-aux/{data_source}/compute_score_success/mean"] = success_rate
+
+                # When val_only is on, we want the results to be reliable, i.e., all scores are computed successfully
+                # If this is not the case, we raise an error to notify the user
+                if success_rate < 1.0 and self.config.trainer.get("val_only", False):
+                    raise ValueError(
+                        f"val_only mode is on but {data_source}/compute_score_success/mean={success_rate} < 1.0"
+                    )
+
+            # drop failed samples (and their descendants)
+            idxs_to_keep = np.where(np.array(compute_score_success) != False)[0]  # noqa: E712
+            job_ids_to_keep = set(test_batch.non_tensor_batch["job_id"][idxs_to_keep])
+            idxs_to_keep = np.array(
+                [idx for idx in idxs_to_keep if test_batch.non_tensor_batch["root_job_id"][idx] in job_ids_to_keep]
+            )
+
+            if len(idxs_to_keep) < len(sample_inputs):
+                fail_count = len(sample_inputs) - len(idxs_to_keep)
+                print(
+                    f"WARNING: compute_score failed for {fail_count}/{len(sample_inputs)} samples; dropping failed ones"
+                )
+                test_batch = test_batch.select_idxs(idxs_to_keep)
+                data_sources = data_sources[idxs_to_keep]
+                sample_inputs = [sample_inputs[i] for i in idxs_to_keep]
+                sample_outputs = [sample_outputs[i] for i in idxs_to_keep]
+                sample_scores = [sample_scores[i] for i in idxs_to_keep]
+                sample_uids = [sample_uids[i] for i in idxs_to_keep]
+                if sample_turns:
+                    sample_turns = [sample_turns[i] for i in idxs_to_keep]
+                reward_extra_infos_dict = {k: [v[i] for i in idxs_to_keep] for k, v in reward_extra_infos_dict.items()}
+
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+
+        if self.config.get("use_vsearch", False):
+            vsearch_metrics = process_vsearch_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+            for data_source, var2metric2val in vsearch_metrics.items():
+                if data_source not in data_src2var2metric2val:
+                    data_src2var2metric2val[data_source] = {}
+                data_src2var2metric2val[data_source].update(var2metric2val)
+
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                n_list = [int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys() if "@" in name]
+                n_max = max(n_list) if n_list else 0
                 for metric_name, metric_val in metric2val.items():
                     if (
                         (var_name == core_var)
@@ -834,7 +1042,13 @@ class RayPPOTrainer:
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+            if resume_from_step := self.config.trainer.get("resume_from_step", None):
+                # TODO: merge this code with find_latest_ckpt_path
+                global_step_folder = os.path.join(checkpoint_folder, "global_step_{}".format(resume_from_step))
+                if not os.path.exists(global_step_folder):
+                    raise ValueError("Checkpoint folder does not exist: {}".format(global_step_folder))
+            else:
+                global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
 
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
@@ -918,6 +1132,180 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _update_multi_modal_inputs(self, batch: DataProto, gen_batch_output: DataProto):
+        if "multi_modal_inputs" in batch.non_tensor_batch and "multi_modal_inputs" in gen_batch_output.non_tensor_batch:
+            from verl.utils.dataset.rl_dataset import concat_multi_modal_inputs
+
+            multi_modal_inputs = concat_multi_modal_inputs(
+                batch.non_tensor_batch.pop("multi_modal_inputs"),
+                gen_batch_output.non_tensor_batch.pop("multi_modal_inputs"),
+            )
+            gen_batch_output.non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs, dtype=object)
+
+    def _reorganize_batch(
+        self, batch: DataProto, gen_batch_output: DataProto, pad_size: int = 0, size_divisor: int = 1
+    ) -> tuple[DataProto, DataProto, int]:
+        """Reorganize batch and gen_batch_output for multi-agent joint training.
+
+        In multi-agent joint training, gen_batch_output may contain more data than the (input) batch because agents may
+        create new jobs for subagents. These new jobs then generate extra data that are not in the input batch.
+        For example, given data-parallel (dp) size 2, the data structure is as follows:
+            batch:            |<- dp0 ->|<- dp1 ->|
+            gen_batch_output: |<- dp0 ->|<- dp0_extra ->|<- dp1 ->|<- dp1_extra ->|
+
+        In cases where gen_batch is padded, we have:
+            gen_batch:        |<- dp0 ->|<- dp1 ->|<- pad ->|
+            gen_batch_output: |<- dp0 ->|<- dp0_extra ->|<- dp1 ->|<- pad ->|<- dp1_extra ->|
+        where dp1_extra may contain new data derived from the pad data.
+
+        This function removes the pad data and their derived data (if any) from gen_batch_output, creates an extra batch
+        for the new jobs by duplicating their root jobs in the batch, and then reorganizes the batch and the unpadded
+        gen_batch_output to align them.
+
+        The returned batch and gen_batch_output are of the same length and have the same structure as follows:
+            batch:            |<- dp0 ->|<- dp1 ->|<- dp0_extra ->|<- dp1_extra ->|<- new_pad ->|
+            gen_batch_output: |<- dp0 ->|<- dp1 ->|<- dp0_extra ->|<- dp1_extra ->|<- new_pad ->|
+        where new_pad is added so the batch can be evenly divided by size_divisor.
+
+        NOTE: This function uses shallow copies whenever possible to avoid unnecessary memory usage.
+              However, this may cause unexpected behavior if the data inside the batch is modified in place.
+              So, it is recommended to avoid directly modifying the data inside the batch.
+              Even with deepcopy, one must be careful because e.g., deepcopying a numpy array of dtype=object does not
+              deepcopy the elements inside the array and the elements may still reference to the same original objects.
+        """
+        assert len(gen_batch_output) >= len(batch) + pad_size
+
+        # There is no need to reorganize the batch if there is no new data
+        if len(gen_batch_output) == len(batch) + pad_size:
+            # Remove the pad
+            gen_batch_output = unpad_dataproto(gen_batch_output, pad_size=pad_size)
+
+            # Store the root job ids
+            if "job_id" in gen_batch_output.non_tensor_batch:
+                root_job_ids = [job_id for job_id in gen_batch_output.non_tensor_batch["job_id"]]
+                gen_batch_output.non_tensor_batch["root_job_id"] = np.array(root_job_ids, dtype=object)
+
+            # Update multi_modal_inputs
+            self._update_multi_modal_inputs(batch, gen_batch_output)
+
+            return batch, gen_batch_output, 0
+
+        print(f"_reorganize_batch input: {len(batch)=}, {len(gen_batch_output)=}, {pad_size=}, {size_divisor=}")
+
+        # Construct the mapping from job_id to output index in gen_batch_output
+        job_id_to_idx = {}
+        for i in range(len(gen_batch_output)):
+            job_id = gen_batch_output.non_tensor_batch["job_id"][i]
+            assert job_id not in job_id_to_idx, f"Duplicate job_id: {job_id}"
+            job_id_to_idx[job_id] = i
+
+        # Construct the mapping from output index to input index
+        # The construction is based on the following assumptions:
+        # 1. non-pad jobs always precede pad jobs
+        # 2. non-root jobs are always preceded by their parent jobs
+        # 3. the order of root jobs is the same for batch and gen_batch_output
+        output_to_input_idx = {}  # output idx of root jobs  -> input idx of the root jobs
+        extra_output_to_input_idx = {}  # output idx of extra jobs -> input idx of the root jobs of the extra jobs
+        pad_idxs = set()
+        for i in range(len(gen_batch_output)):
+            if gen_batch_output.non_tensor_batch["parent_job_id"][i] is None:
+                if len(output_to_input_idx) < len(batch):
+                    output_to_input_idx[i] = len(output_to_input_idx)
+                else:
+                    pad_idxs.add(i)
+            else:
+                root_job_id = gen_batch_output.non_tensor_batch["root_job_id"][i]
+                root_idx = job_id_to_idx[root_job_id]
+                if root_idx in pad_idxs:
+                    pad_idxs.add(i)
+                else:
+                    extra_output_to_input_idx[i] = output_to_input_idx[root_idx]
+
+        assert len(output_to_input_idx) == len(batch), f"{len(output_to_input_idx)=}, {len(batch)=}"
+        assert len(output_to_input_idx) + len(extra_output_to_input_idx) + len(pad_idxs) == len(gen_batch_output), (
+            f"{len(output_to_input_idx)=}, {len(extra_output_to_input_idx)=}, {len(pad_idxs)=}, "
+            f"{len(gen_batch_output)=}"
+        )
+
+        # Construct the extra batch
+        from tensordict import TensorDict
+
+        assert len(batch.batch.keys()) == 0, f"{batch.batch.keys()=}"
+        extra_tensor_batch = TensorDict({}, batch_size=len(extra_output_to_input_idx))
+        extra_non_tensor_batch = {}
+
+        # Add suffixes to data_source of the extra batch
+        extra_data_source_list = []
+        for output_idx, input_idx in extra_output_to_input_idx.items():
+            data_source = batch.non_tensor_batch["data_source"][input_idx]
+            agent_name = gen_batch_output.non_tensor_batch["agent_name"][output_idx]
+            extra_data_source_list.append(f"{data_source}_derived/{agent_name}")
+        extra_non_tensor_batch["data_source"] = np.array(extra_data_source_list, dtype=object)
+
+        reward_model_list = [{} for _ in range(len(extra_output_to_input_idx))]
+        extra_non_tensor_batch["reward_model"] = np.array(reward_model_list, dtype=object)
+
+        if "multi_modal_inputs" in batch.non_tensor_batch:
+            # Initialize multi_modal_inputs as empty dicts for the extra batch
+            multi_modal_inputs_list = [{} for _ in range(len(extra_output_to_input_idx))]
+            extra_non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
+
+        if "uid" in batch.non_tensor_batch:
+            # Generate random UIDs for the extra batch
+            uid_list = [str(uuid.uuid4()) for _ in range(len(extra_output_to_input_idx))]
+            extra_non_tensor_batch["uid"] = np.array(uid_list, dtype=object)
+
+        for key in batch.non_tensor_batch.keys():
+            if key in extra_non_tensor_batch:
+                continue
+            print(f"DEBUG: filling batch.non_tensor_batch.{key} with None for the extra batch of subagents")
+            extra_non_tensor_batch[key] = np.array([None] * len(extra_output_to_input_idx), dtype=object)
+        for key in batch.meta_info:
+            print(f"DEBUG: copying batch.meta_info.{key} for the extra batch of subagents")
+
+        extra_batch = DataProto(
+            batch=extra_tensor_batch,
+            non_tensor_batch=extra_non_tensor_batch,
+            meta_info=batch.meta_info,
+        )
+
+        # Construct the fully aligned batch and gen_batch_output
+        batch = DataProto.concat([batch, extra_batch])
+        gen_batch_output = gen_batch_output.select_idxs(list(output_to_input_idx) + list(extra_output_to_input_idx))
+        assert len(batch) == len(gen_batch_output), f"{len(batch)=}, {len(gen_batch_output)=}"
+
+        # Update multi_modal_inputs
+        self._update_multi_modal_inputs(batch, gen_batch_output)
+
+        # Pad the batch to make it divisible by size_divisor
+        batch, new_pad_size = pad_dataproto_to_divisor(batch, size_divisor)
+        gen_batch_output, _ = pad_dataproto_to_divisor(gen_batch_output, size_divisor)
+
+        # [lkc] TODO: DataProto.select_idxs only creates shallow copy; should we enforce deepcopy for all data?
+
+        # Print a summary
+        print("_reorganize_batch completed.")
+        print(f"Original batch size : {len(output_to_input_idx)}")
+        print(f"Extra batch size    : {len(extra_output_to_input_idx)}")
+        print(f"Old pad size        : {len(pad_idxs)}")
+        print(f"New pad size        : {new_pad_size}")
+        print(f"Final batch size    : {len(batch)} (original + extra + new_pad)")
+
+        return batch, gen_batch_output, new_pad_size
+
+    def _force_concat(self, batch_train: DataProto, batch_other: DataProto, train_first: bool = True) -> DataProto:
+        print(f"DEBUG: _force_concat: {len(batch_train)=}, {len(batch_other)=}, {train_first=}")
+        for key, val in batch_train.batch.items():
+            if key not in batch_other.batch.keys():
+                tensor_size = (len(batch_other), *val.shape[1:])
+                print(f'DEBUG: _force_concat: adding dummy placeholders of size {tensor_size} for "{key}"')
+                batch_other.batch[key] = torch.zeros(*tensor_size, dtype=val.dtype, device=val.device)
+        for key in batch_train.non_tensor_batch.keys():
+            if key not in batch_other.non_tensor_batch.keys():
+                print(f'DEBUG: _force_concat: adding dummy placeholders of size {len(batch_other)} for "{key}"')
+                batch_other.non_tensor_batch[key] = np.array([None] * len(batch_other), dtype=object)
+        return DataProto.concat([batch_train, batch_other] if train_first else [batch_other, batch_train])
+
     def fit(self):
         """
         The training loop of PPO.
@@ -944,11 +1332,13 @@ class RayPPOTrainer:
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
+            for val_trial_idx in range(self.config.trainer.get("val_before_train_n", 1)):
+                val_metrics = self._validate(val_trial_idx=val_trial_idx)
+                assert val_metrics, f"{val_metrics=}"
+                pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                logger.finish()
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
@@ -991,6 +1381,9 @@ class RayPPOTrainer:
 
                 gen_batch = self._get_gen_batch(batch)
 
+                if "extra_info" in batch.non_tensor_batch:
+                    gen_batch.non_tensor_batch["extra_info"] = batch.non_tensor_batch.pop("extra_info")
+
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -1029,10 +1422,50 @@ class RayPPOTrainer:
                             del gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                    # re-organize the batch and gen_batch_output for multi-agent joint training
+                    # for padding, we assume ppo_mini_batch_size == train_batch_size for simplicity
+                    assert self.config.actor_rollout_ref.actor.ppo_mini_batch_size == self.config.data.train_batch_size
+                    assert (
+                        self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+                        % self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+                        == 0
+                    )
+                    size_divisor = (
+                        self.actor_rollout_wg.world_size
+                        * self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+                    )
+                    original_batch_size = len(batch)
+                    with marked_timer("reorganize_batch", timing_raw, color="gray"):
+                        batch, gen_batch_output, new_pad_size = self._reorganize_batch(
+                            batch, gen_batch_output, size_divisor=size_divisor
+                        )
+                    subagent_batch_size = len(batch) - original_batch_size - new_pad_size
+
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    if not self.config.trainer.get("train_on_vreasoner_response", True):
+                        vreasoner_idxs = np.where(batch.non_tensor_batch["agent_name"] == "vreasoner")[0]
+                        other_idxs = np.where(batch.non_tensor_batch["agent_name"] != "vreasoner")[0]
+                        other_idxs = other_idxs[
+                            : len(other_idxs) // size_divisor * size_divisor
+                        ]  # align with size_divisor
+                        vreasoner_batch = batch.select_idxs(vreasoner_idxs)
+                        batch = batch.select_idxs(other_idxs)
+
+                    # Separate the main-agent/subagent batch if we only train on one of them
+                    subagent_keep_size = subagent_batch_size // size_divisor * size_divisor
+                    if not self.config.trainer.get("train_on_main_agent_response", True):
+                        main_agent_batch = batch[:original_batch_size]
+                        batch = batch[original_batch_size : original_batch_size + subagent_keep_size]
+                    elif subagent_batch_size and not self.config.trainer.get("train_on_subagent_response", False):
+                        subagent_batch = batch[original_batch_size : original_batch_size + subagent_keep_size]
+                        batch = batch[:original_batch_size]
+                    effective_batch_size = len(batch)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1045,33 +1478,80 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        # append the main-agent/subagent batch back to the original batch for reward computation
+                        if not self.config.trainer.get("train_on_main_agent_response", True):
+                            batch = self._force_concat(batch, main_agent_batch, train_first=False)
+                        elif subagent_batch_size and not self.config.trainer.get("train_on_subagent_response", False):
+                            batch = self._force_concat(batch, subagent_batch)
+
+                        if not self.config.trainer.get("train_on_vreasoner_response", True):
+                            batch = self._force_concat(batch, vreasoner_batch)
+
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
                         if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                            if self.config.reward_model.get("reward_fn_async_backend", "ray") == "ray":
+                                future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                            else:
+                                future_reward, reward_fn_thread = compute_reward_async_thread(self.reward_fn, batch)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                        if not self.config.trainer.get("train_on_vreasoner_response", True):
+                            vreasoner_idxs = np.where(batch.non_tensor_batch["agent_name"] == "vreasoner")[0]
+                            other_idxs = np.where(batch.non_tensor_batch["agent_name"] != "vreasoner")[0]
+                            vreasoner_batch = batch.select_idxs(vreasoner_idxs)
+                            batch = batch.select_idxs(other_idxs)
+
+                        # remove the main-agent/subagent batch from the original batch
+                        if not self.config.trainer.get("train_on_main_agent_response", True):
+                            main_agent_batch = batch[:original_batch_size]
+                            batch = batch[original_batch_size : original_batch_size + subagent_keep_size]
+                        elif subagent_batch_size and not self.config.trainer.get("train_on_subagent_response", False):
+                            subagent_batch = batch[original_batch_size : original_batch_size + subagent_keep_size]
+                            batch = batch[:original_batch_size]
+
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                        if self.config.actor_rollout_ref.actor.get("skip_old_log_prob_recompute", False):
+                            print(
+                                "WARNING: `skip_old_log_prob_recompute` is set. Make sure that .train() and .eval() "
+                                "don't affect the log_prob produced by the model"
+                            )
+                            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                            if self.config.data.train_batch_size > ppo_mini_batch_size:
+                                raise RuntimeError(
+                                    "`skip_old_log_prob_recompute` is set, but the train_batch_size is larger than "
+                                    "the ppo_mini_batch_size"
+                                )
+                            if self.config.algorithm.use_kl_in_reward:
+                                raise RuntimeError(
+                                    "`skip_old_log_prob_recompute` is set, but `use_kl_in_reward` is enabled"
+                                )
+                            # we can skip old_log_prob computation to save time
+                            # because old_log_prob is simply the current log_prob which will be computed in update_actor
+                            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                        else:
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                            )
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            from verl.utils.debug.metrics import calculate_debug_metrics
+                            if "rollout_log_probs" in batch.batch.keys():
+                                # TODO: we may want to add diff of probs too.
+                                from verl.utils.debug.metrics import calculate_debug_metrics
 
-                            metrics.update(calculate_debug_metrics(batch))
+                                metrics.update(calculate_debug_metrics(batch))
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1089,14 +1569,72 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
+                        # append the main-agent/subagent batch back to the original batch for reward computation
+                        if not self.config.trainer.get("train_on_main_agent_response", True):
+                            batch = self._force_concat(batch, main_agent_batch, train_first=False)
+                        elif subagent_batch_size and not self.config.trainer.get("train_on_subagent_response", False):
+                            batch = self._force_concat(batch, subagent_batch)
+
+                        if not self.config.trainer.get("train_on_vreasoner_response", True):
+                            batch = self._force_concat(batch, vreasoner_batch)
+
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            if self.config.reward_model.get("reward_fn_async_backend", "ray") == "ray":
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            else:
+                                reward_tensor, reward_extra_infos_dict = get_async_reward_thread(
+                                    future_reward, reward_fn_thread
+                                )
+                                if reward_tensor is None:  # fallback to synchronous computation
+                                    reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            assert all(key not in batch.non_tensor_batch for key in reward_extra_infos_dict), (
+                                f"{batch.non_tensor_batch.keys()=}, {reward_extra_infos_dict.keys()=}"
+                            )
+                            batch.non_tensor_batch.update(
+                                {k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()}
+                            )
+
+                        # score computation may fail occasionally (e.g., due to GPT API error)
+                        # we tolerate a small number of failed samples by replacing them with successful ones
+                        if "compute_score_success" in batch.non_tensor_batch:
+                            # NOTE: elements in compute_score_success can take three values:
+                            # - True: the score computation is successful
+                            # - False: the score computation is failed
+                            # - None: the score computation is not performed (e.g., for subagent results)
+                            # We only replace the failed ones (and their descendants) here.
+                            idxs_to_keep = np.where(batch.non_tensor_batch["compute_score_success"] != False)[0]  # noqa: E712
+                            job_ids_to_keep = set(batch.non_tensor_batch["job_id"][idxs_to_keep])
+                            idxs_to_keep = np.array(
+                                [
+                                    idx
+                                    for idx in idxs_to_keep
+                                    if batch.non_tensor_batch["root_job_id"][idx] in job_ids_to_keep
+                                ]
+                            )
+                            assert len(idxs_to_keep), f"{len(idxs_to_keep)=}, {len(batch.batch)=}"
+
+                            if len(idxs_to_keep) < len(batch.batch):
+                                num_to_pad = len(batch.batch) - len(idxs_to_keep)
+                                print(
+                                    f"WARNING: compute_score failed for {num_to_pad} out of {len(batch.batch)} samples;"
+                                    " replacing the failed ones"
+                                )
+                                # randomly sample indices from select_idxs to pad
+                                rng = np.random.RandomState(42)
+                                pad_idxs = rng.choice(idxs_to_keep, size=num_to_pad, replace=True)
+                                # concatenate the selected samples and the padded samples
+                                new_idxs = np.concatenate([idxs_to_keep, pad_idxs])
+                                batch = batch.select_idxs(new_idxs)
+                                # update reward info
+                                reward_tensor = batch.batch["token_level_scores"]
+                                reward_extra_infos_dict = {
+                                    k: list(batch.non_tensor_batch[k]) for k in reward_extra_infos_dict
+                                }
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1122,6 +1660,27 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
+                        if not self.config.trainer.get("train_on_vreasoner_response", True):
+                            vreasoner_idxs = np.where(batch.non_tensor_batch["agent_name"] == "vreasoner")[0]
+                            other_idxs = np.where(batch.non_tensor_batch["agent_name"] != "vreasoner")[0]
+                            other_idxs = other_idxs[
+                                : len(other_idxs) // size_divisor * size_divisor
+                            ]  # align with size_divisor
+                            vreasoner_batch = batch.select_idxs(vreasoner_idxs)
+                            batch = batch.select_idxs(other_idxs)
+
+                        # remove the main-agent/subagent batch from the original batch
+                        if not self.config.trainer.get("train_on_main_agent_response", True):
+                            main_agent_batch = batch[:original_batch_size]
+                            batch = batch[original_batch_size : original_batch_size + subagent_keep_size]
+                        elif subagent_batch_size and not self.config.trainer.get("train_on_subagent_response", False):
+                            subagent_batch = batch[original_batch_size : original_batch_size + subagent_keep_size]
+                            batch = batch[:original_batch_size]
+
+                        # rebalance the batch
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -1137,6 +1696,15 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    # append the main-agent/subagent batch back to the original batch for dumping results and metrics
+                    if not self.config.trainer.get("train_on_main_agent_response", True):
+                        batch = self._force_concat(batch, main_agent_batch, train_first=False)
+                    elif subagent_batch_size and not self.config.trainer.get("train_on_subagent_response", False):
+                        batch = self._force_concat(batch, subagent_batch)
+
+                    if not self.config.trainer.get("train_on_vreasoner_response", True):
+                        batch = self._force_concat(batch, vreasoner_batch)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1175,6 +1743,25 @@ class RayPPOTrainer:
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
 
+                # add refresh_freq to save checkpoint
+                refresh_freq = self.config.trainer.get("refresh_freq", -1)
+                if refresh_freq > 0 and (self.global_steps % refresh_freq == 0):
+                    checkpoint_folder = self.config.trainer.default_local_dir
+                    if not os.path.isabs(checkpoint_folder):
+                        working_dir = os.getcwd()
+                        checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+                    refresh_file = Path(checkpoint_folder, "last_refresh_iteration.txt")
+                    if refresh_file.exists():
+                        with refresh_file.open("r") as f:
+                            last_refresh_step = int(f.read())
+                        shutil.rmtree(Path(checkpoint_folder, f"global_step_{last_refresh_step}"), ignore_errors=True)
+                        refresh_file.unlink()
+                    if not Path(checkpoint_folder, f"global_step_{self.global_steps}").exists():
+                        with marked_timer("save_checkpoint", timing_raw):
+                            self._save_checkpoint()
+                        with refresh_file.open("w") as f:
+                            f.write(str(self.global_steps))
+
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (
                         self.global_steps + 1 in self.config.global_profiler.steps
@@ -1201,6 +1788,9 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if self.config.get("use_vsearch", False):
+                    metrics.update(compute_agent_metrics(batch=batch))
+                    metrics.update({"training/batch_size": effective_batch_size})
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -1212,6 +1802,8 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                if dump_dir := self.config.trainer.get("train_dump_dir", None):
+                    self._dump_batch_sample(batch, dump_dir)
 
                 progress_bar.update(1)
                 self.global_steps += 1
@@ -1226,6 +1818,7 @@ class RayPPOTrainer:
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
+                    logger.finish()
                     progress_bar.close()
                     return
 

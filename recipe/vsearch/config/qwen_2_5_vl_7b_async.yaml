@@ -1,0 +1,174 @@
+# this config will override the default ppo_trainer.yaml
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+project_root: ${hydra:runtime.cwd}
+use_vsearch: True
+
+# Maximum number of pixels allowed for images (applies to both input and cropped images)
+data:
+  # ======= for async rollout ========
+  return_raw_chat: True
+  return_multi_modal_inputs: False
+  apply_chat_template_kwargs:
+    max_tool_calls: ${actor_rollout_ref.rollout.multi_turn.max_user_turns}
+  # ==================================
+
+  filter_overlong_prompts: False
+  truncation: error
+  image_key: images
+  max_pixels: ${eval:1280*1280}
+  validation_max_pixels: ${data.max_pixels}
+  max_prompt_length: 4096
+  validation_max_prompt_length: ${data.max_prompt_length}
+  max_response_length: 8192
+  validation_shuffle: True
+  use_vsearch: ${use_vsearch}
+  force_dataset_concat: True
+
+  batch_sampler:
+    enabled: True
+    class_path: ${project_root}/verl/experimental/dataset/vsearch_sampler.py
+    class_name: VSearchBatchSampler
+    weights: null
+
+actor_rollout_ref:
+  model:
+    use_remove_padding: True
+    enable_gradient_checkpointing: True
+
+    # ======= for async rollout ========
+    custom_chat_template: "{% set image_count = namespace(value=0) %}{% set video_count = namespace(value=0) %}<|im_start|>system\n{% if messages[0]['role'] == 'system' %}{% if messages[0]['content'] is string %}{{ messages[0]['content'] }}{% else %}{{ messages[0]['content'][0]['text'] }}{% endif %}{% else %}{{ 'You are a helpful assistant.' }}{% endif %}<|im_end|>\n{% for message in messages %}{% if message['role'] != 'system' or loop.first == false %}{% if (message.role == 'user') or (message.role == 'system' and not loop.first) or (message.role == 'assistant') %}<|im_start|>{{ message['role'] }}\n{% if message['content'] is string %}{{ message['content'] }}<|im_end|>\n{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}{% set image_count.value = image_count.value + 1 %}{% if add_vision_id %}Picture {{ image_count.value }}: {% endif %}<|vision_start|><|image_pad|><|vision_end|>{% elif content['type'] == 'video' or 'video' in content %}{% set video_count.value = video_count.value + 1 %}{% if add_vision_id %}Video {{ video_count.value }}: {% endif %}<|vision_start|><|video_pad|><|vision_end|>{% elif 'text' in content %}{{ content['text'] }}{% endif %}{% endfor %}<|im_end|>\n{% endif %}{% elif message.role == 'tool' %}<|im_start|>user\n<tool_response>{% if message['content'] is string %}{{ message.content }}{% else %}{% for content in message['content'] %}{% if content['type'] == 'image' or 'image' in content or 'image_url' in content %}{% set image_count.value = image_count.value + 1 %}{% if add_vision_id %}Picture {{ image_count.value }}: {% endif %}<|vision_start|><|image_pad|><|vision_end|>{% elif content['type'] == 'video' or 'video' in content %}{% set video_count.value = video_count.value + 1 %}{% if add_vision_id %}Video {{ video_count.value }}: {% endif %}<|vision_start|><|video_pad|><|vision_end|>{% endif %}{% endfor %}{% endif %}</tool_response>\n{% if image_count.value > max_tool_calls %}You have reached the tool call limit and cannot call tools anymore.\nThink first, then answer with the bbox coordinates in [x1, y1, x2, y2] format (or [0, 0, 0, 0] if you can't locate it). Format strictly as:  <think>...</think>  <answer>[x1, y1, x2, y2]</answer> {% else %}Think first, call **image_zoom_in_tool** if needed, then answer with the bbox coordinates in [x1, y1, x2, y2] format (or [0, 0, 0, 0] if you can't locate it). Format strictly as:  <think>...</think>  <tool_call>...</tool_call> (if tools needed)  <answer>[x1, y1, x2, y2]</answer> (otherwise){% endif %}<|im_end|>\n{% endif %}{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+    # ==================================
+
+  actor:
+    _target_: recipe.vsearch.config.VSearchFSDPActorConfig
+    freeze_vision_tower: True
+    skip_old_log_prob_recompute: True  # whether to skip old log prob recompute, only valid when there is only one ppo mini-batch
+    force_on_policy: True              # if True, ignore ppo_mini_batch_size and ppo_epochs and force on-policy learning
+    optim:
+      lr: 1e-6
+    use_kl_loss: True
+    kl_loss_coef: 0.01
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    fsdp_config:
+      param_offload: True
+      optimizer_offload: True
+
+  rollout:
+    _target_: recipe.vsearch.config.VSearchRolloutConfig
+    name: vllm
+
+    # ======= for async rollout ========
+    mode: async
+    multi_turn:
+      enable: True
+      max_user_turns: 6
+      max_assistant_turns: 7   # max_user_turns + 1
+      tool_config_path: "recipe/deepeyes/configs/image_zoom_in_tool_config.yaml"
+    # ==================================
+
+    # vsearch-specific parameters
+    use_vsearch: ${use_vsearch}
+    enable_tool_feedback: True    # whether to enable tool caller to provide feedback to the tool during training;
+                                  # during validation, we always disable tool feedback ignoring this setting
+
+    # Maximum allowed token id; rollouts with tokens above this will be terminated
+    max_allowed_token_id: 151664
+    max_num_batched_tokens: ${eval:1024*32}
+    gpu_memory_utilization: 0.75
+    enable_chunked_prefill: False
+    enforce_eager: True
+    free_cache_engine: True
+
+  ref:
+    fsdp_config:
+      param_offload: True
+    
+reward_model:
+  reward_manager: batch
+  launch_reward_fn_async: True     # if True, the reward function will be launched in a separate process
+  reward_fn_async_backend: thread  # thread or ray (ray is the default of verl but it comes with issues)
+
+  disable_async_reward: True       # disable async reward compute during agent loop
+                                   # the main branch do not have this option to disable async reward computation,
+                                   # leading to the reward being computed twice:
+                                   # 1. during agent loop
+                                   # 2. during training
+  num_examine:
+    train: 1
+    val: 1
+
+custom_reward_function:
+  path: ${project_root}/verl/utils/reward_score/vsearch_batch.py
+  name: compute_score_batch
+  
+  reward_kwargs:
+    reward_type: conditioned_on_tool_reward
+    verify_method: gpt
+    judge_model: gpt-5-nano
+    num_workers: 32
+    task_timeout: 60
+    min_success_rate: 0.85
+    max_retries: 10
+    retry_interval: 30
+    reward_weights:
+      format: 0.2
+      accuracy: 0.8
+      iou: 0.8
+      tool: 1.0
+    format_reward:
+      must_have_answer: True
+      skip_last_response_if_empty: False
+    iou_reward:
+      iou_low: 0.25
+      iou_high: 1.0
+      pseudo_iou_reward_type: "caller_feedback"
+    tool_reward:
+      max_consecutive_iou: 0.6
+
+trainer:
+  # frequency of replacing old temporary checkpoints with new ones
+  refresh_freq: 25
+
+  # Directory to dump validation results
+  val_dump_dir: null
+
+  # Maximum number of samples to dump per data source
+  max_val_sample_dump_per_data_source: 1
+
+  # Directory to dump training results
+  train_dump_dir: null
+
+  # Resume training from a specific step
+  resume_from_step: null
+
+  # Whether to disable prompt grouping in metrics
+  disable_prompt_grouping_in_metrics: True
+
+  # Whether to train on the main agent response
+  train_on_main_agent_response: True
+
+  # Whether to train on the subagent response
+  train_on_subagent_response: True
+
+  # Whether to train on the vreasoner response
+  train_on_vreasoner_response: False
+
+  # Number of times to run validation
+  val_before_train_n: 1
+
+  # Total number of epochs to train (dummy value; use `trainer.total_training_steps` instead)
+  total_epochs: 10000000
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: False
+  subagent_advantage_estimator: global_norm    # options: null, broadcast, global_norm, no_global_norm  

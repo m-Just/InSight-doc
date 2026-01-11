@@ -371,6 +371,9 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        if "old_log_probs" not in data.batch:
+            # when skip old_log_prob recompute, we need to skip old_log_probs to the select_keys
+            select_keys.remove("old_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         if self.config.tis_imp_ratio_cap > 0:
@@ -388,6 +391,16 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        if self.config.force_on_policy:
+            if self.config.ppo_mini_batch_size != data.batch.batch_size[0]:
+                print(
+                    f"WARNING: force on-policy (original ppo_mini_batch_size: {self.config.ppo_mini_batch_size}, "
+                    f"new: {data.batch.batch_size[0]})"
+                )
+                self.config.ppo_mini_batch_size = data.batch.batch_size[0]
+            if self.config.ppo_epochs != 1:
+                print(f"WARNING: force on-policy (original ppo_epochs: {self.config.ppo_epochs}, new: 1)")
+                self.config.ppo_epochs = 1
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
@@ -411,7 +424,6 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
-                    old_log_prob = model_inputs["old_log_probs"]
                     rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]
 
@@ -425,7 +437,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     calculate_entropy = False
-                    if entropy_coeff != 0:
+                    if entropy_coeff != 0 or self.config.skip_old_log_prob_recompute:
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
@@ -486,6 +498,14 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
+
+                    if self.config.skip_old_log_prob_recompute:
+                        if entropy_coeff == 0:
+                            entropy_loss = agg_loss(
+                                loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+                            )
+                        micro_batch_metrics["actor/entropy"] = entropy_loss.detach().item()
+
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

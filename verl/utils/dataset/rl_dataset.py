@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, Sequence
 
 import datasets
 import numpy as np
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 def collate_fn(data_list: list[dict]) -> dict:
-    """
+    r"""
     Collate a batch of sample dicts into batched tensors and arrays.
 
     Args:
@@ -63,6 +63,25 @@ def collate_fn(data_list: list[dict]) -> dict:
         non_tensors[key] = np.fromiter(val, dtype=object, count=len(val))
 
     return {**tensors, **non_tensors}
+
+
+def concat_multi_modal_inputs(mm_inputs: Sequence[dict], new_mm_inputs: Sequence[dict]) -> list[dict]:
+    """Concatenate mm_inputs with new_mm_inputs."""
+    assert len(mm_inputs) == len(new_mm_inputs), f"length mismatch: {len(mm_inputs)=}, {len(new_mm_inputs)=}"
+    mm_inputs = [mm_input.copy() for mm_input in mm_inputs]
+    for i in range(len(mm_inputs)):
+        if not mm_inputs[i]:
+            mm_inputs[i] = new_mm_inputs[i]
+            continue
+        if not new_mm_inputs[i]:
+            continue
+        assert set(mm_inputs[i]) == set(new_mm_inputs[i]), (
+            f"mm_inputs[i] and new_mm_inputs[i] have different keys: {mm_inputs[i].keys()=}, {new_mm_inputs[i].keys()=}"
+        )
+        for key in mm_inputs[i]:
+            # print(f"DEBUG: concat multi_modal_inputs.{key}", mm_inputs[i][key].shape, new_mm_inputs[i][key].shape)
+            mm_inputs[i][key] = torch.cat([mm_inputs[i][key], new_mm_inputs[i][key]], dim=0)
+    return mm_inputs
 
 
 class RLHFDataset(Dataset):
@@ -121,6 +140,10 @@ class RLHFDataset(Dataset):
         self._download()
         self._read_files_and_tokenize()
 
+        if self.config.get("use_vsearch", False):
+            # TODO: only for Qwen2VLImageProcessor or for all other processors?
+            self.processor.image_processor.do_resize = False
+
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
 
@@ -134,6 +157,26 @@ class RLHFDataset(Dataset):
             # read parquet files and cache
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
             dataframes.append(dataframe)
+        if self.config.get("force_dataset_concat", False) and len(dataframes) > 1:
+            print("WARNING: Force dataset concatenation")
+            extra_infos = [set(df["extra_info"][0].keys()) for df in dataframes]
+            extra_infos_union = set.union(*extra_infos)
+            print(f"Extra infos union: {extra_infos_union}")
+
+            def map_extra_info(example):
+                extra_info = example.pop("extra_info")
+                for key in list(extra_infos_union):
+                    if key not in extra_info:
+                        extra_info[key] = None
+                assert "extra_info_union" not in example, "extra_info_union already exists"
+                example["extra_info_union"] = extra_info
+                return example
+
+            def map_extra_info_back(example):
+                example["extra_info"] = example.pop("extra_info_union")
+                return example
+
+            dataframes = [df.map(map_extra_info).map(map_extra_info_back) for df in dataframes]
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         print(f"dataset len: {len(self.dataframe)}")
@@ -225,12 +268,19 @@ class RLHFDataset(Dataset):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
+
+        if self._is_train:
+            self.max_prompt_length = self.config.get("max_prompt_length", 1024)
+        else:
+            self.max_prompt_length = self.config.get("validation_max_prompt_length", 1024)
+
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
+            from verl.utils.vsearch import fetch_image_wo_resize
 
             raw_prompt = self.processor.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
@@ -240,11 +290,28 @@ class RLHFDataset(Dataset):
             images = None
             row_dict_images = row_dict.pop(self.image_key, None)
             if row_dict_images:
-                images = [process_image(image) for image in row_dict_images]
+                extra_info = row_dict.get("extra_info", {})
+                max_pixels_global = self.config.get("max_pixels")
+                if not self._is_train and self.config.get("validation_max_pixels"):
+                    max_pixels_global = self.config.get("validation_max_pixels")
+                max_pixels_sample = extra_info.get("max_pixels")
+                if max_pixels_global and max_pixels_sample:
+                    max_pixels = min(max_pixels_global, max_pixels_sample)
+                else:
+                    max_pixels = max_pixels_global or max_pixels_sample
+
+                images_dict = [image for image in row_dict_images]
+                images = [process_image(image, max_pixels=max_pixels) for image in images_dict]
 
                 # due to the image key is "image" instead of "images" in vllm, we need to use "image" here
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
                 multi_modal_data["image"] = images
+
+                if self.config.get("use_vsearch", False):
+                    extra_info["image_ori"] = [fetch_image_wo_resize(image) for image in images_dict]
+                    extra_info["image_ori_wh"] = [image.size for image in extra_info["image_ori"]]
+                    extra_info["image_processed_wh"] = [image.size for image in multi_modal_data["image"]]
+                    row_dict["extra_info"] = extra_info
 
             videos = None
             row_dict_videos = row_dict.pop(self.video_key, None)
@@ -363,6 +430,19 @@ class RLHFDataset(Dataset):
         need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
+
+        if self.config.get("use_vsearch", False):
+            create_kwargs = tools_kwargs.get("image_zoom_in_tool", {}).get("create_kwargs", {})
+            create_kwargs.update(
+                {
+                    "image": row_dict["extra_info"]["image_ori"][0],
+                    "resized_image_size": row_dict["extra_info"]["image_processed_wh"][0],
+                    "max_pixels": max_pixels,
+                }
+            )
+            tools_kwargs.setdefault("image_zoom_in_tool", {})["create_kwargs"] = create_kwargs
+
+        # print(f"DEBUG: {tools_kwargs=}")
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs

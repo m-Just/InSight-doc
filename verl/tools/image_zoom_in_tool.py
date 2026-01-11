@@ -24,7 +24,7 @@ from uuid import uuid4
 
 import ray
 import ray.actor
-from qwen_vl_utils import fetch_image
+from qwen_vl_utils import fetch_image, smart_resize
 
 from .base_tool import BaseTool
 from .schemas import OpenAIFunctionToolSchema, ToolResponse
@@ -202,7 +202,14 @@ class ImageZoomInTool(BaseTool):
             logger.warning(f"Bbox validation error: {e}")
             return False
 
-    def _maybe_resize_bbox(self, bbox_2d: list[float], image_width: int, image_height: int) -> Optional[list[float]]:
+    def _maybe_resize_bbox(
+        self,
+        bbox_2d: list[float],
+        image_width: int,
+        image_height: int,
+        resized_image_width: int | None = None,
+        resized_image_height: int | None = None,
+    ) -> Optional[list[float]]:
         """
         Clamp, validate, and potentially resize a bounding box.
 
@@ -214,6 +221,13 @@ class ImageZoomInTool(BaseTool):
             A valid bounding box as a list of coordinates, or None if validation fails.
         """
         left, top, right, bottom = bbox_2d
+
+        if resized_image_width is not None:
+            left *= image_width / resized_image_width
+            right *= image_width / resized_image_width
+        if resized_image_height is not None:
+            top *= image_height / resized_image_height
+            bottom *= image_height / resized_image_height
 
         # 1. Clamp the initial bounding box to the image dimensions.
         left = max(0.0, float(left))
@@ -339,6 +353,8 @@ class ImageZoomInTool(BaseTool):
             "image": img,
             "response": "",
             "reward": 0.0,
+            "resized_image_size": kwargs.get("resized_image_size", (None, None)),
+            "max_pixels": kwargs.get("max_pixels", None),
         }
         return instance_id, ToolResponse()
 
@@ -356,9 +372,17 @@ class ImageZoomInTool(BaseTool):
         instance_data = self._instance_dict[instance_id]
         image = instance_data["image"]
         image_width, image_height = image.size
+        resized_image_width, resized_image_height = instance_data["resized_image_size"]
+        max_pixels = instance_data["max_pixels"]
 
         try:
-            resized_bbox = self._maybe_resize_bbox(bbox_2d, image_width=image_width, image_height=image_height)
+            resized_bbox = self._maybe_resize_bbox(
+                bbox_2d,
+                image_width=image_width,
+                image_height=image_height,
+                resized_image_width=resized_image_width,
+                resized_image_height=resized_image_height,
+            )
 
             if resized_bbox is None:
                 error_msg = (
@@ -373,6 +397,19 @@ class ImageZoomInTool(BaseTool):
         except Exception as e:
             logger.error(f"Error processing image zoom-in: {e}")
             return ToolResponse(text=f"Error processing image zoom-in: {e}"), -0.05, {"success": False}
+
+        if max_pixels is not None:
+            try:
+                new_height, new_width = smart_resize(
+                    height=cropped_image.size[1],
+                    width=cropped_image.size[0],
+                    min_pixels=self.MIN_DIMENSION * self.MIN_DIMENSION,
+                    max_pixels=max_pixels,
+                )
+                cropped_image = cropped_image.resize((new_width, new_height))
+            except Exception as e:
+                logger.error(f"Error resizing cropped image: {e}")
+                return ToolResponse(text=f"Error resizing cropped image: {e}"), -0.05, {"success": False}
 
         response_text = f"Zoomed in on the image to the region {bbox_2d}."
         if label:

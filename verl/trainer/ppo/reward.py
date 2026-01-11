@@ -17,6 +17,7 @@ import multiprocessing
 import os
 import sys
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Optional
 
@@ -189,3 +190,57 @@ def compute_reward_async(data: DataProto, config=None, tokenizer=None, reward_fn
         )
 
     return compute_reward(data, reward_fn)
+
+
+def compute_reward_async_thread(reward_fn, batch: DataProto):
+    """
+    Compute reward for a batch of data in a separate thread.
+    Args:
+        reward_fn: Reward function to compute the reward.
+        batch: DataProto object containing the input data.
+    Returns:
+        Tuple of future reward and reward function thread.
+    """
+    # [lewei]: official ray reward manager has bug (jiter import error) when using GPT verifier,
+    # we replace it with ThreadPoolExecutor.
+    reward_fn_thread = ThreadPoolExecutor(max_workers=1)
+    future_reward = reward_fn_thread.submit(reward_fn, batch, return_dict=True)
+    return future_reward, reward_fn_thread
+
+
+def get_async_reward_thread(future_reward, reward_fn_thread, timeout=None):
+    """
+    Get the reward extra infos dictionary from the future reward.
+    Args:
+        future_reward: Future reward object.
+        reward_fn_thread: Reward function thread.
+        timeout: Timeout in seconds.
+    Returns:
+        Tuple of reward tensor and reward extra infos dictionary.
+    """
+    reward_extra_infos_dict: dict[str, list]
+    if timeout is None:
+        timeout = int(os.environ.get("REWARD_FN_TIMEOUT", "1800"))  # 30 minutes default
+    try:
+        reward_result = future_reward.result(
+            timeout=int(timeout)  # Add timeout to prevent indefinite waiting
+        )
+        reward_tensor = reward_result["reward_tensor"]
+        reward_extra_infos_dict = reward_result["reward_extra_info"]
+    except Exception as e:
+        if isinstance(e, TimeoutError):
+            print(
+                f"[RewardWorker] Reward computation timed out after {timeout}s, falling back to synchronous computation"
+            )
+        else:
+            # print(f"Error in reward_fn: {repr(e)}")
+            import traceback
+
+            print(f"[RewardWorker Debug] Error details: {traceback.format_exc()}")
+        reward_tensor, reward_extra_infos_dict = None, None
+    finally:
+        try:
+            reward_fn_thread.shutdown(wait=False)
+        except Exception as e:
+            print(f"[RewardWorker] Warning: Error during thread pool shutdown: {e}")
+    return reward_tensor, reward_extra_infos_dict

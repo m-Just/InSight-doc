@@ -15,7 +15,7 @@ from abc import abstractmethod
 from collections.abc import Sized
 
 from omegaconf import DictConfig
-from torch.utils.data import Sampler
+from torch.utils.data import Sampler, BatchSampler
 
 from verl import DataProto
 
@@ -38,3 +38,12 @@ class AbstractCurriculumSampler(AbstractSampler):
     @abstractmethod
     def update(self, batch: DataProto) -> None:
         pass
+
+
+class AbstractBatchSampler(BatchSampler):
+    """Abstract interface for custom batch samplers."""
+
+    @abstractmethod
+    def __init__(self, batch_size: int, data_source: Sized, data_config: DictConfig):
+        pass
+

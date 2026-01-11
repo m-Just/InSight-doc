@@ -39,6 +39,10 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
+    # support dynamic evaluation of config values
+    OmegaConf.register_new_resolver("eval", eval)
+    OmegaConf.resolve(config)
+
     run_ppo(config)
 
 
@@ -279,11 +283,12 @@ class TaskRunner:
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
         # Load the reward manager for training and validation.
+        num_examine = config.reward_model.get("num_examine", {})
         reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=num_examine.get("train", 0), **config.reward_model.get("reward_kwargs", {})
         )
         val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=num_examine.get("val", 1), **config.reward_model.get("reward_kwargs", {})
         )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
@@ -362,6 +367,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         processor=processor,
         config=data_config,
     )
+    dataset._is_train = is_train
 
     return dataset
 
@@ -374,12 +380,24 @@ def create_rl_sampler(data_config, dataset):
         dataset (Dataset): The dataset.
 
     Returns:
-        sampler (Sampler): The sampler.
+        sampler (Sampler / BatchSampler): The sampler.
     """
     import torch
     from torch.utils.data import RandomSampler, SequentialSampler
 
-    if data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
+    # Prefer a user-specified BatchSampler (e.g., VSearchBatchSampler) if enabled
+    if data_config.get("batch_sampler") is not None and data_config.batch_sampler.get("enabled", False):
+        bs_cls = load_extern_type(
+            data_config.batch_sampler.class_path,
+            data_config.batch_sampler.class_name,
+        )
+        sampler = bs_cls(
+            batch_size=data_config.get("gen_batch_size", data_config.train_batch_size),
+            data_source=dataset,
+            data_config=data_config,
+        )
+
+    elif data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
         curriculum_class = load_extern_type(
             data_config.sampler.class_path,
             data_config.sampler.class_name,

@@ -139,6 +139,8 @@ class AgentLoopOutput(BaseModel):
     """Auxiliary performance metrics"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
+    subagent_outputs: Optional[list["AgentLoopOutput"]] = None
+    """Subagent outputs for multi-agent loops."""
 
 
 class _InternalAgentLoopOutput(AgentLoopOutput):
@@ -444,7 +446,7 @@ class AgentLoopWorker:
             temperature=config.temperature,
             top_p=config.top_p,
             repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs,
+            logprobs=(1 if config.calculate_log_probs else None),
         )
 
         # override sampling params for validation
@@ -470,8 +472,9 @@ class AgentLoopWorker:
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
         outputs = await asyncio.gather(*tasks)
+        outputs = sum(outputs, [])
 
-        output = self._postprocess(outputs)
+        output = self._postprocess(outputs, batch.meta_info.get("validate", False))
         return output
 
     async def _run_agent_loop(
@@ -481,28 +484,9 @@ class AgentLoopWorker:
         *,
         agent_name: str,
         **kwargs,
-    ) -> _InternalAgentLoopOutput:
-        with rollout_trace_attr(
-            step=trajectory["step"],
-            sample_index=trajectory["sample_index"],
-            rollout_n=trajectory["rollout_n"],
-            validate=trajectory["validate"],
-            name="agent_loop",
-        ):
-            assert agent_name in _agent_loop_registry, (
-                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
-            )
+    ) -> list[_InternalAgentLoopOutput]:
 
-            agent_loop_config = _agent_loop_registry[agent_name]
-            agent_loop = hydra.utils.instantiate(
-                config=agent_loop_config,
-                trainer_config=_DummyConfig(config=self.config),
-                server_manager=self.server_manager,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-            )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-
+        async def process_output(output: AgentLoopOutput, **kwargs) -> _InternalAgentLoopOutput:
             # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
             # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
@@ -536,7 +520,7 @@ class AgentLoopWorker:
 
             self.tokenizer.padding_side = "right"
             response_output = self.tokenizer.pad(
-                {"input_ids": output.response_ids},
+                {"input_ids": output.response_ids or [[]]},   # [] => an empty batch, [[]] => a batch with an empty seq
                 padding="max_length",
                 max_length=self.config.actor_rollout_ref.rollout.response_length,
                 return_tensors="pt",
@@ -547,7 +531,7 @@ class AgentLoopWorker:
                 response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
             response_mask_output = self.tokenizer.pad(
-                {"input_ids": output.response_mask},
+                {"input_ids": output.response_mask or [[]]},  # [] => an empty batch, [[]] => a batch with an empty seq
                 padding="max_length",
                 max_length=self.config.actor_rollout_ref.rollout.response_length,
                 return_tensors="pt",
@@ -589,7 +573,7 @@ class AgentLoopWorker:
                 video_grid_thw = multi_modal_inputs.get("video_grid_thw")
                 second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
 
-                position_ids = get_rope_index(
+                vision_position_ids = get_rope_index(
                     self.processor,
                     input_ids=input_ids.squeeze(0),
                     image_grid_thw=image_grid_thw,
@@ -597,11 +581,19 @@ class AgentLoopWorker:
                     second_per_grid_ts=second_per_grid_ts,
                     attention_mask=attention_mask.squeeze(0),
                 ).unsqueeze(0)  # (1, 3, seq_len)
+
+                valid_mask = attention_mask[0].bool()
+                text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+                text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+                text_position_ids = text_position_ids.unsqueeze(0)
+                position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
             else:
                 position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
             enable_async_reward = (
                 self.rm_executor is not None and self.config.reward_model.enable_resource_pool
             ) or not self.config.reward_model.enable
+            if self.config.reward_model.disable_async_reward:
+                enable_async_reward = False
             if output.reward_score is None and enable_async_reward:
                 batch = TensorDict(
                     {
@@ -646,7 +638,38 @@ class AgentLoopWorker:
                 extra_fields=output.extra_fields,
             )
 
-    def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
+        with rollout_trace_attr(
+            step=trajectory["step"],
+            sample_index=trajectory["sample_index"],
+            rollout_n=trajectory["rollout_n"],
+            validate=trajectory["validate"],
+            name="agent_loop",
+        ):
+            assert agent_name in _agent_loop_registry, (
+                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+            )
+
+            agent_loop_config = _agent_loop_registry[agent_name]
+            agent_loop = hydra.utils.instantiate(
+                config=agent_loop_config,
+                trainer_config=_DummyConfig(config=self.config),
+                server_manager=self.server_manager,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+            )
+
+            kwargs["_validate"] = trajectory["validate"]
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+
+            internal_outputs = [await process_output(output, **kwargs)]
+            if output.subagent_outputs:
+                for subagent_output in output.subagent_outputs:
+                    internal_outputs.append(await process_output(subagent_output, **kwargs))
+
+            return internal_outputs
+    
+
+    def _postprocess(self, inputs: list[_InternalAgentLoopOutput], is_validate: bool) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
@@ -692,9 +715,14 @@ class AgentLoopWorker:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
-        multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
-        if any(mmi is not None for mmi in multi_modal_inputs_list):
-            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
+        # Validation do not need multi_modal_inputs, so we drop them
+        multi_modal_inputs_list = []
+        for i, input in enumerate(inputs):
+            if is_validate:
+                multi_modal_inputs_list.append(None)
+            else:
+                multi_modal_inputs_list.append(input.multi_modal_inputs)
+        non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
         # Collect extra fields from all inputs and convert them to np.ndarray
@@ -852,6 +880,13 @@ class AgentLoopManager:
         output = DataProto.concat(outputs)
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
+
+        if "critical_failure" in output.non_tensor_batch:
+            critical_failure = output.non_tensor_batch["critical_failure"]
+            failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)
+            max_failure_ratio = self.config.actor_rollout_ref.rollout.agent.get("max_critical_failure_ratio", 0.2)
+            if failure_ratio > max_failure_ratio:
+                raise RuntimeError(f"Critical failure ratio {failure_ratio} exceeds the threshold {max_failure_ratio}")
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]

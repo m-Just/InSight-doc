@@ -114,7 +114,12 @@ class ToolAgentLoop(AgentLoopBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
-        image_data = copy.deepcopy(kwargs.get("multi_modal_data", {}).get("image", None))
+        image_data = kwargs.get("multi_modal_data", {}).get("image", None)
+        if image_data is not None:
+            if isinstance(image_data, list):
+                image_data = image_data.copy()  # avoid deepcopy to save memory
+            else:
+                image_data = [image_data]
         metrics = {}
         request_id = uuid4().hex
         tools_kwargs = kwargs.get("tools_kwargs", {})
@@ -292,26 +297,18 @@ class ToolAgentLoop(AgentLoopBase):
                 message = {"role": "tool", "content": tool_response.text or ""}
 
             add_messages.append(message)
-            agent_data.messages.extend(add_messages)
 
             # Handle image data
             if tool_response.image:
-                if agent_data.image_data is None:
-                    agent_data.image_data = []
-                elif not isinstance(agent_data.image_data, list):
-                    agent_data.image_data = [agent_data.image_data]
-
                 # Add new image data
                 if isinstance(tool_response.image, list):
                     # Ensure all elements in the list are valid image objects
                     for img in tool_response.image:
                         if img is not None:  # Add a check to ensure the image is not None
-                            agent_data.image_data.append(img)
                             new_images_this_turn.append(img)  # Using local variable
                 else:
                     # Ensure the image is not None
                     if tool_response.image is not None:
-                        agent_data.image_data.append(tool_response.image)
                         new_images_this_turn.append(tool_response.image)  # Using local variable
 
             # Handle video data
@@ -324,6 +321,8 @@ class ToolAgentLoop(AgentLoopBase):
 
             if tool_reward is not None:
                 agent_data.tool_rewards.append(tool_reward)
+
+        agent_data.messages.extend(add_messages)
 
         # Update prompt with tool responses
         if self.processor is not None:
@@ -349,6 +348,15 @@ class ToolAgentLoop(AgentLoopBase):
         if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
             return AgentState.TERMINATED
         # Update prompt_ids and response_mask
+
+        if new_images_this_turn:
+            if agent_data.image_data is None:
+                agent_data.image_data = []
+            elif not isinstance(agent_data.image_data, list):
+                agent_data.image_data = [agent_data.image_data]
+            for img in new_images_this_turn:
+                agent_data.image_data.append(img)
+
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
         if agent_data.response_logprobs:

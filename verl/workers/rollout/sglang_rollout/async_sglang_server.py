@@ -78,7 +78,12 @@ class SGLangHttpServer:
 
         self.config: RolloutConfig | RewardModelConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        if not self.config.get("max_model_len", None):
+            self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        assert (
+            self.config.max_model_len >= self.config.prompt_length + self.config.response_length
+        ), f"""max_model_len should be greater than total sequence length (prompt_length + response_length): 
+            {self.config.max_model_len} >= {self.config.prompt_length} + {self.config.response_length}"""
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -207,6 +212,8 @@ class SGLangHttpServer:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_new_tokens = min(self.config.response_length, self.config.max_model_len - len(prompt_ids) - 1)
+        if "max_new_tokens" in sampling_params:
+            max_new_tokens = min(sampling_params.pop("max_new_tokens"), max_new_tokens)
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 

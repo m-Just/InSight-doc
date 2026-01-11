@@ -139,7 +139,12 @@ class vLLMHttpServer:
 
         self.config: RolloutConfig | RewardModelConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        if not self.config.get("max_model_len", None):
+            self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        assert (
+            self.config.max_model_len >= self.config.prompt_length + self.config.response_length
+        ), f"""max_model_len should be greater than total sequence length (prompt_length + response_length): 
+            {self.config.max_model_len} >= {self.config.prompt_length} + {self.config.response_length}"""
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -347,6 +352,8 @@ class vLLMHttpServer:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
         max_tokens = self.config.max_model_len - len(prompt_ids)
+        if "max_tokens" in sampling_params:
+            max_tokens = min(sampling_params.pop("max_tokens"), max_tokens)
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)

@@ -1,0 +1,718 @@
+import asyncio
+import json
+import os
+import time
+from dataclasses import asdict, dataclass
+from typing import Any, Callable
+
+from openai import AsyncOpenAI
+
+from verl.utils.vsearch import (
+    BBox,
+    iou as compute_iou,
+    compute_overall_iou_with_gt,
+    intersection_area,
+    extract_bbox_from_tool_call,
+    extract_final_bbox_from_response,
+)
+from verl.utils.vsearch_role_play_prompt import qa_verify as verify_prompt
+
+from insight_o3.utils.api import query_api  # type: ignore
+
+
+class ParseError(Exception): pass
+class JudgeError(Exception): pass
+
+
+class RewardComputer:
+    """Manages reward computation with asyncio concurrency and timeout handling."""
+
+    def __init__(
+        self,
+        num_workers: int = 32,
+        task_timeout: int = 60,
+        min_success_rate: float = 0.85,
+        max_retries: int = 10,
+        retry_interval: int = 30,
+        **kwargs,
+    ):
+        self.num_workers = num_workers
+        self.task_timeout = task_timeout
+        self.min_success_rate = min_success_rate
+        self.max_retries = max_retries
+        self.retry_interval = retry_interval
+        self._semaphore: asyncio.Semaphore | None = None
+
+    def __enter__(self):
+        raise RuntimeError("RewardComputer must be used as an async context manager")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    async def __aenter__(self):
+        self._semaphore = asyncio.Semaphore(self.num_workers)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._semaphore = None
+
+    async def _run_single(
+        self,
+        idx: int,
+        compute_single_fn: Callable,
+        data_source: str,
+        solution_str: str,
+        ground_truth: str,
+        extra_info: dict,
+        **reward_kwargs: dict,
+    ) -> tuple[int, Any, Exception | None]:
+        assert self._semaphore is not None
+        try:
+            async with self._semaphore:
+                result = await asyncio.wait_for(
+                    compute_single_fn(
+                        data_source,
+                        solution_str,
+                        ground_truth,
+                        extra_info,
+                        **reward_kwargs,
+                    ),
+                    timeout=self.task_timeout,
+                )
+            return idx, result, None
+        except Exception as exc:  # bubble idx back to the collector
+            return idx, None, exc
+
+    async def compute_batch(
+        self,
+        compute_single_fns: list[Callable],
+        data_sources: list[str],
+        solution_strs: list[str],
+        ground_truths: list[str],
+        extra_infos: list[dict],
+        **reward_kwargs: dict,
+    ) -> tuple[list[bool], list[dict[str, Any] | None]]:
+        """
+        Compute rewards for a batch with retry mechanism to handle network instability.
+        Ensures at least `min_success_rate` success rate for verification to maintain training stability.
+        """
+        if not self._semaphore:
+            raise RuntimeError("RewardComputer must be used as async context manager")
+
+        total_samples = len(solution_strs)
+        trial_count = 1
+        results = [None] * total_samples
+        success = [False] * total_samples
+
+        while trial_count <= self.max_retries:
+            tasks = []
+            for i, (data_source, solution_str, ground_truth, extra_info) in enumerate(
+                zip(data_sources, solution_strs, ground_truths, extra_infos, strict=True)
+            ):
+                if success[i]:
+                    continue
+                compute_single_fn = compute_single_fns[i]
+                task = asyncio.create_task(
+                    self._run_single(
+                        i,
+                        compute_single_fn,
+                        data_source,
+                        solution_str,
+                        ground_truth,
+                        extra_info,
+                        **reward_kwargs,
+                    )
+                )
+                tasks.append(task)
+
+            for task in asyncio.as_completed(tasks):
+                idx, task_result, error = await task
+                if error is None:
+                    results[idx] = task_result
+                    success[idx] = True
+                    continue
+
+                if isinstance(error, JudgeError):
+                    print(f"[RewardWorker] Task {idx} failed: {error}")
+                elif isinstance(error, asyncio.TimeoutError):
+                    print(f"[RewardWorker] Task {idx} timed out after {self.task_timeout}s")
+                else:
+                    print(f"[RewardWorker] Task {idx} encountered an unexpected error")
+                    raise error
+
+            task_success_rate = sum(success) / total_samples
+            num_failed = total_samples - sum(success)
+            if task_success_rate >= self.min_success_rate:
+                print(
+                    f"[RewardWorker] Work finished with "
+                    f"{sum(success)} successful, {num_failed} failed, "
+                    f"success rate: {task_success_rate:.3f}."
+                )
+                return success, results
+
+            if trial_count == self.max_retries:
+                error_msg = (
+                    f"[RewardWorker] ERROR: Failed to achieve required success rates after {self.max_retries} trials. "
+                    f"Final task success rate: {task_success_rate:.3f}, "
+                    f"Required minimum: {self.min_success_rate:.3f}. "
+                    f"Please check your network and API availability."
+                )
+                raise RuntimeError(error_msg)
+
+            print(
+                f"[RewardWorker] Trial [{trial_count}/{self.max_retries}] has {num_failed} tasks failed, "
+                f"success rate {task_success_rate:.3f} below threshold {self.min_success_rate:.3f}. "
+                f"Retrying in {self.retry_interval} seconds."
+            )
+            trial_count += 1
+
+            try:
+                await self._interruptible_sleep(self.retry_interval)
+            except KeyboardInterrupt:
+                print("[RewardWorker] Interrupted during retry wait, shutting down...")
+                raise
+
+        return success, results
+
+    async def _interruptible_sleep(self, duration: int):
+        """Sleep in small chunks to allow interruption by signals."""
+        chunk_size = 1  # Sleep 1 second at a time
+        elapsed = 0
+        while elapsed < duration:
+            await asyncio.sleep(min(chunk_size, duration - elapsed))
+            elapsed += chunk_size
+
+
+@dataclass
+class Score:
+    score: float
+    format_reward: float = 0.0
+    accuracy_reward: float = 0.0
+    tool_reward: float = 0.0
+    iou_reward: float = 0.0
+
+    n_valid_tool_calls: int = 0
+    extracted_answer: Any = None
+
+    tool_iou: float = 0.0
+    final_iou: float = 0.0
+
+    def __init__(self, reward_weights: dict):
+        self.reward_weights = reward_weights
+
+    @property
+    def score(self) -> float:
+        return (
+            self.format_reward * self.reward_weights["format"]
+            + self.accuracy_reward * self.reward_weights["accuracy"]
+            + self.tool_reward * self.reward_weights["tool"]
+            + self.iou_reward * self.reward_weights["iou"]
+        )
+
+    @property
+    def is_correct(self) -> bool:
+        return self.accuracy_reward > 0.0
+
+
+@dataclass
+class ScoreConditionedOnToolReward(Score):
+    def __init__(self, reward_weights: dict):
+        self.reward_weights = reward_weights
+
+    @property
+    def score(self) -> float:
+        assert self.accuracy_reward * self.iou_reward == 0.0
+        return self.tool_reward * (
+            self.format_reward * self.reward_weights["format"]
+            + self.accuracy_reward * self.reward_weights["accuracy"]
+            + self.iou_reward * self.reward_weights["iou"]
+        )
+
+
+@dataclass
+class ScoreOnlyAccuracy(Score):
+    def __init__(self):
+        pass
+
+    @property
+    def score(self) -> float:
+        return self.accuracy_reward
+
+
+SCORE_CLASS_MAP = {
+    "basic_weighted_addition": Score,
+    "conditioned_on_tool_reward": ScoreConditionedOnToolReward,
+}
+
+
+def parse_response(
+    response: str,
+    *,
+    required_tags: list[str],
+    excluded_tags: list[str] | None = None,
+) -> dict[str, str]:
+    """Parse a response delimited by the given XML tags.
+
+    Expect the response to be in the following format (with the order following `required_tags`):
+        <required_tag_1>content_1</required_tag_1>
+        <required_tag_2>content_2</required_tag_2>
+        ...
+        <required_tag_n>content_n</required_tag_n>
+    Only whitespace characters are allowed before and after each tag.
+    Tags in `excluded_tags` must not appear in the response.
+
+    Args:
+        - response: the response to parse
+        - required_tags: the tags that must appear exactly once, in the exact order
+        - excluded_tags (optional): the tags that must not appear in the response
+
+    Returns:
+        - A dictionary of the parsed content, with the keys being the tag names and the values being the contents.
+
+    Raises:
+        - ParseError: if the response is not in the expected format.
+    """
+
+    def contain_tag(response: str, tag: str) -> bool:
+        return f"<{tag}>" in response or f"</{tag}>" in response
+
+    # Check if the excluded tags appear in the response
+    if excluded_tags is None:
+        excluded_tags = []
+    for tag in excluded_tags:
+        if contain_tag(response, tag):
+            raise ParseError(f"parse_response: excluded tag {tag} appears in the response")
+
+    parsed_content = {}
+
+    for tag in required_tags:
+        # Check if the opening tag is present
+        response = response.lstrip()
+        if not response.startswith(f"<{tag}>"):
+            raise ParseError(f"parse_response: missing opening tag for {tag}")
+
+        # Remove the opening tag
+        response = response[len(f"<{tag}>") :]
+
+        # Ensure that the closing tag is present
+        response_chunks = response.split(f"</{tag}>", 1)
+        if len(response_chunks) == 1:
+            raise ParseError(f"parse_response: missing closing tag for {tag}")
+
+        # Separate the content from the remaining response
+        content, response = response_chunks
+
+        # Ensure that the content does not contain any other required tags
+        for tag_other in required_tags:
+            if contain_tag(content, tag_other):
+                raise ParseError(f"parse_response: nested tags detected in {tag}")
+
+        parsed_content[tag] = content
+
+    # Ensure there is no unexpected content after the last pair of tags
+    if response.strip():
+        raise ParseError("parse_response: unexpected content after the last pair of tags")
+
+    return parsed_content
+
+
+def compute_format_reward(
+    solution_str: str,
+    tool_call_check_fn: Callable,
+    core_answer_extraction_fn: Callable | None = None,
+    must_have_answer: bool = True,
+    skip_last_response_if_empty: bool = True,
+) -> dict:
+    """Compute the format reward of the model's conversation with the user (tool response).
+       Extract the final answer and other information (e.g., bboxes) from the conversation in the process.
+
+    The conversation may contain multiple rounds of interaction between the model and the user.
+    At each round, the model can choose to either
+        a. call a tool; or
+        b. answer the query.
+
+    We reward the model if its response follows this format in every round:
+        <think>...</think>
+        <tool_call>...</tool_call> (if a tool is needed)
+        <answer>...</answer>       (otherwise)
+
+    In addition:
+        - Every response except the last one must end with a tool call.
+        - Every tool call must pass tool_call_check_fn.
+        - If must_have_answer is True, the last response must contain an answer.
+        - If skip_last_response_if_empty is True, the last response may be empty
+            (in case the conversation was stopped early).
+
+    Args:
+        - solution_str: a conversation between the model and the user (excluding the system prompt
+            and the initial user prompt), formatted as follows:
+                [... initial_model_response ...]\n
+                user\n
+                [... tool_response ...]\n
+                assistant\n
+                [... model_response ...]\n
+                ...
+        - tool_call_check_fn: a function that checks if the tool call is valid
+        - core_answer_extraction_fn: a function that tries to extract the core answer (within the answer tags)
+            from the model's response; the function should return None if the core answer can't be extracted;
+            if the function is not provided, the whole string within the answer tags will be extracted.
+        - must_have_answer: whether the model must answer the query.
+        - skip_last_response_if_empty: whether to skip the last response if it is empty.
+
+    Returns:
+        - format_reward: a float that is either 0.0 or 1.0
+        - reward_extra_info: a dictionary for storing the extracted answer and other information
+            - extracted_answer: the final answer of the conversation; can be None
+    """
+
+    # Extract the responses from the conversation
+    responses = [round.split("assistant\n")[-1] for round in solution_str.split("user\n")]
+    if skip_last_response_if_empty and not responses[-1]:
+        responses = responses[:-1]
+
+    # Check if every response strictly follows the format
+    # Extract the bboxes and the final answer (if given) in the process
+    reward_extra_info = {"extracted_answer": None}
+
+    for i, response in enumerate(responses):
+        # Check if this is a valid tool-call response
+        try:
+            content = parse_response(response, required_tags=["think", "tool_call"], excluded_tags=["answer"])
+        except ParseError:
+            is_valid_tool_call = False
+        else:
+            is_valid_tool_call = True
+
+        # If this is not a valid tool-call response, see if it is the last response
+        # If it is the last response, the format can only be valid if it has an answer
+        # If it is not the last response, the format is wrong
+        if not is_valid_tool_call:
+            if i + 1 == len(responses):
+                must_have_answer = True
+                break
+            else:
+                return 0.0, reward_extra_info
+
+        # Check if the tool call is valid
+        if not tool_call_check_fn(content["tool_call"], reward_extra_info):
+            return 0.0, reward_extra_info
+
+    # Try to parse the last response as an answer response
+    if responses:
+        try:
+            content = parse_response(responses[-1], required_tags=["think", "answer"], excluded_tags=["tool_call"])
+        except ParseError:
+            if must_have_answer:
+                return 0.0, reward_extra_info
+
+        if "answer" in content:
+            if core_answer_extraction_fn:
+                reward_extra_info["extracted_answer"] = core_answer_extraction_fn(content["answer"])
+                if must_have_answer and reward_extra_info["extracted_answer"] is None:
+                    return 0.0, reward_extra_info
+            else:
+                reward_extra_info["extracted_answer"] = content["answer"].strip()
+
+    return 1.0, reward_extra_info
+
+
+async def compute_accuracy_reward(
+    data_source: str,
+    question: str,
+    extracted_answer: str,
+    ground_truth: str,
+    judge_client: AsyncOpenAI,
+    judge_model: str = "gpt-5-nano",
+) -> float:
+    """Compute the accuracy reward of the extracted answer."""
+
+    if extracted_answer == ground_truth:
+        return 1.0
+
+    # Use judge model to verify the answer
+    query = verify_prompt.format(
+        question=question,
+        gt_answer=ground_truth,
+        model_answer=extracted_answer,
+    )
+
+    try:
+        _, judge_response = await query_api(
+            query,
+            model=judge_model,
+            client=judge_client,
+            max_tokens=2048,
+        )
+        response_text = judge_response.choices[0].message.content
+    except Exception as e:
+        raise JudgeError(f"failed to verify answer correctness: {e}")
+
+    return float("<correct>" in response_text)
+
+
+async def compute_score_single_vsearch_base(
+    solution_str: str,
+    extra_info: dict,
+    core_answer_extraction_fn: Callable | None = None,
+    **reward_kwargs: dict,
+) -> tuple[Score, dict]:
+    assert len(extra_info["image_processed_wh"]) == 1, "only support single input image"
+    score_cls = SCORE_CLASS_MAP[reward_kwargs["reward_type"]]
+    score = score_cls(reward_kwargs["reward_weights"])
+
+    def tool_call_check_fn(tool_call: str, reward_extra_info: dict) -> bool:
+        try:
+            tool_call_dict = json.loads(tool_call)
+        except json.JSONDecodeError as e:
+            print(f"[RewardWorker] Error parsing tool call JSON: {e}")
+            return False
+        if not isinstance(tool_call_dict, dict):
+            return False
+        if tool_call_dict.get("name") != "image_zoom_in_tool":
+            return False
+        try:
+            bbox = extract_bbox_from_tool_call(tool_call)
+        except Exception as e:
+            print(f"[RewardWorker] Error extracting bbox from tool call: {e}")
+            return False
+        if intersection_area(bbox, (0, 0, *extra_info["image_processed_wh"][0])) == 0.0:
+            return False
+        reward_extra_info.setdefault("bboxes", []).append(bbox)
+        return True
+
+    # Compute the format reward
+    score.format_reward, reward_extra_info = compute_format_reward(
+        solution_str,
+        tool_call_check_fn,
+        core_answer_extraction_fn=core_answer_extraction_fn,
+        must_have_answer=reward_kwargs["format_reward"]["must_have_answer"],
+        skip_last_response_if_empty=reward_kwargs["format_reward"]["skip_last_response_if_empty"],
+    )
+
+    score.extracted_answer = reward_extra_info["extracted_answer"]
+    bboxes_crop = reward_extra_info.setdefault("bboxes", [])
+    score.n_valid_tool_calls = min(len(bboxes_crop), solution_str.count("user\n<tool_response>"))
+
+    # Compute the iou if the ground truth bboxes are available
+    if extra_info.get("bboxes"):
+        tool_iou = compute_overall_iou_with_gt(
+            bboxes_crop, extra_info["bboxes"], extra_info["image_processed_wh"][0], extra_info["image_ori_wh"][0]
+        )
+        score.tool_iou = tool_iou
+
+    # If the format is wrong, return 0.0 for all rewards
+    if not score.format_reward:
+        return score, reward_extra_info
+
+    # Compute the tool reward
+    score.tool_reward = float(score.n_valid_tool_calls > 0)
+
+    # Penalize bad tool usage: cropping similar regions in two consecutive tool calls
+    seen_bboxes = [(0, 0, *extra_info["image_processed_wh"][0]), *bboxes_crop]
+    for i in range(1, len(seen_bboxes)):
+        iou = compute_iou(seen_bboxes[i-1], seen_bboxes[i])
+        max_consecutive_iou = reward_kwargs["tool_reward"]["max_consecutive_iou"]
+        if iou > max_consecutive_iou:
+            print(f"[RewardWorker] consecutive iou {iou} > {max_consecutive_iou}")
+            score.tool_reward = 0.0
+            break
+
+    return score, reward_extra_info
+
+
+async def compute_score_single_vsearcher(
+    data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **reward_kwargs: dict
+) -> Score:
+    def core_answer_extraction_fn(answer: str) -> BBox | None:
+        try:
+            return extract_final_bbox_from_response(answer)
+        except Exception as e:
+            print(f"[RewardWorker] compute_score_single_vsearcher: {e}")
+            return None
+
+    score, _ = await compute_score_single_vsearch_base(
+        solution_str,
+        extra_info,
+        core_answer_extraction_fn=core_answer_extraction_fn,
+        **reward_kwargs,
+    )
+
+    # Compute the iou reward
+    bbox_2d = score.extracted_answer
+    if bbox_2d is None or bbox_2d == (0, 0, 0, 0):
+        return score
+
+    final_iou = compute_overall_iou_with_gt(
+        [bbox_2d], extra_info["bboxes"], extra_info["image_processed_wh"][0], extra_info["image_ori_wh"][0]
+    )
+    score.final_iou = final_iou
+
+    iou_low, iou_high = reward_kwargs["iou_reward"]["iou_low"], reward_kwargs["iou_reward"]["iou_high"]
+    final_iou_clipped = max(iou_low, min(iou_high, score.final_iou))
+    score.iou_reward = (final_iou_clipped - iou_low) / (iou_high - iou_low)
+
+    return score
+
+
+async def compute_score_single_vsearcher_as_subagent(
+    data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **reward_kwargs: dict
+) -> Score:
+    score, _ = await compute_score_single_vsearch_base(solution_str, extra_info, **reward_kwargs)
+    return score
+
+
+async def compute_score_single_vreasoner(
+    data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **reward_kwargs: dict
+) -> Score:
+    """ For vReasonser, we only care about whether the answer is correct.  """
+    score = ScoreOnlyAccuracy()
+    score.format_reward = 1.0
+
+    if "\\boxed{" in solution_str:
+        score.extracted_answer = solution_str.split("\\boxed{", 1)[1].split("}", 1)[0].strip()
+    elif "<answer>" in solution_str and "</answer>" in solution_str:
+        score.extracted_answer = solution_str.split("<answer>", 1)[1].split("</answer>", 1)[0].strip()
+
+    score.accuracy_reward = await compute_accuracy_reward(
+        data_source,
+        extra_info["question"],
+        score.extracted_answer,
+        ground_truth,
+        reward_kwargs["judge_client"],
+        reward_kwargs["judge_model"],
+    )
+
+    score.n_valid_tool_calls = solution_str.count("<tool_response>")
+    return score
+
+
+def _update_subagent_iou_rewards(
+    scores: list[Score | None],
+    extra_infos: list[dict],
+    pseudo_iou_reward_type: str,
+) -> None:
+    """Update subagent iou_reward with pseudo_iou_reward based on caller_feedback and root's accuracy_reward.
+
+    This separates the reward computation from the advantage estimation in compute_advantage.
+    For subagents (where parent_job_id is not None), we compute a pseudo_iou_reward based on:
+    - The subagent's caller_feedback
+    - The root job's accuracy_reward
+
+    The pseudo_iou_reward is then set as the subagent's iou_reward.
+    """
+
+    # Build mapping from job_id to index
+    job_id_to_idx = {}
+    for i, extra_info in enumerate(extra_infos):
+        job_id = extra_info.get("job_id")
+        if job_id is not None:
+            job_id_to_idx[job_id] = i
+
+    # Update subagent iou_rewards
+    for i, extra_info in enumerate(extra_infos):
+        # Only process subagents (where parent_job_id is not None)
+        if extra_info.get("parent_job_id") is None:
+            continue
+
+        # Get root job's accuracy_reward
+        root_idx = job_id_to_idx[extra_info["root_job_id"]]
+        root_accuracy_reward = scores[root_idx].accuracy_reward
+
+        # Compute pseudo_iou_reward based on pseudo_iou_reward_type
+        caller_feedback = extra_info["caller_feedback"]
+        if "caller_feedback_no_outcome" in pseudo_iou_reward_type:
+            pseudo_iou_reward = float(caller_feedback == "helpful")
+        elif "outcome_no_caller_feedback" in pseudo_iou_reward_type:
+            pseudo_iou_reward = float(root_accuracy_reward == 1.0)
+        else:
+            pseudo_iou_reward = float(caller_feedback == "helpful" and root_accuracy_reward == 1.0)
+
+        # Update score
+        scores[i].iou_reward = pseudo_iou_reward
+
+
+def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos, **reward_kwargs):
+    """
+    Optimized batch reward computation using asyncio-based concurrency and timeout handling.
+    """
+
+    async def _compute_score_batch():
+        print(
+            f"[RewardWorker] Computing rewards for {len(solution_strs)} samples "
+            f"with {reward_kwargs['num_workers']} workers "
+            f"using {reward_kwargs['judge_model']} verification."
+        )
+        start_time = time.time()
+
+        compute_single_fns = []
+        for i, extra_info in enumerate(extra_infos):
+            if "agent_name" not in extra_info:
+                raise KeyError(f"agent_name not found in extra_info: {extra_info}")
+
+            if extra_info["agent_name"] == "vsearcher":
+                if extra_info.get("parent_job_id") is None:
+                    compute_single_fns.append(compute_score_single_vsearcher)
+                else:
+                    compute_single_fns.append(compute_score_single_vsearcher_as_subagent)
+            elif extra_info["agent_name"] == "vreasoner":
+                compute_single_fns.append(compute_score_single_vreasoner)
+            else:
+                raise ValueError(f"Unknown agent name: {extra_info['agent_name']}")
+
+        _client_timeout = os.getenv("OPENAI_CLIENT_TIMEOUT", None)
+        if _client_timeout is not None:
+            _client_timeout = float(_client_timeout)
+        judge_client = AsyncOpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL"),
+            timeout=_client_timeout,
+        )
+
+        reward_kwargs_with_client = {**reward_kwargs, "judge_client": judge_client}
+        try:
+            async with RewardComputer(**reward_kwargs_with_client) as reward_computer:
+                success, scores = await reward_computer.compute_batch(
+                    compute_single_fns=compute_single_fns,
+                    data_sources=data_sources,
+                    solution_strs=solution_strs,
+                    ground_truths=ground_truths,
+                    extra_infos=extra_infos,
+                    **reward_kwargs_with_client,
+                )
+        finally:
+            await judge_client.close()
+
+        # Post-process: update subagent iou_reward with pseudo_iou_reward
+        pseudo_iou_reward_type = reward_kwargs.get("pseudo_iou_reward_type", "")
+        if "caller_feedback" in pseudo_iou_reward_type and any(ei.get("caller_feedback") for ei in extra_infos):
+            _update_subagent_iou_rewards(scores, extra_infos, pseudo_iou_reward_type)
+
+        n_skipped = sum(s is None for s in success)
+        n_failed = sum(s is False for s in success)
+        n_correct = sum(score.is_correct for score in scores if score is not None)
+        n_wrong = sum(not score.is_correct for score in scores if score is not None)
+        print(
+            f"[RewardWorker] Accuracy ({reward_kwargs['judge_model']}): "
+            f"{n_correct} correct, {n_wrong} wrong, {n_failed} failed, {n_skipped} skipped out of {len(scores)} samples"
+        )
+
+        score_dicts = []
+        for compute_score_success, score in zip(success, scores, strict=True):
+            if score is None:
+                score_cls = SCORE_CLASS_MAP[reward_kwargs["reward_type"]]
+                score = score_cls(reward_kwargs["reward_weights"])  # dummy score
+            score_dict = asdict(score)
+            score_dict["compute_score_success"] = compute_score_success
+            score_dicts.append(score_dict)
+
+        print(f"[RewardWorker] Reward computation completed, time: {time.time() - start_time:.2f}s")
+        return score_dicts
+
+    try:
+        return asyncio.run(_compute_score_batch())
+    except RuntimeError as e:
+        # asyncio.run cannot be called from a running event loop; surface a clear error.
+        if "asyncio.run()" in str(e):
+            raise RuntimeError("compute_score_batch must be called from a non-async context") from e
+        raise
+

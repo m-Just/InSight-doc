@@ -20,13 +20,19 @@ from PIL import Image
 from qwen_vl_utils import fetch_image, fetch_video
 
 
-def process_image(image: dict | Image.Image) -> Image.Image:
+def process_image(image: dict | Image.Image, max_pixels: int | None = None) -> Image.Image:
     if isinstance(image, Image.Image):
-        return image.convert("RGB")
+        image = {"image": image}
+    assert isinstance(image, dict), f"Invalid image type: {type(image)}"
 
     if "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
         image["image"] = Image.open(BytesIO(image["bytes"]))
+    elif isinstance(image["image"], dict) and "bytes" in image["image"]:
+        image["image"] = Image.open(BytesIO(image["image"]["bytes"]))
+
+    if max_pixels is not None:
+        image["max_pixels"] = max_pixels
 
     return fetch_image(image)
 

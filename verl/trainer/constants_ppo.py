@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import json
 import os
 
@@ -21,8 +20,10 @@ PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
         "NCCL_DEBUG": "WARN",
-        "VLLM_LOGGING_LEVEL": "WARN",
+        "VLLM_LOGGING_LEVEL": os.environ.get("VLLM_LOGGING_LEVEL", "WARN"),
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+        "RAY_DEBUG_POST_MORTEM": os.environ.get("RAY_DEBUG_POST_MORTEM", "0"),
+        "CUDA_LAUNCH_BLOCKING": os.environ.get("CUDA_LAUNCH_BLOCKING", "0"),
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         # To prevent hanging or crash during synchronization of weights between actor and rollout
         # in disaggregated mode. See:
