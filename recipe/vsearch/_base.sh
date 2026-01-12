@@ -149,6 +149,8 @@ run_experiment () {
             actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
             actor_rollout_ref.rollout.n=8 \
             actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
+            actor_rollout_ref.rollout.agent.agent_loop_config_path="recipe/vsearch/config/agent_${API_MODEL_FOR_AGENT:-gpt-5-mini}.yaml" \
+            custom_reward_function.reward_kwargs.judge_model="${JUDGE_MODEL:-gpt-5-nano}" \
             trainer.logger="$logger" \
             trainer.project_name="$PROJECT_NAME" \
             trainer.experiment_name="$EXP_NAME" \
@@ -162,6 +164,8 @@ run_experiment () {
             trainer.total_training_steps=150 \
             trainer.resume_from_step="$resume_from_step" \
             trainer.train_dump_dir="$train_dump_dir" \
-            trainer.val_dump_dir="$val_dump_dir" "$@" 2>&1 | tee -a "$log_file"
+            trainer.val_dump_dir="$val_dump_dir" \
+            trainer.max_val_sample_dump_per_data_source="${MAX_VAL_SAMPLE_DUMP_PER_DATA_SOURCE:-5}" \
+            "$@" 2>&1 | tee -a "$log_file"
     )
 }

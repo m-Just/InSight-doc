@@ -40,6 +40,7 @@ class ExtraFields:
     caller_feedback: str | None = None
     final_bbox: BBox | None = None
     critical_failure: bool | None = None   # None if don't care
+    messages: list[dict] | None = None
     multi_modal_data: dict[str, Any] | None = None
 
 
@@ -53,13 +54,11 @@ class VSearcherLoop(ToolAgentLoop):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        # TODO: fix chat template for this agent loop
         # Currently:
         # - we bake the system prompt into the dataset parquet files (or vreasoner calls), not using tool schemas
         # - we ignore tool messages returned by image_zoom_in_tool and manually add the messages to the chat template;
         #   however, errors returned by image_zoom_in_tool are still passed to the model, prompting its response
         self.tool_schemas = None
-        ...
 
         validate = kwargs["_validate"]
         if validate:
@@ -84,7 +83,6 @@ class VSearcherLoop(ToolAgentLoop):
         # Extract final bbox from response text
         response_text = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
         last_response = response_text.split("user\n")[-1].split("assistant\n")[-1]
-        match = re.search(r"\]\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\[", last_response[::-1])
 
         try:
             final_bbox = extract_final_bbox_from_response(last_response)
@@ -126,6 +124,7 @@ class VSearcherLoop(ToolAgentLoop):
             n_tool_calls=(output.num_turns - 1) // 2,   # the number of successful tool calls = the number of user turns
             caller_feedback=None,
             final_bbox=final_bbox,
+            messages=self.messages,
             multi_modal_data=output.multi_modal_data,
         )
 
@@ -136,6 +135,8 @@ class VSearcherLoop(ToolAgentLoop):
     async def _handle_generating_state(
         self, agent_data: AgentData, sampling_params: dict[str, Any], ignore_termination: bool = False
     ) -> AgentState:
+        self.messages = agent_data.messages
+
         max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
         if len(agent_data.prompt_ids) >= max_model_len:
             logger.warning(f"prompt len exceeded max model len: {len(agent_data.prompt_ids)=} >= {max_model_len=}")
@@ -172,23 +173,23 @@ class VReasonerLoop(AgentLoopBase):
         self,
         trainer_config: _DummyConfig,
         server_manager: AsyncLLMServerManager,
-        tokenizer: AutoTokenizer,               # tokenizer for vSearcher
-        processor: AutoProcessor,               # processor for vSearcher
-        # TODO: make it configurable in the config file
-        model: str = os.getenv("API_MODEL_FOR_AGENT", "gpt-5-mini"),              # API model name for vReasoner
-        max_tool_calls: int = 6,                # max number of tool calls for vReasoner
-        max_round_retries: int = 3,             # max number of retries for vReasoner
-        # TODO: make it configurable in the config file
-        gpt_image_max_area: int = int(os.getenv("GPT_IMAGE_MAX_AREA", str(1280 * 1280))),  # max area for GPT image in vReasoner
-        reasoning_effort: str | None = None,    # reasoning effort for vReasoner
-        enable_tool_feedback: bool = True,      # enable tool feedback for vReasoner
-        **kwargs,                               # extra kwargs for vReasoner
+        tokenizer: AutoTokenizer,                  # tokenizer for vSearcher
+        processor: AutoProcessor,                  # processor for vSearcher
+        model: str = "gpt-5-mini",                 # API model name for vReasoner
+        max_tool_calls: int = 6,                   # max number of tool calls for vReasoner
+        max_round_retries: int = 3,                # max number of retries for vReasoner
+        gpt_image_max_area: int = 1280 * 1280,     # max area for GPT image in vReasoner
+        max_completion_tokens: int | None = 2048,  # max completion tokens (per turn) for vReasoner
+        reasoning_effort: str | None = None,       # reasoning effort for vReasoner
+        enable_tool_feedback: bool = True,         # enable tool feedback for vReasoner
+        **kwargs,                                  # extra kwargs for vReasoner
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, **kwargs)
         self.model = model
         self.max_tool_calls = max_tool_calls
         self.max_round_retries = max_round_retries
         self.gpt_image_max_area = gpt_image_max_area
+        self.max_completion_tokens = max_completion_tokens
         self.reasoning_effort = reasoning_effort
         self.enable_tool_feedback = enable_tool_feedback
         self.vsearcher_loop = VSearcherLoop(trainer_config, server_manager, tokenizer, processor)
@@ -200,7 +201,7 @@ class VReasonerLoop(AgentLoopBase):
 
         validate = kwargs["_validate"]
 
-        messages = []
+        messages_api = []
         bbox = None
         n_tool_calls = 0
         vsearcher_outputs = []
@@ -208,19 +209,21 @@ class VReasonerLoop(AgentLoopBase):
         multi_modal_data = {"image": []}
 
         metrics = AgentLoopMetrics()
-        metrics_local = {}
+        profile = {}
 
+        # Start agent loop
         while True:
-            with simple_timer("api_calls", metrics_local):
+            with simple_timer("api_calls", profile):
                 request = await get_gpt_visual_search_request(
                     initial_question=kwargs["extra_info"]["question"],
                     original_image=kwargs["extra_info"]["image_ori"][0],
-                    messages=messages,
+                    messages=messages_api,
                     bbox=bbox,
                     model=self.model,
                     max_tool_calls=self.max_tool_calls,
                     max_round_retries=self.max_round_retries,
                     gpt_image_max_area=self.gpt_image_max_area,
+                    max_completion_tokens=self.max_completion_tokens,
                     reasoning_effort=self.reasoning_effort,
                     enable_tool_feedback=(False if validate else self.enable_tool_feedback),
                 )
@@ -230,7 +233,7 @@ class VReasonerLoop(AgentLoopBase):
                 critical_failure = True
                 break
 
-            messages = request.messages
+            messages_api = request.messages
             if vsearcher_outputs:
                 vsearcher_outputs[-1].extra_fields["caller_feedback"] = request.tool_feedback
 
@@ -239,10 +242,12 @@ class VReasonerLoop(AgentLoopBase):
 
             n_tool_calls += 1
 
-            # Prepare vSearcherLoop.run() kwargs
-            # TODO: fix chat template for vsearcher
-            vsearcher_kwargs = {}
-            vsearcher_kwargs["raw_prompt"] = [
+            if n_tool_calls > self.max_tool_calls:
+                logger.warning(f"vreasoner: exceeded max vsearcher calls: {n_tool_calls} > {self.max_tool_calls}")
+                break
+
+            # Prepare vSearcherLoop.run() kwargs and sampling params
+            raw_prompt = [
                 {
                     "role": "system",
                     "content": 'You are a helpful assistant.\n\n# Tools\nYou may call one or more functions to assist with the user query.\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{"type":"function","function":{"name":"image_zoom_in_tool","description":"Zoom in on a specific region of an image by cropping it based on a bounding box (bbox) and an optional object label.","parameters":{"type":"object","properties":{"bbox_2d":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4,"description":"The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner."},"label":{"type":"string","description":"The name or label of the object in the specified bounding box (optional)."}},"required":["bbox"]}}}\n</tools>\n\n# How to call a tool\nReturn a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>\n\n**Example**:  \n<tool_call>  \n{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}  \n</tool_call>',
@@ -263,12 +268,15 @@ class VReasonerLoop(AgentLoopBase):
                     ],
                 },
             ]
-            vsearcher_kwargs["multi_modal_data"] = {"image": [kwargs["multi_modal_data"]["image"][0]]}
-            vsearcher_kwargs["tools_kwargs"] = kwargs["tools_kwargs"]
-            vsearcher_kwargs["extra_info"] = kwargs["extra_info"]
-            vsearcher_kwargs["parent_job_id"] = job_id
-            vsearcher_kwargs["root_job_id"] = root_job_id
-            vsearcher_kwargs["_validate"] = validate
+            vsearcher_kwargs = {
+                "raw_prompt": raw_prompt,
+                "multi_modal_data": {"image": [kwargs["multi_modal_data"]["image"][0]]},
+                "tools_kwargs": kwargs["tools_kwargs"],
+                "extra_info": kwargs["extra_info"],
+                "parent_job_id": job_id,
+                "root_job_id": root_job_id,
+                "_validate": validate,
+            }
 
             vsearcher_sampling_params = {
                 **sampling_params,
@@ -277,13 +285,13 @@ class VReasonerLoop(AgentLoopBase):
                 vsearcher_sampling_params["temperature"] = 0.0
 
             # Get the bbox from vsearcher output
-            with simple_timer("vsearcher_loop.run", metrics_local):
+            with simple_timer("vsearcher_loop.run", profile):
                 vsearcher_output = await self.vsearcher_loop.run(vsearcher_sampling_params, **vsearcher_kwargs)
             vsearcher_outputs.append(vsearcher_output)
 
             bbox = vsearcher_output.extra_fields["final_bbox"]
             if bbox is None:
-                logger.warning("vsearcher failure")
+                logger.warning("vsearcher failed to return a valid bbox")
                 break
 
             # Resize the target region bbox in scale with the original image resolution
@@ -292,85 +300,106 @@ class VReasonerLoop(AgentLoopBase):
                 target_wh = kwargs["extra_info"]["image_ori_wh"][0]
                 bbox = resize_bbox(bbox, source_wh, target_wh)
 
-        # Construct messages for answer evaluation and generation dumping
-        with simple_timer("adapt_messages", metrics_local):
-            messages_adapted = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "<|vision_start|><|vision_end|>" + kwargs["extra_info"]["question"]},
-                    ],
-                },
-            ]
+        logger.info(f"vreasoner loop completed: {profile=}")
 
-            apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
-            raw_prompt_adapted = self.processor.apply_chat_template(
-                messages_adapted,
+        # Construct messages for answer evaluation and visualization
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<|vision_start|><|vision_end|>" + kwargs["extra_info"]["question"]},
+            ],
+        }
+
+        messages = [user_message]
+
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        raw_prompt = self.processor.apply_chat_template(
+            messages,
+            tools=None,
+            add_generation_prompt=False,
+            tokenize=False,
+            **apply_chat_template_kwargs,
+        )
+
+        model_inputs = self.processor(text=[raw_prompt], return_tensors="pt")
+        prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+
+        # Collect response tokens; we left-truncate over-length text so it can fit within response_length
+        # This truncated text is only used for answer evaluation (note that max_length_char is in chars, not tokens)
+        # We also construct a non-truncated version of the messages (with images) for later visualizing the response
+        def maybe_truncate(text: str, max_length_char: int = 4096) -> str:
+            """Left-truncate text if it is too long."""
+            if len(text) > max_length_char:
+                logger.info(f"vreasoner turn response is too long: {len(text)} chars; "
+                            f"left-truncating to {max_length_char} chars")
+                return "..." + text[-max_length_char:][len("..."):]
+            return text
+
+        messages_shortened = messages.copy()
+        response_ids_shortened = []
+        response_mask_shortened = []
+        response_started = False
+
+        for message in messages_api:
+            if not isinstance(message, dict):
+                message = message.to_dict()
+
+            # Collect image data from the message for visualization
+            if isinstance(message["content"], list):
+                for content in message["content"]:
+                    if content["type"] == "image_url":
+                        image_url = content["image_url"]["url"]
+                        _, b64data = image_url.split(",", 1)
+                        img_bytes = base64.b64decode(b64data)
+                        img = Image.open(io.BytesIO(img_bytes))
+                        multi_modal_data["image"].append(img)
+
+            # Skip messages before the response starts
+            if message["role"] in ("system", "user") and not response_started:
+                continue
+
+            if message["role"] == "assistant":
+                response_started = True
+                text = message["content"]
+                if text is None:
+                    logger.warning(f"vreasoner: assistant message content is None")
+                    continue
+                content = [{"type": "text", "text": text}]
+                content_shortened = [{"type": "text", "text": maybe_truncate(text)}]
+            elif message["role"] == "user":
+                content = [
+                    {"type": "text", "text": "<tool_response>"},
+                    {"type": "image"},
+                    {"type": "text", "text": "</tool_response>"},
+                ]
+                content_shortened = [
+                    {"type": "text", "text": "<tool_response><|vision_start|><|vision_end|></tool_response>"},
+                ]
+            else:
+                logger.warning(f"vreasoner: unexpected message role: {message['role']}")
+                continue
+
+            messages.append({"role": message["role"], "content": content})
+            messages_shortened.append({"role": message["role"], "content": content_shortened})
+
+            raw_prompt_shortened = self.processor.apply_chat_template(
+                messages_shortened,
                 tools=None,
                 add_generation_prompt=False,
                 tokenize=False,
                 **apply_chat_template_kwargs,
             )
 
-            model_inputs_adapted = self.processor(text=[raw_prompt_adapted], return_tensors="pt")
-            prompt_ids_adapted = model_inputs_adapted.pop("input_ids").squeeze(0).tolist()
-            
-            response_ids_adapted = []
-            response_mask_adapted = []
+            model_inputs_shortened = self.processor(text=[raw_prompt_shortened], return_tensors="pt")
+            seq_ids_shortened = model_inputs_shortened.pop("input_ids").squeeze(0).tolist()
+            new_response_ids = seq_ids_shortened[len(prompt_ids) + len(response_ids_shortened):]
+            response_ids_shortened += new_response_ids
+            response_mask_shortened += [int(message["role"] == "assistant")] * len(new_response_ids)
 
-            response_started = False
-            for message in messages:
-                if not isinstance(message, dict):
-                    message = message.to_dict()
-
-                # Aside: collect image data from the message for dumping
-                if isinstance(message["content"], list):
-                    for content in message["content"]:
-                        if content["type"] == "image_url":
-                            image_url = content["image_url"]["url"]
-                            header, b64data = image_url.split(",", 1)
-                            img_bytes = base64.b64decode(b64data)
-                            img = Image.open(io.BytesIO(img_bytes))
-                            multi_modal_data["image"].append(img)
-
-                # Skip messages before the response starts
-                if message["role"] in ("system", "user") and not response_started:
-                    continue
-
-                if message["role"] == "assistant":
-                    response_started = True
-                    text = message["content"]
-                    if text is None:
-                        logger.warning(f"vreasoner: assistant message content is None")
-                        continue
-                elif message["role"] == "user":
-                    text = "<tool_response><|vision_start|><|vision_end|></tool_response>"
-                else:
-                    logger.warning(f"vreasoner: unexpected message role: {message['role']}")
-                    continue
-
-                messages_adapted.append({
-                    "role": message["role"],
-                    "content": [
-                        {"type": "text", "text": text},
-                    ],
-                })
-
-                raw_prompt_adapted = self.processor.apply_chat_template(
-                    messages_adapted,
-                    tools=None,
-                    add_generation_prompt=False,
-                    tokenize=False,
-                    **apply_chat_template_kwargs,
-                )
-
-                model_inputs_adapted = self.processor(text=[raw_prompt_adapted], return_tensors="pt")
-                seq_ids_adapted = model_inputs_adapted.pop("input_ids").squeeze(0).tolist()
-                new_response_ids = seq_ids_adapted[len(prompt_ids_adapted) + len(response_ids_adapted):]
-                response_ids_adapted += new_response_ids
-                response_mask_adapted += [int(message["role"] == "assistant")] * len(new_response_ids)
-
-        logger.warning(f"vreasoner: {metrics_local=}")
+        # Left truncate the response if it is still too long
+        response_length = self.config.actor_rollout_ref.rollout.response_length
+        response_ids_shortened = response_ids_shortened[-response_length:]
+        response_mask_shortened = response_mask_shortened[-response_length:]
 
         # Construct the extra fields for the final output
         extra_fields = ExtraFields(
@@ -381,6 +410,7 @@ class VReasonerLoop(AgentLoopBase):
             extra_info=kwargs["extra_info"],
             n_tool_calls=n_tool_calls,
             critical_failure=critical_failure,
+            messages=messages,
             multi_modal_data=multi_modal_data,
         )
 
@@ -394,13 +424,13 @@ class VReasonerLoop(AgentLoopBase):
         extra_fields.update({"turn_scores": [], "tool_rewards": []})
 
         return AgentLoopOutput(
-            prompt_ids=prompt_ids_adapted,
-            response_ids=response_ids_adapted,
-            response_mask=response_mask_adapted,
+            prompt_ids=prompt_ids,
+            response_ids=response_ids_shortened,
+            response_mask=response_mask_shortened,
             response_logprobs=None,
             multi_modal_data={},  # we pass multi_modal_data back through extra_fields instead
             reward_score=None,
-            num_turns=len(messages_adapted),
+            num_turns=len(messages_shortened),
             metrics=metrics,
             extra_fields=extra_fields,
             subagent_outputs=vsearcher_outputs,

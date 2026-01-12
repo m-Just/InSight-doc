@@ -63,30 +63,26 @@ actor_rollout_ref:
       optimizer_offload: True
 
   rollout:
-    _target_: recipe.vsearch.config.VSearchRolloutConfig
+    _target_: verl.workers.config.RolloutConfig
     name: vllm
-
-    # ======= for async rollout ========
-    mode: async
-    multi_turn:
-      enable: True
-      max_user_turns: 6
-      max_assistant_turns: 7   # max_user_turns + 1
-      tool_config_path: "recipe/deepeyes/configs/image_zoom_in_tool_config.yaml"
-    # ==================================
-
-    # vsearch-specific parameters
-    use_vsearch: ${use_vsearch}
-    enable_tool_feedback: True    # whether to enable tool caller to provide feedback to the tool during training;
-                                  # during validation, we always disable tool feedback ignoring this setting
-
-    # Maximum allowed token id; rollouts with tokens above this will be terminated
-    max_allowed_token_id: 151664
     max_num_batched_tokens: ${eval:1024*32}
     gpu_memory_utilization: 0.75
     enable_chunked_prefill: False
     enforce_eager: True
     free_cache_engine: True
+
+    # ======= for async rollout ========
+    mode: async
+    multi_turn:
+      enable: True
+      max_user_turns: 6        # exluding the initial user turn, so this is essentially max tool response turns
+      max_assistant_turns: 7   # max_user_turns + 1
+      tool_config_path: "recipe/deepeyes/configs/image_zoom_in_tool_config.yaml"
+    # ==================================
+
+    agent:
+      _target_: verl.workers.config.AgentLoopConfig
+      agent_loop_config_path: "recipe/vsearch/config/agent_gpt_5_mini.yaml"
 
   ref:
     fsdp_config:

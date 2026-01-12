@@ -296,9 +296,15 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
+        # Skip training dataset creation if val_only is enabled
+        val_only = config.trainer.get("val_only", False)
+        if val_only:
+            train_dataset = None
+            train_sampler = None
+        else:
+            train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
+            train_sampler = create_rl_sampler(config.data, train_dataset)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
-        train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(

@@ -232,11 +232,10 @@ async def get_gpt_visual_search_request(
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
             )
+            updated_messages = messages + [response.choices[0].message]
         except Exception as e:
             logger.warning(f"query_api failed (attempt {attempt + 1} of {max_round_retries}): {e}")
             updated_messages = None
-        else:
-            updated_messages = messages + [response.choices[0].message]
 
         # If the underlying call failed, keep prior inputs/messages and try again
         if not updated_messages or not isinstance(updated_messages[-1], ChatCompletionMessage):

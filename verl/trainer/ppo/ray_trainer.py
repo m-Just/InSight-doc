@@ -400,18 +400,8 @@ class RayPPOTrainer:
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
-        if train_dataset is None:
-            train_dataset = create_rl_dataset(
-                self.config.data.train_files, self.config.data, self.tokenizer, self.processor
-            )
-        if val_dataset is None:
-            val_dataset = create_rl_dataset(
-                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
-            )
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+        val_only = self.config.trainer.get("val_only", False)
 
-        if train_sampler is None:
-            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
@@ -419,22 +409,43 @@ class RayPPOTrainer:
 
         num_workers = self.config.data["dataloader_num_workers"]
 
-        if isinstance(train_sampler, AbstractBatchSampler):
-            self.train_dataloader = StatefulDataLoader(
-                dataset=self.train_dataset,
-                num_workers=num_workers,
-                collate_fn=collate_fn,
-                batch_sampler=train_sampler,
-            )
+        # Skip training dataset/dataloader creation if val_only is enabled
+        if val_only:
+            self.train_dataset = None
+            self.train_dataloader = None
         else:
-            self.train_dataloader = StatefulDataLoader(
-                dataset=self.train_dataset,
-                batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-                num_workers=num_workers,
-                drop_last=True,
-                collate_fn=collate_fn,
-                sampler=train_sampler,
+            if train_dataset is None:
+                train_dataset = create_rl_dataset(
+                    self.config.data.train_files, self.config.data, self.tokenizer, self.processor
+                )
+            self.train_dataset = train_dataset
+
+            if train_sampler is None:
+                train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+
+            if isinstance(train_sampler, AbstractBatchSampler):
+                self.train_dataloader = StatefulDataLoader(
+                    dataset=self.train_dataset,
+                    num_workers=num_workers,
+                    collate_fn=collate_fn,
+                    batch_sampler=train_sampler,
+                )
+            else:
+                self.train_dataloader = StatefulDataLoader(
+                    dataset=self.train_dataset,
+                    batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+                    num_workers=num_workers,
+                    drop_last=True,
+                    collate_fn=collate_fn,
+                    sampler=train_sampler,
+                )
+            assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+
+        if val_dataset is None:
+            val_dataset = create_rl_dataset(
+                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
+        self.val_dataset = val_dataset
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
@@ -449,8 +460,13 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
         )
 
-        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+
+        if val_only:
+            self.total_training_steps = 0
+            print(f"val_only mode: skipping training dataset/dataloader creation")
+            print(f"Size of val dataloader: {len(self.val_dataloader)}")
+            return
 
         print(
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
@@ -1086,6 +1102,8 @@ class RayPPOTrainer:
 
         # load dataloader,
         # TODO: from remote not implemented yet
+        if self.train_dataloader is None:
+            return
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)

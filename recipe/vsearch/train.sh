@@ -11,7 +11,8 @@ MAX_IMG_TOKENS_VAL=16K
 
 MAX_VAL_SAMPLE_DUMP_PER_DATA_SOURCE=5         # dump a small number of validation samples each step
 
+VAL_ONLY=False
+
 run_experiment \
     +data.batch_sampler.weights.info_vqa_region_localization=0.5 \
-    +data.batch_sampler.weights.merged_compound=0.5 \
-    trainer.max_val_sample_dump_per_data_source="$MAX_VAL_SAMPLE_DUMP_PER_DATA_SOURCE"
+    +data.batch_sampler.weights.merged_compound=0.5
