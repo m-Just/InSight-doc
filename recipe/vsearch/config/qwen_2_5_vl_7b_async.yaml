@@ -116,7 +116,7 @@ custom_reward_function:
     judge_model: gpt-5-nano
     num_workers: 32
     task_timeout: 60
-    min_success_rate: 0.85
+    min_success_rate: 0.99
     max_retries: 10
     retry_interval: 30
     reward_weights:

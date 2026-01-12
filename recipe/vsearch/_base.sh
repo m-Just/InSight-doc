@@ -154,7 +154,7 @@ run_experiment () {
             trainer.experiment_name="$EXP_NAME" \
             trainer.default_local_dir="$exp_path" \
             trainer.val_before_train="${VAL_BEFORE_TRAIN:-True}" \
-            trainer.val_before_train_n="${VAL_BEFORE_TRAIN_N:-1}" \
+            trainer.val_before_train_n="${NUM_VAL_TRIALS:-1}" \
             trainer.val_only="$val_only" \
             trainer.save_freq=50 \
             trainer.test_freq=50 \
