@@ -19,4 +19,4 @@ export OPENAI_CLIENT_TIMEOUT=60
 
 run_experiment \
     +data.batch_sampler.weights.info_vqa_region_localization=0.5 \
-    +data.batch_sampler.weights.merged_compound=0.5
+    +data.batch_sampler.weights.viscot_vstar_collage=0.5
