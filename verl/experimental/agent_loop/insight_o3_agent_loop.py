@@ -83,9 +83,10 @@ class VSearcherLoop(ToolAgentLoop):
         # Extract final bbox from response text
         response_text = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
         last_response = response_text.split("user\n")[-1].split("assistant\n")[-1]
+        answer_text = last_response.split("<answer>")[-1].split("</answer>")[0].strip()
 
         try:
-            final_bbox = extract_final_bbox_from_response(last_response)
+            final_bbox = extract_final_bbox_from_response(answer_text)
         except Exception as e:
             logger.warning(f"failed to parse final bbox from response: {e}")
             final_bbox = None

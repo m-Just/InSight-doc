@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
+import logging
 
 from openai import AsyncOpenAI
 
@@ -18,6 +19,10 @@ from verl.utils.vsearch import (
 from verl.utils.vsearch_role_play_prompt import qa_verify as verify_prompt
 
 from insight_o3.utils.api import query_api  # type: ignore
+
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class ParseError(Exception): pass
@@ -133,17 +138,17 @@ class RewardComputer:
                     continue
 
                 if isinstance(error, JudgeError):
-                    print(f"[RewardWorker] Task {idx} failed: {error}")
+                    logger.warning(f"[RewardWorker] Task {idx} failed: {error}")
                 elif isinstance(error, asyncio.TimeoutError):
-                    print(f"[RewardWorker] Task {idx} timed out after {self.task_timeout}s")
+                    logger.warning(f"[RewardWorker] Task {idx} timed out after {self.task_timeout}s")
                 else:
-                    print(f"[RewardWorker] Task {idx} encountered an unexpected error")
+                    logger.error(f"[RewardWorker] Task {idx} encountered an unexpected error")
                     raise error
 
             task_success_rate = sum(success) / total_samples
             num_failed = total_samples - sum(success)
             if task_success_rate >= self.min_success_rate:
-                print(
+                logger.info(
                     f"[RewardWorker] Work finished with "
                     f"{sum(success)} successful, {num_failed} failed, "
                     f"success rate: {task_success_rate:.3f}."
@@ -159,7 +164,7 @@ class RewardComputer:
                 )
                 raise RuntimeError(error_msg)
 
-            print(
+            logger.warning(
                 f"[RewardWorker] Trial [{trial_count}/{self.max_retries}] has {num_failed} tasks failed, "
                 f"success rate {task_success_rate:.3f} below threshold {self.min_success_rate:.3f}. "
                 f"Retrying in {self.retry_interval} seconds."
@@ -169,7 +174,7 @@ class RewardComputer:
             try:
                 await self._interruptible_sleep(self.retry_interval)
             except KeyboardInterrupt:
-                print("[RewardWorker] Interrupted during retry wait, shutting down...")
+                logger.info("[RewardWorker] Interrupted during retry wait, shutting down...")
                 raise
 
         return success, results
@@ -464,7 +469,7 @@ async def compute_score_single_vsearch_base(
         try:
             tool_call_dict = json.loads(tool_call)
         except json.JSONDecodeError as e:
-            print(f"[RewardWorker] Error parsing tool call JSON: {e}")
+            logger.warning(f"[RewardWorker] Error parsing tool call JSON: {e}")
             return False
         if not isinstance(tool_call_dict, dict):
             return False
@@ -473,7 +478,7 @@ async def compute_score_single_vsearch_base(
         try:
             bbox = extract_bbox_from_tool_call(tool_call)
         except Exception as e:
-            print(f"[RewardWorker] Error extracting bbox from tool call: {e}")
+            logger.warning(f"[RewardWorker] Error extracting bbox from tool call: {e}")
             return False
         if intersection_area(bbox, (0, 0, *extra_info["image_processed_wh"][0])) == 0.0:
             return False
@@ -513,7 +518,7 @@ async def compute_score_single_vsearch_base(
         iou = compute_iou(seen_bboxes[i-1], seen_bboxes[i])
         max_consecutive_iou = reward_kwargs["tool_reward"]["max_consecutive_iou"]
         if iou > max_consecutive_iou:
-            print(f"[RewardWorker] consecutive iou {iou} > {max_consecutive_iou}")
+            logger.info(f"[RewardWorker] vsearcher consecutive iou {iou} > {max_consecutive_iou}")
             score.tool_reward = 0.0
             break
 
@@ -527,7 +532,7 @@ async def compute_score_single_vsearcher(
         try:
             return extract_final_bbox_from_response(answer)
         except Exception as e:
-            print(f"[RewardWorker] compute_score_single_vsearcher: {e}")
+            logger.warning(f"[RewardWorker] compute_score_single_vsearcher: {e}")
             return None
 
     score, _ = await compute_score_single_vsearch_base(
@@ -637,7 +642,7 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
     """
 
     async def _compute_score_batch():
-        print(
+        logger.info(
             f"[RewardWorker] Computing rewards for {len(solution_strs)} samples "
             f"with {reward_kwargs['num_workers']} workers "
             f"using {reward_kwargs['judge_model']} verification."
@@ -691,7 +696,7 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
         n_failed = sum(s is False for s in success)
         n_correct = sum(score.is_correct for score in scores if score is not None)
         n_wrong = sum(not score.is_correct for score in scores if score is not None)
-        print(
+        logger.info(
             f"[RewardWorker] Accuracy ({reward_kwargs['judge_model']}): "
             f"{n_correct} correct, {n_wrong} wrong, {n_failed} failed, {n_skipped} skipped out of {len(scores)} samples"
         )
@@ -705,7 +710,7 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
             score_dict["compute_score_success"] = compute_score_success
             score_dicts.append(score_dict)
 
-        print(f"[RewardWorker] Reward computation completed, time: {time.time() - start_time:.2f}s")
+        logger.info(f"[RewardWorker] Reward computation completed, time: {time.time() - start_time:.2f}s")
         return score_dicts
 
     try:

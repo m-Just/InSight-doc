@@ -886,7 +886,9 @@ class AgentLoopManager:
             failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)
             max_failure_ratio = self.config.actor_rollout_ref.rollout.agent.get("max_critical_failure_ratio", 0.2)
             if failure_ratio > max_failure_ratio:
-                raise RuntimeError(f"Critical failure ratio {failure_ratio} exceeds the threshold {max_failure_ratio}")
+                raise RuntimeError(
+                    f"Critical failure ratio {failure_ratio:.2f} exceeds tolerance threshold {max_failure_ratio}"
+                )
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]

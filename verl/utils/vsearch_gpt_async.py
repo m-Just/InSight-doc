@@ -234,7 +234,7 @@ async def get_gpt_visual_search_request(
             )
             updated_messages = messages + [response.choices[0].message]
         except Exception as e:
-            logger.warning(f"query_api failed (attempt {attempt + 1} of {max_round_retries}): {e}")
+            logger.warning(f"query_api failed on {model} (attempt {attempt + 1} of {max_round_retries}): {e}")
             updated_messages = None
 
         # If the underlying call failed, keep prior inputs/messages and try again
@@ -278,6 +278,7 @@ async def get_gpt_visual_search_request(
             )
 
         # Neither tool call nor answer -> follow-up with a format hint or last-round
+        logger.warning(f"no tool call nor answer from {model} (attempt {attempt + 1} of {max_round_retries})")
         attempt += 1
         if prior_tool_calls >= int(max_tool_calls) or is_last_round:
             pending_question = prompts.vsearch_user_hint_last_round
