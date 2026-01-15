@@ -35,8 +35,10 @@ run_experiment () {
         if [ -n "${EVAL_NAME:-}" ]; then
             echo "Eval name: $EVAL_NAME"
             val_dump_dir=$val_dump_dir/$EVAL_NAME
+            local log_file=$exp_path/val_${EVAL_NAME}.log
+        else
+            local log_file=$exp_path/val.log
         fi
-        local log_file=$exp_path/val_${EVAL_NAME}.log
         local logger="${LOGGER:-['console']}"
     else
         echo "Run mode: train"

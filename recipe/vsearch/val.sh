@@ -11,4 +11,5 @@ MAX_VAL_SAMPLE_DUMP_PER_DATA_SOURCE=10000000  # dump all validation samples (thi
 VAL_ONLY=True
 VAL_BEFORE_TRAIN=True
 
+EVAL_NAME=my_eval
 run_experiment
