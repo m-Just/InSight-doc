@@ -52,24 +52,17 @@ def extract_bbox_from_tool_call(tool_call_json: str) -> BBox:
     return validate_bbox(bbox)
 
 
-def extract_final_bbox_from_response(response: str) -> BBox:
-    def maybe_truncate(text: str, max_length: int = 500) -> str:
+def parse_bbox(text: str) -> BBox:
+    def maybe_truncate(text: str, max_length: int = 200) -> str:
         """Left-truncate text if it is too long."""
         return ("..." + text[-max_length:]) if len(text) > max_length else text
-
-    # Search for the *last* bbox match in the response
-    pattern = r"\]" + ",".join([r"\s*\d+\s*"] * 4) + r"\["
-    match = re.search(pattern, response[::-1])
-    if not match:
-        raise ValueError(f"no bbox found in response: {maybe_truncate(response)}")
-    bbox_str = match.group(0)[::-1]
     try:
-        bbox = tuple(eval(bbox_str))
-        if bbox not in SPECIAL_BBOXES:
-            validate_bbox(bbox)
-    except Exception as e:
-        raise ValueError(f"invalid bbox: {bbox_str}") from e
-
+        bbox = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"failed to parse bbox from text: {maybe_truncate(text)}") from e
+    bbox = tuple(bbox)
+    if bbox not in SPECIAL_BBOXES:
+        validate_bbox(bbox)
     return bbox
 
 

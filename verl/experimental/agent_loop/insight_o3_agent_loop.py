@@ -1,7 +1,8 @@
+import asyncio
 from dataclasses import dataclass, asdict
+from functools import partial
 import logging
 import os
-import re
 from typing import Any
 from copy import deepcopy
 from uuid import uuid4
@@ -22,7 +23,7 @@ from verl.experimental.agent_loop.agent_loop import (
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.profiler import simple_timer
-from verl.utils.vsearch import BBox, extract_final_bbox_from_response, resize_bbox
+from verl.utils.vsearch import BBox, parse_bbox, resize_bbox
 from verl.utils.vsearch_gpt_async import get_gpt_visual_search_request
 
 logger = logging.getLogger(__file__)
@@ -81,14 +82,17 @@ class VSearcherLoop(ToolAgentLoop):
         output = await super().run(sampling_params, **kwargs)
 
         # Extract final bbox from response text
-        response_text = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
+        loop = asyncio.get_event_loop()
+        response_text = await loop.run_in_executor(
+            None, partial(self.tokenizer.decode, output.response_ids, skip_special_tokens=True)
+        )
         last_response = response_text.split("user\n")[-1].split("assistant\n")[-1]
         answer_text = last_response.split("<answer>")[-1].split("</answer>")[0].strip()
 
         try:
-            final_bbox = extract_final_bbox_from_response(answer_text)
+            final_bbox = parse_bbox(answer_text)
         except Exception as e:
-            logger.warning(f"failed to parse final bbox from response: {e}")
+            logger.warning(f"no valid bbox found in vsearcher's answer: {e}")
             final_bbox = None
 
         if validate:
@@ -322,7 +326,10 @@ class VReasonerLoop(AgentLoopBase):
             **apply_chat_template_kwargs,
         )
 
-        model_inputs = self.processor(text=[raw_prompt], return_tensors="pt")
+        loop = asyncio.get_event_loop()
+        model_inputs = await loop.run_in_executor(
+            None, partial(self.processor, text=[raw_prompt], return_tensors="pt")
+        )
         prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
 
         # Collect response tokens; we left-truncate over-length text so it can fit within response_length
@@ -351,8 +358,9 @@ class VReasonerLoop(AgentLoopBase):
                     if content["type"] == "image_url":
                         image_url = content["image_url"]["url"]
                         _, b64data = image_url.split(",", 1)
-                        img_bytes = base64.b64decode(b64data)
-                        img = Image.open(io.BytesIO(img_bytes))
+                        img = await loop.run_in_executor(
+                            None, lambda b: Image.open(io.BytesIO(base64.b64decode(b))), b64data
+                        )
                         multi_modal_data["image"].append(img)
 
             # Skip messages before the response starts
@@ -391,7 +399,9 @@ class VReasonerLoop(AgentLoopBase):
                 **apply_chat_template_kwargs,
             )
 
-            model_inputs_shortened = self.processor(text=[raw_prompt_shortened], return_tensors="pt")
+            model_inputs_shortened = await loop.run_in_executor(
+                None, partial(self.processor, text=[raw_prompt_shortened], return_tensors="pt")
+            )
             seq_ids_shortened = model_inputs_shortened.pop("input_ids").squeeze(0).tolist()
             new_response_ids = seq_ids_shortened[len(prompt_ids) + len(response_ids_shortened):]
             response_ids_shortened += new_response_ids

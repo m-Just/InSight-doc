@@ -14,7 +14,7 @@ from verl.utils.vsearch import (
     compute_overall_iou_with_gt,
     intersection_area,
     extract_bbox_from_tool_call,
-    extract_final_bbox_from_response,
+    parse_bbox,
 )
 from verl.utils.vsearch_role_play_prompt import qa_verify as verify_prompt
 
@@ -530,7 +530,7 @@ async def compute_score_single_vsearcher(
 ) -> Score:
     def core_answer_extraction_fn(answer: str) -> BBox | None:
         try:
-            return extract_final_bbox_from_response(answer)
+            return parse_bbox(answer)
         except Exception as e:
             logger.warning(f"[RewardWorker] compute_score_single_vsearcher: {e}")
             return None
@@ -571,12 +571,18 @@ async def compute_score_single_vreasoner(
 ) -> Score:
     """ For vReasonser, we only care about whether the answer is correct.  """
     score = ScoreOnlyAccuracy()
-    score.format_reward = 1.0
 
     if "\\boxed{" in solution_str:
         score.extracted_answer = solution_str.split("\\boxed{", 1)[1].split("}", 1)[0].strip()
     elif "<answer>" in solution_str and "</answer>" in solution_str:
         score.extracted_answer = solution_str.split("<answer>", 1)[1].split("</answer>", 1)[0].strip()
+    else:
+        score.extracted_answer = None
+
+    if score.extracted_answer:
+        score.format_reward = 1.0
+    else:
+        score.format_reward = 0.0
 
     score.accuracy_reward = await compute_accuracy_reward(
         data_source,
@@ -614,6 +620,7 @@ def _update_subagent_iou_rewards(
             job_id_to_idx[job_id] = i
 
     # Update subagent iou_rewards
+    count = 0
     for i, extra_info in enumerate(extra_infos):
         # Only process subagents (where parent_job_id is not None)
         if extra_info.get("parent_job_id") is None:
@@ -634,6 +641,9 @@ def _update_subagent_iou_rewards(
 
         # Update score
         scores[i].iou_reward = pseudo_iou_reward
+        count += 1
+
+    logger.info(f"[RewardWorker] Updated {count} subagent iou_rewards")
 
 
 def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos, **reward_kwargs):
@@ -688,7 +698,7 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
             await judge_client.close()
 
         # Post-process: update subagent iou_reward with pseudo_iou_reward
-        pseudo_iou_reward_type = reward_kwargs.get("pseudo_iou_reward_type", "")
+        pseudo_iou_reward_type = reward_kwargs["iou_reward"].get("pseudo_iou_reward_type", "")
         if "caller_feedback" in pseudo_iou_reward_type and any(ei.get("caller_feedback") for ei in extra_infos):
             _update_subagent_iou_rewards(scores, extra_infos, pseudo_iou_reward_type)
 

@@ -139,7 +139,7 @@ class VStarBench(VerlFormatDataset):
     def get_extra_info(self, example):
         return {
             **super().get_extra_info(example),
-            "question_id": example["question_id"],
+            "question_id": str(example["question_id"]),
             "category": example["category"],
             "bboxes": self.get_bboxes(example),
         }
@@ -178,7 +178,7 @@ class MME_RealWorld_Lite(VerlFormatDataset):
     def get_extra_info(self, example):
         return {
             **super().get_extra_info(example),
-            "question_id": example["question_id"],
+            "question_id": str(example["question_id"]),
             "category": example["category"],
         }
 
@@ -205,7 +205,7 @@ class VisualProbeHard(VerlFormatDataset):
     def get_extra_info(self, example):
         return {
             **super().get_extra_info(example),
-            "question_id": example["question_id"],
+            "question_id": str(example["question_id"]),
             "category": example["category"],
         }
 
@@ -294,7 +294,7 @@ class InfoVQA_RegionLocalization(VerlFormatDataset):
     def get_extra_info(self, example):
         return {
             **super().get_extra_info(example),
-            "question_id": example["question_id"],
+            "question_id": str(example["question_id"]),
             "search_target": example["region_description"],
             "bboxes": [example["bbox"]],
         }

@@ -108,13 +108,14 @@ custom_reward_function:
   
   reward_kwargs:
     reward_type: conditioned_on_tool_reward
-    verify_method: gpt
     judge_model: gpt-5-nano
     num_workers: 32
+    # ======= fail-safe for judge API calls ========
     task_timeout: 60
     min_success_rate: 0.99
     max_retries: 10
     retry_interval: 30
+    # ==============================================
     reward_weights:
       format: 0.2
       accuracy: 0.8
@@ -158,7 +159,7 @@ trainer:
   # Whether to train on the vreasoner response
   train_on_vreasoner_response: False
 
-  # Number of times to run validation
+  # Number of times to repeat validation at a validation step
   val_before_train_n: 1
 
   # Total number of epochs to train (dummy value; use `trainer.total_training_steps` instead)

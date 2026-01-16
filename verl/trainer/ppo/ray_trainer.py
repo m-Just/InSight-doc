@@ -1418,6 +1418,15 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
+                    if "critical_failure" in gen_batch_output.non_tensor_batch:
+                        critical_failure = gen_batch_output.non_tensor_batch["critical_failure"]
+                        failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)
+                        max_ratio = self.config.actor_rollout_ref.rollout.agent.get("max_critical_failure_ratio", 0.2)
+                        if failure_ratio > max_ratio:
+                            raise RuntimeError(
+                                f"Critical failure ratio {failure_ratio:.2f} exceeds tolerance threshold {max_ratio}"
+                            )
+
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")

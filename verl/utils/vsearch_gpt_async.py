@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 import logging
+import asyncio
+from functools import partial
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessage
@@ -157,7 +159,6 @@ async def get_gpt_visual_search_request(
     max_round_retries: int = 3,
     reasoning_effort: str = None,
     enable_tool_feedback: bool = False,
-    use_refined_prompt: bool = False,
 ) -> GPTVisualSearchRequest:
     # Start with history and compute prior tool-call count
     out_messages: list = [] if messages is None else list(messages)
@@ -176,34 +177,39 @@ async def get_gpt_visual_search_request(
     last_image_used: Optional[str] = None
 
     # Select prompt set based on flag
-    assert not (use_refined_prompt and enable_tool_feedback)
     if enable_tool_feedback:
         vsearch_sys_prompt = prompts.vsearch_sys_prompt_with_feedback
     else:
         vsearch_sys_prompt = prompts.vsearch_sys_prompt
 
     # Prepare first prompt/image once
+    def _prepare_first_image(img: Image.Image, gpt_image_max_area: int) -> str:
+        img = img.convert("RGB") if img.mode != "RGB" else img
+        img = _scale_image_to_area(img, gpt_image_max_area)
+        return _pil_to_data_url_jpeg(img)
+
+    loop = asyncio.get_event_loop()
+
     if not out_messages:
-        base_img = original_image.convert("RGB") if original_image.mode != "RGB" else original_image
-        img = _scale_image_to_area(base_img, gpt_image_max_area)
-        last_image_used = _pil_to_data_url_jpeg(img)
+        last_image_used = await loop.run_in_executor(None, _prepare_first_image, original_image, gpt_image_max_area)
         out_messages = [{"role": "system", "content": vsearch_sys_prompt}]
-        if use_refined_prompt:
-            pending_question = prompts.vsearch_initial_user_prompt.format(question=initial_question)
-        else:
-            pending_question = initial_question
+        pending_question = initial_question
         pending_image = last_image_used
     else:
         # Check bbox first; treat [0,0,0,0] as invalid
         bbox_valid = bool(bbox) and any(int(v) != 0 for v in bbox)
         if bbox_valid:
-            pending_image = _crop_prepare_data_url(
-                original=original_image,
-                bbox=bbox,
-                expand_ratio=crop_expand_ratio,
-                min_side=crop_min_side,
-                min_area=crop_min_area,
-                max_area=gpt_image_max_area,
+            pending_image = await loop.run_in_executor(
+                None,
+                partial(
+                    _crop_prepare_data_url,
+                    original=original_image,
+                    bbox=bbox,
+                    expand_ratio=crop_expand_ratio,
+                    min_side=crop_min_side,
+                    min_area=crop_min_area,
+                    max_area=gpt_image_max_area,
+                )
             )
             last_image_used = pending_image
             pending_question = prompts.vsearch_user_hint if pending_image else prompts.vsearch_user_hint_fail
@@ -250,11 +256,7 @@ async def get_gpt_visual_search_request(
         assistant_msg: ChatCompletionMessage = updated_messages[-1]
         content: str = assistant_msg.content or ""
         region_desc = _parse_region_description(content)
-        if use_refined_prompt:
-            # answer = _parse_xml_answer(content)
-            answer = _parse_boxed_answer(content)
-        else:
-            answer = _parse_boxed_answer(content)
+        answer = _parse_boxed_answer(content)
 
         tool_feedback = None
         if enable_tool_feedback:

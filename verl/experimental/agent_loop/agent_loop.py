@@ -881,15 +881,6 @@ class AgentLoopManager:
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.sleep()
 
-        if "critical_failure" in output.non_tensor_batch:
-            critical_failure = output.non_tensor_batch["critical_failure"]
-            failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)
-            max_failure_ratio = self.config.actor_rollout_ref.rollout.agent.get("max_critical_failure_ratio", 0.2)
-            if failure_ratio > max_failure_ratio:
-                raise RuntimeError(
-                    f"Critical failure ratio {failure_ratio:.2f} exceeds tolerance threshold {max_failure_ratio}"
-                )
-
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)

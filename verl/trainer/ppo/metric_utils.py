@@ -542,21 +542,18 @@ def process_vsearch_validation_metrics(
 def _compute_vsearch_val_metrics(var2vals: dict[str, list]) -> dict[str, dict[str, float]]:
     has_answer_key = "has_answer" if "has_answer" in var2vals else "format_reward"
 
-    if "acc/gpt" in var2vals:
-        acc_key = "acc/gpt"
-    elif "acc/raw" in var2vals:
-        acc_key = "acc/raw"
-    else:
-        acc_key = "accuracy_reward"
-
     attempts = np.array(var2vals[has_answer_key], dtype=bool)
-    correct = attempts & np.array(var2vals[acc_key], dtype=bool)
+    correct = attempts & np.array(var2vals["accuracy_reward"], dtype=bool)
     tool_use = attempts & np.array(var2vals["n_valid_tool_calls"], dtype=bool)
 
     def safe_ratio(num, den):
         return float(num / den) if den > 0 else float("nan")
 
+    critical_failure = np.array(var2vals["critical_failure"], dtype=object)
+    failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)
+
     return {
+        "critical_failure_ratio": {"mean": failure_ratio},
         "has_answer": {"mean": float(attempts.mean())},
         "acc/answered": {"mean": safe_ratio(correct.sum(), attempts.sum())},
         "acc/direct": {"mean": safe_ratio((correct & ~tool_use).sum(), (attempts & ~tool_use).sum())},
