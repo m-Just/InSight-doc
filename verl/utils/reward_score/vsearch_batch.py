@@ -18,7 +18,7 @@ from verl.utils.vsearch import (
 )
 from verl.utils.vsearch_role_play_prompt import qa_verify as verify_prompt
 
-from insight_o3.utils.api import query_api  # type: ignore
+from insight_o3.utils.api import create_async_openai_client, query_api  # pyright: ignore[reportMissingImports]
 
 
 logger = logging.getLogger(__file__)
@@ -674,14 +674,7 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
             else:
                 raise ValueError(f"Unknown agent name: {extra_info['agent_name']}")
 
-        _client_timeout = os.getenv("OPENAI_CLIENT_TIMEOUT", None)
-        if _client_timeout is not None:
-            _client_timeout = float(_client_timeout)
-        judge_client = AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
-            timeout=_client_timeout,
-        )
+        judge_client = create_async_openai_client()
 
         reward_kwargs_with_client = {**reward_kwargs, "judge_client": judge_client}
         try:

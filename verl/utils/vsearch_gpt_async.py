@@ -7,28 +7,19 @@ import logging
 import asyncio
 from functools import partial
 
-from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessage
 from PIL import Image
 
 import verl.utils.vsearch_role_play_prompt as prompts
 from verl.utils.vsearch import BBox
 
-from insight_o3.utils.api import query_api  # noqa
+from insight_o3.utils.api import create_async_openai_client, query_api  # pyright: ignore[reportMissingImports]
 
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-
-_client_timeout = os.getenv("OPENAI_CLIENT_TIMEOUT", None)
-if _client_timeout is not None:
-    _client_timeout = float(_client_timeout)
-client = AsyncOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    timeout=_client_timeout,
-)
+client = create_async_openai_client()
 
 
 @dataclass
@@ -232,7 +223,7 @@ async def get_gpt_visual_search_request(
                 model=model,
                 client=client,
                 image_url=last_image_used if is_last_round else pending_image,
-                image_detail=image_detail,
+                image_url_extra_settings={"detail": image_detail},
                 context=current_messages,
                 max_completion_tokens=max_completion_tokens,
                 temperature=temperature,

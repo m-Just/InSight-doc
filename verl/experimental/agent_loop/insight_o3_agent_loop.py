@@ -183,6 +183,7 @@ class VReasonerLoop(AgentLoopBase):
         model: str = "gpt-5-mini",                 # API model name for vReasoner
         max_tool_calls: int = 6,                   # max number of tool calls for vReasoner
         max_round_retries: int = 3,                # max number of retries for vReasoner
+        max_round_retries_val: int = 5,            # max number of retries for vReasoner during validation
         gpt_image_max_area: int = 1280 * 1280,     # max area for GPT image in vReasoner
         max_completion_tokens: int | None = 2048,  # max completion tokens (per turn) for vReasoner
         reasoning_effort: str | None = None,       # reasoning effort for vReasoner
@@ -193,6 +194,7 @@ class VReasonerLoop(AgentLoopBase):
         self.model = model
         self.max_tool_calls = max_tool_calls
         self.max_round_retries = max_round_retries
+        self.max_round_retries_val = max_round_retries_val
         self.gpt_image_max_area = gpt_image_max_area
         self.max_completion_tokens = max_completion_tokens
         self.reasoning_effort = reasoning_effort
@@ -226,7 +228,7 @@ class VReasonerLoop(AgentLoopBase):
                     bbox=bbox,
                     model=self.model,
                     max_tool_calls=self.max_tool_calls,
-                    max_round_retries=self.max_round_retries,
+                    max_round_retries=self.max_round_retries if not validate else self.max_round_retries_val,
                     gpt_image_max_area=self.gpt_image_max_area,
                     max_completion_tokens=self.max_completion_tokens,
                     reasoning_effort=self.reasoning_effort,

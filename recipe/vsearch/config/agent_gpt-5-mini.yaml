@@ -3,6 +3,7 @@
   model: gpt-5-mini
   max_tool_calls: 6
   max_round_retries: 3
+  max_round_retries_val: 5      # more permissive for validation
   gpt_image_max_area: 1638400   # 1280*1280
   max_completion_tokens: 2048
   reasoning_effort: null
