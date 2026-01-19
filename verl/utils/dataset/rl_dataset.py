@@ -21,7 +21,7 @@ import re
 import traceback
 from collections import defaultdict
 from io import BytesIO
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 import datasets
 import numpy as np
@@ -30,14 +30,16 @@ from omegaconf import DictConfig, ListConfig
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
+from qwen_vl_utils import extract_vision_info, fetch_image
 
 from verl.utils.import_utils import load_extern_object
+from verl.utils.vsearch import fetch_image_wo_resize
 
 logger = logging.getLogger(__name__)
 
 
 def collate_fn(data_list: list[dict]) -> dict:
-    """
+    r"""
     Collate a batch of sample dicts into batched tensors and arrays.
 
     Args:
@@ -65,6 +67,92 @@ def collate_fn(data_list: list[dict]) -> dict:
         non_tensors[key] = np.fromiter(val, dtype=object, count=len(val))
 
     return {**tensors, **non_tensors}
+
+
+def concat_multi_modal_inputs(mm_inputs: Sequence[dict], new_mm_inputs: Sequence[dict]) -> list[dict]:
+    """Concatenate mm_inputs with new_mm_inputs."""
+    assert len(mm_inputs) == len(new_mm_inputs), f"length mismatch: {len(mm_inputs)=}, {len(new_mm_inputs)=}"
+    mm_inputs = [mm_input.copy() for mm_input in mm_inputs]
+    for i in range(len(mm_inputs)):
+        if not mm_inputs[i]:
+            mm_inputs[i] = new_mm_inputs[i]
+            continue
+        if not new_mm_inputs[i]:
+            continue
+        assert set(mm_inputs[i]) == set(new_mm_inputs[i]), (
+            f"mm_inputs[i] and new_mm_inputs[i] have different keys: {mm_inputs[i].keys()=}, {new_mm_inputs[i].keys()=}"
+        )
+        for key in mm_inputs[i]:
+            # print(f"DEBUG: concat multi_modal_inputs.{key}", mm_inputs[i][key].shape, new_mm_inputs[i][key].shape)
+            mm_inputs[i][key] = torch.cat([mm_inputs[i][key], new_mm_inputs[i][key]], dim=0)
+    return mm_inputs
+
+
+def _setup_vsearch_fields(row_dict: dict[str, Any], config: DictConfig, is_train: bool) -> None:
+    """Create vsearch fields (image_ori, image_ori_wh, image_processed_wh) in extra_info.
+
+    Also sets up the image_zoom_in_tool create_kwargs in tools_kwargs, and replaces
+    the original images in raw_prompt with processed (resized) images.
+
+    Args:
+        row_dict: The row dict returned by RLHFDataset.__getitem__.
+        config: The dataset config.
+        is_train: Whether this is training mode (affects max_pixels selection).
+    """
+    extra_info = row_dict["extra_info"]
+    raw_prompt = row_dict["raw_prompt"]
+
+    # Determine max_pixels from config and extra_info
+    max_pixels_global = config.get("max_pixels")
+    if not is_train and config.get("validation_max_pixels"):
+        max_pixels_global = config.get("validation_max_pixels")
+    max_pixels_sample = extra_info.get("max_pixels")
+    if max_pixels_global and max_pixels_sample:
+        max_pixels = min(max_pixels_global, max_pixels_sample)
+    else:
+        max_pixels = max_pixels_global or max_pixels_sample
+
+    # Extract vision info from raw_prompt messages using qwen_vl_utils
+    vision_infos = extract_vision_info(raw_prompt)
+
+    # Filter for images only (exclude videos)
+    image_elements = [info for info in vision_infos if "image" in info or "image_url" in info]
+    assert len(image_elements) == 1, f"expected 1 image element, got {len(image_elements)}"
+
+    # Create image_ori by loading images without resize
+    image_ori = [fetch_image_wo_resize(img) for img in image_elements]
+    extra_info["image_ori"] = image_ori
+    extra_info["image_ori_wh"] = [img.size for img in image_ori]
+
+    # Set max_pixels on image elements so fetch_image uses it for resizing
+    if max_pixels is not None:
+        for img_elem in image_elements:
+            img_elem["max_pixels"] = max_pixels
+
+    # Create processed images using fetch_image (which applies resizing based on max_pixels)
+    image_processed = [fetch_image(img) for img in image_elements]
+    extra_info["image_processed_wh"] = [img.size for img in image_processed]
+
+    # Replace original images in raw_prompt with processed images
+    # image_elements are references to the dicts in raw_prompt, so we can modify them directly
+    for img_elem, processed_img in zip(image_elements, image_processed, strict=True):
+        img_elem["image"] = processed_img
+
+    # Set up image_zoom_in_tool create_kwargs
+    tools_kwargs = row_dict.get("tools_kwargs", {})
+    if tools_kwargs is None:
+        tools_kwargs = {}
+        row_dict["tools_kwargs"] = tools_kwargs
+
+    assert "image_zoom_in_tool" not in tools_kwargs, f"image_zoom_in_tool already in tools_kwargs: {tools_kwargs}"
+    create_kwargs = tools_kwargs.get("image_zoom_in_tool", {}).get("create_kwargs", {})
+    create_kwargs.update({
+        "image": extra_info["image_ori"][0],
+        "resized_image_size": extra_info["image_processed_wh"][0],
+    })
+    if max_pixels is not None:
+        create_kwargs["max_pixels"] = max_pixels
+    tools_kwargs.setdefault("image_zoom_in_tool", {})["create_kwargs"] = create_kwargs
 
 
 class RLHFDataset(Dataset):
@@ -143,6 +231,10 @@ class RLHFDataset(Dataset):
         self._download()
         self._read_files_and_tokenize()
 
+        if self.config.get("use_vsearch", False):
+            # TODO: only for Qwen2VLImageProcessor or for all other processors?
+            self.processor.image_processor.do_resize = False
+
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
 
@@ -161,6 +253,26 @@ class RLHFDataset(Dataset):
             else:
                 raise ValueError(f"Unsupported file format: {parquet_file}")
             dataframes.append(dataframe)
+        if self.config.get("force_dataset_concat", False) and len(dataframes) > 1:
+            print("WARNING: Force dataset concatenation")
+            extra_infos = [set(df["extra_info"][0].keys()) for df in dataframes]
+            extra_infos_union = set.union(*extra_infos)
+            print(f"Extra infos union: {extra_infos_union}")
+
+            def map_extra_info(example):
+                extra_info = example.pop("extra_info")
+                for key in list(extra_infos_union):
+                    if key not in extra_info:
+                        extra_info[key] = None
+                assert "extra_info_union" not in example, "extra_info_union already exists"
+                example["extra_info_union"] = extra_info
+                return example
+
+            def map_extra_info_back(example):
+                example["extra_info"] = example.pop("extra_info_union")
+                return example
+
+            dataframes = [df.map(map_extra_info).map(map_extra_info_back) for df in dataframes]
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         total = len(self.dataframe)
@@ -356,9 +468,16 @@ class RLHFDataset(Dataset):
         need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
+
+        # print(f"DEBUG: {tools_kwargs=}")
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+
+        # Set up vsearch fields if enabled
+        if self.config.get("use_vsearch", False):
+            _setup_vsearch_fields(row_dict, self.config, self._is_train)
+
         return row_dict
 
     @classmethod

@@ -517,6 +517,9 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.use_prefix_grouper and "prompts" in data.batch.keys():
             select_keys.append("prompts")
+        if "old_log_probs" not in data.batch:
+            # when skip old_log_prob recompute, we need to skip old_log_probs to the select_keys
+            select_keys.remove("old_log_probs")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
@@ -538,6 +541,16 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        if self.config.force_on_policy:
+            if self.config.ppo_mini_batch_size != data.batch.batch_size[0]:
+                print(
+                    f"WARNING: force on-policy (original ppo_mini_batch_size: {self.config.ppo_mini_batch_size}, "
+                    f"new: {data.batch.batch_size[0]})"
+                )
+                self.config.ppo_mini_batch_size = data.batch.batch_size[0]
+            if self.config.ppo_epochs != 1:
+                print(f"WARNING: force on-policy (original ppo_epochs: {self.config.ppo_epochs}, new: 1)")
+                self.config.ppo_epochs = 1
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
@@ -564,7 +577,6 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
                     response_mask = model_inputs["response_mask"]
-                    old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
@@ -578,6 +590,8 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     # all return: (bsz, response_length)
+                    if self.config.skip_old_log_prob_recompute:
+                        calculate_entropy = True
                     outputs = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )

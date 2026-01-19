@@ -225,6 +225,40 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
+def compute_agent_metrics(batch: DataProto) -> dict[str, Any]:
+    data = {k: v for k, v in batch.non_tensor_batch.items()}
+    data["rewards"] = batch.batch["token_level_rewards"].sum(-1).tolist()
+
+    def collect_metrics(metric_names: list[str]):
+        for metric_name in metric_names:
+            value = data[metric_name][sample_idx]
+            agent2var2vals[agent_name][metric_name].append(value)
+            if data["parent_job_id"][sample_idx] is None:
+                agent2var2vals[f"{agent_name}/main"][metric_name].append(value)
+            else:
+                agent2var2vals[f"{agent_name}/sub"][metric_name].append(value)
+
+    agent2var2vals = defaultdict(lambda: defaultdict(list))
+    for sample_idx, agent_name in enumerate(batch.non_tensor_batch["agent_name"]):
+        collect_metrics(["rewards", "format_reward", "tool_reward", "n_tool_calls"])
+        if agent_name == "vsearcher":
+            collect_metrics(["iou_reward", "final_iou", "tool_iou"])
+        elif agent_name == "vreasoner":
+            collect_metrics(["accuracy_reward"])
+
+    metrics = {}
+    for agent_name, var2vals in agent2var2vals.items():
+        for var_name, var_vals in var2vals.items():
+            vals = np.array(var_vals)
+            if len(vals) > 0:
+                metrics[f"{agent_name}/{var_name}/mean"] = vals.mean()
+                metrics[f"{agent_name}/{var_name}/std"] = vals.std()
+                metrics[f"{agent_name}/{var_name}/max"] = vals.max()
+                metrics[f"{agent_name}/{var_name}/min"] = vals.min()
+
+    return metrics
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.
@@ -657,3 +691,40 @@ def process_validation_metrics(
             for metric_name, uid_vals in metric2uid_vals.items():
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
     return data_src2var2metric2val
+
+
+def process_vsearch_validation_metrics(
+    data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
+) -> dict[str, dict[str, dict[str, float]]]:
+    data_by_source = defaultdict(lambda: defaultdict(list))
+    for i, data_source in enumerate(data_sources):
+        for var_name, var_vals in infos_dict.items():
+            data_by_source[data_source][var_name].append(var_vals[i])
+
+    data_src2var2metric2val = {}
+    for data_source, var2vals in data_by_source.items():
+        data_src2var2metric2val[data_source] = _compute_vsearch_val_metrics(var2vals)
+
+    return data_src2var2metric2val
+
+
+def _compute_vsearch_val_metrics(var2vals: dict[str, list]) -> dict[str, dict[str, float]]:
+    has_answer_key = "has_answer" if "has_answer" in var2vals else "format_reward"
+
+    attempts = np.array(var2vals[has_answer_key], dtype=bool)
+    correct = attempts & np.array(var2vals["accuracy_reward"], dtype=bool)
+    tool_use = attempts & np.array(var2vals["n_valid_tool_calls"], dtype=bool)
+
+    def safe_ratio(num, den):
+        return float(num / den) if den > 0 else float("nan")
+
+    critical_failure = np.array(var2vals["critical_failure"], dtype=object)
+    failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)
+
+    return {
+        "critical_failure_ratio": {"mean": failure_ratio},
+        "has_answer": {"mean": float(attempts.mean())},
+        "acc/answered": {"mean": safe_ratio(correct.sum(), attempts.sum())},
+        "acc/direct": {"mean": safe_ratio((correct & ~tool_use).sum(), (attempts & ~tool_use).sum())},
+        "acc/with_tool_use": {"mean": safe_ratio((correct & tool_use).sum(), (attempts & tool_use).sum())},
+    }

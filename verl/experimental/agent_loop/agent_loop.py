@@ -153,6 +153,8 @@ class AgentLoopOutput(BaseModel):
     """Auxiliary performance metrics"""
     extra_fields: dict[str, Any] = {}
     """Extra fields for dynamic addition."""
+    subagent_outputs: Optional[list["AgentLoopOutput"]] = None
+    """Subagent outputs for multi-agent loops."""
 
 
 class _InternalAgentLoopOutput(AgentLoopOutput):
@@ -429,7 +431,7 @@ class AgentLoopWorker:
             temperature=config.temperature,
             top_p=config.top_p,
             repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs,
+            logprobs=(1 if config.calculate_log_probs else None),
         )
 
         # override sampling params for validation
@@ -477,9 +479,9 @@ class AgentLoopWorker:
                 )
             )
         outputs = await asyncio.gather(*tasks)
+        outputs = sum(outputs, [])
 
-        output = self._postprocess(outputs)
-
+        output = self._postprocess(outputs, batch.meta_info.get("validate", False))
         return output
 
     async def _run_agent_loop(
@@ -513,10 +515,18 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 dataset_config=self.config.data,
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
 
-    async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
+            kwargs["_validate"] = trajectory["validate"]
+            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+
+            internal_outputs = [await self._agent_loop_postprocess(output, **kwargs)]
+            if output.subagent_outputs:
+                for subagent_output in output.subagent_outputs:
+                    internal_outputs.append(await self._agent_loop_postprocess(subagent_output, **kwargs))
+
+            return internal_outputs
+
+    async def _agent_loop_postprocess(self, output, **kwargs) -> list[_InternalAgentLoopOutput]:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -541,6 +551,15 @@ class AgentLoopWorker:
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
         # TODO(wuxibin): remove padding and use tensordict.
+        prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
+        actual_prompt_length = len(output.prompt_ids)
+        if actual_prompt_length > prompt_length:
+            logger.warning(
+                f"Prompt length ({actual_prompt_length}) exceeds prompt_length ({prompt_length}). "
+                f"This may cause shape mismatches during batching. Consider increasing prompt_length config "
+                f"or enabling filter_overlong_prompts in the dataset."
+            )
+
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
@@ -555,7 +574,7 @@ class AgentLoopWorker:
 
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
+            {"input_ids": output.response_ids or [[]]},   # [] => an empty batch, [[]] => a batch with an empty seq
             padding="max_length",
             max_length=self.config.actor_rollout_ref.rollout.response_length,
             return_tensors="pt",
@@ -566,7 +585,7 @@ class AgentLoopWorker:
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
+            {"input_ids": output.response_mask or [[]]},  # [] => an empty batch, [[]] => a batch with an empty seq
             padding="max_length",
             max_length=self.config.actor_rollout_ref.rollout.response_length,
             return_tensors="pt",
@@ -726,8 +745,9 @@ class AgentLoopWorker:
             result = await self.reward_loop_worker.compute_score.remote(data)
             output.reward_score = result["reward_score"]
             output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+    
 
-    def _postprocess(self, inputs: list[_InternalAgentLoopOutput]) -> DataProto:
+    def _postprocess(self, inputs: list[_InternalAgentLoopOutput], is_validate: bool) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
@@ -775,9 +795,14 @@ class AgentLoopWorker:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
-        multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
-        if any(mmi is not None for mmi in multi_modal_inputs_list):
-            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
+        # Validation do not need multi_modal_inputs, so we drop them
+        multi_modal_inputs_list = []
+        for i, input in enumerate(inputs):
+            if is_validate:
+                multi_modal_inputs_list.append(None)
+            else:
+                multi_modal_inputs_list.append(input.multi_modal_inputs)
+        non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
         # Collect extra fields from all inputs and convert them to np.ndarray

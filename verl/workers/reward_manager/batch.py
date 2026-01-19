@@ -13,8 +13,10 @@
 # limitations under the License.
 
 from collections import defaultdict
+from copy import deepcopy
 from typing import Any
 
+import numpy as np
 import torch
 
 from verl import DataProto
@@ -67,6 +69,16 @@ class BatchRewardManager(AbstractRewardManager):
         for i in range(len(data)):
             extras[i]["rollout_reward_scores"] = rollout_reward_scores[i]
 
+        # Inject additional information to the extras
+        # First, we deepcopy the extras, so we can safely modify its content
+        # NOTE: we can't use `extras = deepcopy(extras)` because it does *not* deepcopy the objects in the array!
+        extras = np.array([deepcopy(e) for e in extras])
+        for info in ("agent_name", "job_id", "parent_job_id", "root_job_id", "caller_feedback"):
+            if info in data.non_tensor_batch:
+                for i in range(len(data)):
+                    extras[i] = extras[i] or {}
+                    extras[i][info] = data.non_tensor_batch[info][i]
+
         scores = self.compute_score(
             data_sources=data_sources,
             solution_strs=responses_str,
@@ -98,8 +110,11 @@ class BatchRewardManager(AbstractRewardManager):
         for i in range(len(data)):
             length = valid_response_lengths[i].item()
             score = scores[i]
+            extracted_answer = None
 
             if isinstance(score, dict):
+                if "extracted_answer" in score:
+                    extracted_answer = str(score.pop("extracted_answer"))
                 reward = score["score"]
                 for key, value in score.items():
                     reward_extra_info[key].append(value)
@@ -116,11 +131,20 @@ class BatchRewardManager(AbstractRewardManager):
                 ground_truth = data[i].non_tensor_batch["reward_model"].get("ground_truth", None)
                 print("[prompt]", prompt_str)
                 print("[response]", response_str)
+                if extracted_answer is not None:
+                    print("[extracted_answer]", extracted_answer)
                 print("[ground_truth]", ground_truth)
-                print("[score]", scores[i])
+                if isinstance(score, dict):
+                    for key, value in score.items():
+                        print(f"[{key}]", value)
+                else:
+                    print("[score]", score)
+                print("[data_source]", data_source)
+                if "agent_name" in data.non_tensor_batch:
+                    print("[agent_name]", data.non_tensor_batch["agent_name"][i])
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
-        data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
+        # data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
 
         if return_dict:
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
