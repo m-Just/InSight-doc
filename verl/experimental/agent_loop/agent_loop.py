@@ -278,6 +278,10 @@ class AgentLoopBase(ABC):
                 ),
             )
 
+            logger.debug(f"[AgentLoopBase.apply_chat_template] {messages=}")
+            logger.debug(f"[AgentLoopBase.apply_chat_template] {tools=}")
+            logger.debug(f"[AgentLoopBase.apply_chat_template] {raw_prompt=}")
+
             # split the videos and according metadatas
             if videos is not None:
                 videos, video_metadatas = zip(*videos, strict=False)
@@ -429,6 +433,7 @@ class AgentLoopWorker:
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
+            top_k=config.top_k,
             top_p=config.top_p,
             repetition_penalty=1.0,
             logprobs=(1 if config.calculate_log_probs else None),
@@ -436,8 +441,9 @@ class AgentLoopWorker:
 
         # override sampling params for validation
         if batch.meta_info.get("validate", False):
-            sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["temperature"] = config.val_kwargs.temperature
+            sampling_params["top_k"] = config.val_kwargs.top_k
+            sampling_params["top_p"] = config.val_kwargs.top_p
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:

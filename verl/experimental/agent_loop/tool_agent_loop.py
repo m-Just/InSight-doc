@@ -348,7 +348,7 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             response_ids = await self.apply_chat_template(
                 add_messages,
-                images=new_images_this_turn,  # Using local variable
+                images=new_images_this_turn if new_images_this_turn else None,  # Pass None if empty list
                 videos=None,
                 remove_system_prompt=True,
             )

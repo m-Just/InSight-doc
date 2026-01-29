@@ -25,6 +25,7 @@ from uuid import uuid4
 import ray
 import ray.actor
 from qwen_vl_utils import fetch_image, smart_resize
+from qwen_vl_utils.vision_process import SPATIAL_MERGE_SIZE
 
 from .base_tool import BaseTool
 from .schemas import OpenAIFunctionToolSchema, ToolResponse
@@ -169,13 +170,17 @@ class ImageZoomInTool(BaseTool):
         self.rate_limit = config.get("rate_limit", 50)
         self.timeout = config.get("timeout", 30)
 
-        self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
-        self.execution_pool = init_visual_execution_pool(
-            num_workers=self.num_workers,
-            enable_global_rate_limit=self.enable_global_rate_limit,
-            rate_limit=self.rate_limit,
-            mode=PoolMode.ThreadMode,
-        )
+        self.enable_execution_pool = config.get("enable_execution_pool", False)
+        if self.enable_execution_pool:
+            self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
+            self.execution_pool = init_visual_execution_pool(
+                num_workers=self.num_workers,
+                enable_global_rate_limit=self.enable_global_rate_limit,
+                rate_limit=self.rate_limit,
+                mode=PoolMode.ThreadMode,
+            )
+        else:
+            self.execution_pool = None
         logger.info(f"Initialized ImageZoomInTool with config: {config}")
 
     def _validate_bbox(self, left: float, top: float, right: float, bottom: float) -> bool:
@@ -355,6 +360,7 @@ class ImageZoomInTool(BaseTool):
             "reward": 0.0,
             "resized_image_size": kwargs.get("resized_image_size", (None, None)),
             "max_pixels": kwargs.get("max_pixels", None),
+            "patch_size": kwargs.get("patch_size", None),
         }
         return instance_id, ToolResponse()
 
@@ -403,6 +409,7 @@ class ImageZoomInTool(BaseTool):
                 new_height, new_width = smart_resize(
                     height=cropped_image.size[1],
                     width=cropped_image.size[0],
+                    factor=int(instance_data["patch_size"] * SPATIAL_MERGE_SIZE),
                     min_pixels=self.MIN_DIMENSION * self.MIN_DIMENSION,
                     max_pixels=max_pixels,
                 )

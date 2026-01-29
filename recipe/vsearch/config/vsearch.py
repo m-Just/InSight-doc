@@ -1,13 +1,18 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from omegaconf import MISSING
 
-from verl.base_config import BaseConfig
-from verl.workers.config import FSDPActorConfig, RolloutConfig
+from verl.workers.config import AgentLoopConfig, FSDPActorConfig
 
 __all__ = [
+    "VSearchAgentLoopConfig",
     "VSearchFSDPActorConfig",
 ]
+
+
+@dataclass
+class VSearchAgentLoopConfig(AgentLoopConfig):
+    vsearcher_loop_cls: str = MISSING
 
 
 @dataclass

@@ -912,51 +912,10 @@ class RayPPOTrainer:
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         metric_dict = {}
 
-        if "compute_score_success" in reward_extra_infos_dict and self.config.data.val_batch_size is None:
-            # compute compute_score_success rate
-            compute_score_success = reward_extra_infos_dict.pop("compute_score_success")
-            compute_score_success_by_source = defaultdict(list)
-            for i, data_source in enumerate(data_sources):
-                if compute_score_success[i] is not None:  # None means the score computation was skipped
-                    compute_score_success_by_source[data_source].append(compute_score_success[i])
-
-            for data_source, success_lst in compute_score_success_by_source.items():
-                success_rate = np.mean(success_lst)
-                metric_dict[f"val-aux/{data_source}/compute_score_success/mean"] = success_rate
-
-                # When val_only is on, we want the results to be reliable, i.e., all scores are computed successfully
-                # If this is not the case, we raise an error to notify the user
-                if success_rate < 1.0 and self.config.trainer.get("val_only", False):
-                    raise ValueError(
-                        f"val_only mode is on but {data_source}/compute_score_success/mean={success_rate} < 1.0"
-                    )
-
-            # drop failed samples (and their descendants)
-            idxs_to_keep = np.where(np.array(compute_score_success) != False)[0]  # noqa: E712
-            job_ids_to_keep = set(test_batch.non_tensor_batch["job_id"][idxs_to_keep])
-            idxs_to_keep = np.array(
-                [idx for idx in idxs_to_keep if test_batch.non_tensor_batch["root_job_id"][idx] in job_ids_to_keep]
-            )
-
-            if len(idxs_to_keep) < len(sample_inputs):
-                fail_count = len(sample_inputs) - len(idxs_to_keep)
-                print(
-                    f"WARNING: compute_score failed for {fail_count}/{len(sample_inputs)} samples; dropping failed ones"
-                )
-                test_batch = test_batch.select_idxs(idxs_to_keep)
-                data_sources = data_sources[idxs_to_keep]
-                sample_inputs = [sample_inputs[i] for i in idxs_to_keep]
-                sample_outputs = [sample_outputs[i] for i in idxs_to_keep]
-                sample_scores = [sample_scores[i] for i in idxs_to_keep]
-                sample_uids = [sample_uids[i] for i in idxs_to_keep]
-                if sample_turns:
-                    sample_turns = [sample_turns[i] for i in idxs_to_keep]
-                reward_extra_infos_dict = {k: [v[i] for i in idxs_to_keep] for k, v in reward_extra_infos_dict.items()}
-
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
 
         if self.config.get("use_vsearch", False):
-            vsearch_metrics = process_vsearch_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+            vsearch_metrics = process_vsearch_validation_metrics(data_sources, reward_extra_infos_dict)
             for data_source, var2metric2val in vsearch_metrics.items():
                 if data_source not in data_src2var2metric2val:
                     data_src2var2metric2val[data_source] = {}
@@ -1677,6 +1636,8 @@ class RayPPOTrainer:
         # Construct the extra batch
         from tensordict import TensorDict
 
+        if "dummy_tensor" in batch.batch:
+            _ = batch.batch.pop("dummy_tensor")
         assert len(batch.batch.keys()) == 0, f"{batch.batch.keys()=}"
         extra_tensor_batch = TensorDict({}, batch_size=len(extra_output_to_input_idx))
         extra_non_tensor_batch = {}
@@ -1776,7 +1737,7 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
 
-        current_epoch = self.global_steps // len(self.train_dataloader)
+        current_epoch = self.global_steps // len(self.train_dataloader) if self.train_dataloader else 0
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -2103,6 +2064,9 @@ class RayPPOTrainer:
                                 if reward_tensor is None:  # fallback to synchronous computation
                                     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                         batch.batch["token_level_scores"] = reward_tensor
+
+                        if self.config.get("use_vsearch", False):
+                            batch.non_tensor_batch.pop("critical_failure", None)
 
                         if reward_extra_infos_dict:
                             assert all(key not in batch.non_tensor_batch for key in reward_extra_infos_dict), (

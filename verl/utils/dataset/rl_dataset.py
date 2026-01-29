@@ -88,7 +88,7 @@ def concat_multi_modal_inputs(mm_inputs: Sequence[dict], new_mm_inputs: Sequence
     return mm_inputs
 
 
-def _setup_vsearch_fields(row_dict: dict[str, Any], config: DictConfig, is_train: bool) -> None:
+def _setup_vsearch_fields(row_dict: dict[str, Any], patch_size: int, config: DictConfig, is_train: bool) -> None:
     """Create vsearch fields (image_ori, image_ori_wh, image_processed_wh) in extra_info.
 
     Also sets up the image_zoom_in_tool create_kwargs in tools_kwargs, and replaces
@@ -149,6 +149,7 @@ def _setup_vsearch_fields(row_dict: dict[str, Any], config: DictConfig, is_train
     create_kwargs.update({
         "image": extra_info["image_ori"][0],
         "resized_image_size": extra_info["image_processed_wh"][0],
+        "patch_size": patch_size,
     })
     if max_pixels is not None:
         create_kwargs["max_pixels"] = max_pixels
@@ -476,7 +477,7 @@ class RLHFDataset(Dataset):
 
         # Set up vsearch fields if enabled
         if self.config.get("use_vsearch", False):
-            _setup_vsearch_fields(row_dict, self.config, self._is_train)
+            _setup_vsearch_fields(row_dict, self.processor.image_processor.patch_size, self.config, self._is_train)
 
         return row_dict
 

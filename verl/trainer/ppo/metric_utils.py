@@ -229,32 +229,34 @@ def compute_agent_metrics(batch: DataProto) -> dict[str, Any]:
     data = {k: v for k, v in batch.non_tensor_batch.items()}
     data["rewards"] = batch.batch["token_level_rewards"].sum(-1).tolist()
 
-    def collect_metrics(metric_names: list[str]):
+    def collect_metrics(metric_names: list[str], agent_name_displayed: str):
         for metric_name in metric_names:
             value = data[metric_name][sample_idx]
-            agent2var2vals[agent_name][metric_name].append(value)
+            agent2var2vals[agent_name_displayed][metric_name].append(value)
             if data["parent_job_id"][sample_idx] is None:
-                agent2var2vals[f"{agent_name}/main"][metric_name].append(value)
+                agent2var2vals[f"{agent_name_displayed}/main"][metric_name].append(value)
             else:
-                agent2var2vals[f"{agent_name}/sub"][metric_name].append(value)
+                agent2var2vals[f"{agent_name_displayed}/sub"][metric_name].append(value)
 
     agent2var2vals = defaultdict(lambda: defaultdict(list))
     for sample_idx, agent_name in enumerate(batch.non_tensor_batch["agent_name"]):
-        collect_metrics(["rewards", "format_reward", "tool_reward", "n_tool_calls"])
-        if agent_name == "vsearcher":
-            collect_metrics(["iou_reward", "final_iou", "tool_iou"])
-        elif agent_name == "vreasoner":
-            collect_metrics(["accuracy_reward"])
+        if agent_name.startswith("vsearcher"):
+            agent_name_displayed = "vsearcher"
+            collect_metrics(["iou_reward", "final_iou", "tool_iou"], agent_name_displayed)
+        elif agent_name.startswith("vreasoner"):
+            agent_name_displayed = "vreasoner"
+            collect_metrics(["accuracy_reward"], agent_name_displayed)
+        collect_metrics(["rewards", "format_reward", "tool_reward", "n_tool_calls"], agent_name_displayed)
 
     metrics = {}
-    for agent_name, var2vals in agent2var2vals.items():
+    for agent_name_displayed, var2vals in agent2var2vals.items():
         for var_name, var_vals in var2vals.items():
             vals = np.array(var_vals)
             if len(vals) > 0:
-                metrics[f"{agent_name}/{var_name}/mean"] = vals.mean()
-                metrics[f"{agent_name}/{var_name}/std"] = vals.std()
-                metrics[f"{agent_name}/{var_name}/max"] = vals.max()
-                metrics[f"{agent_name}/{var_name}/min"] = vals.min()
+                metrics[f"{agent_name_displayed}/{var_name}/mean"] = vals.mean()
+                metrics[f"{agent_name_displayed}/{var_name}/std"] = vals.std()
+                metrics[f"{agent_name_displayed}/{var_name}/max"] = vals.max()
+                metrics[f"{agent_name_displayed}/{var_name}/min"] = vals.min()
 
     return metrics
 
@@ -631,6 +633,10 @@ def process_validation_metrics(
                 if not var_vals or isinstance(var_vals[0], str):
                     continue
 
+                # skip var with None vals
+                if any(val is None for val in var_vals):
+                    continue
+
                 # compute mean and std
                 n_resps = len(var_vals)
                 metric = {f"mean@{n_resps}": float(np_mean(var_vals))}
@@ -694,7 +700,7 @@ def process_validation_metrics(
 
 
 def process_vsearch_validation_metrics(
-    data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
+    data_sources: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
     data_by_source = defaultdict(lambda: defaultdict(list))
     for i, data_source in enumerate(data_sources):
@@ -717,6 +723,9 @@ def _compute_vsearch_val_metrics(var2vals: dict[str, list]) -> dict[str, dict[st
 
     def safe_ratio(num, den):
         return float(num / den) if den > 0 else float("nan")
+
+    if "critical_failure" not in var2vals:
+        raise ValueError("critical_failure not found")
 
     critical_failure = np.array(var2vals["critical_failure"], dtype=object)
     failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)

@@ -321,17 +321,11 @@ def parse_response(
     return parsed_content
 
 
-def compute_format_reward(
-    solution_str: str,
-    tool_call_check_fn: Callable,
-    core_answer_extraction_fn: Callable | None = None,
-    must_have_answer: bool = True,
-    skip_last_response_if_empty: bool = True,
-) -> dict:
-    """Compute the format reward of the model's conversation with the user (tool response).
-       Extract the final answer and other information (e.g., bboxes) from the conversation in the process.
+def compute_format_reward(solution_str: str, must_have_answer: bool = True) -> dict:
+    """Compute the format reward of the model's conversation with the user.
+       We assume that the user messages are all tool responses.
 
-    The conversation may contain multiple rounds of interaction between the model and the user.
+    The conversation may contain multiple rounds of exchanges between the model and the user.
     At each round, the model can choose to either
         a. call a tool; or
         b. answer the query.
@@ -342,11 +336,8 @@ def compute_format_reward(
         <answer>...</answer>       (otherwise)
 
     In addition:
-        - Every response except the last one must end with a tool call.
-        - Every tool call must pass tool_call_check_fn.
-        - If must_have_answer is True, the last response must contain an answer.
-        - If skip_last_response_if_empty is True, the last response may be empty
-            (in case the conversation was stopped early).
+        - Every response except the last one must end with <tool_call>...</tool_call>.
+        - If must_have_answer is True, the last response must end with <answer>...</answer>.
 
     Args:
         - solution_str: a conversation between the model and the user (excluding the system prompt
@@ -357,68 +348,95 @@ def compute_format_reward(
                 assistant\n
                 [... model_response ...]\n
                 ...
-        - tool_call_check_fn: a function that checks if the tool call is valid
-        - core_answer_extraction_fn: a function that tries to extract the core answer (within the answer tags)
-            from the model's response; the function should return None if the core answer can't be extracted;
-            if the function is not provided, the whole string within the answer tags will be extracted.
-        - must_have_answer: whether the model must answer the query.
-        - skip_last_response_if_empty: whether to skip the last response if it is empty.
+        - must_have_answer: whether the model must answer with <answer>...</answer> in the last response.
 
     Returns:
         - format_reward: a float that is either 0.0 or 1.0
-        - reward_extra_info: a dictionary for storing the extracted answer and other information
-            - extracted_answer: the final answer of the conversation; can be None
     """
 
     # Extract the responses from the conversation
     responses = [round.split("assistant\n")[-1] for round in solution_str.split("user\n")]
-    if skip_last_response_if_empty and not responses[-1]:
-        responses = responses[:-1]
 
     # Check if every response strictly follows the format
-    # Extract the bboxes and the final answer (if given) in the process
-    reward_extra_info = {"extracted_answer": None}
-
     for i, response in enumerate(responses):
-        # Check if this is a valid tool-call response
+        # Check if this is a tool-call response
         try:
-            content = parse_response(response, required_tags=["think", "tool_call"], excluded_tags=["answer"])
+            parse_response(response, required_tags=["think", "tool_call"], excluded_tags=["answer"])
         except ParseError:
-            is_valid_tool_call = False
+            is_tool_call = False
         else:
-            is_valid_tool_call = True
+            is_tool_call = True
 
-        # If this is not a valid tool-call response, see if it is the last response
-        # If it is the last response, the format can only be valid if it has an answer
-        # If it is not the last response, the format is wrong
-        if not is_valid_tool_call:
+        # If this is not a tool-call response, see if it is the last response
+        # If it is the last response, it should have an answer; otherwise, the format is wrong
+        if not is_tool_call:
             if i + 1 == len(responses):
                 must_have_answer = True
-                break
             else:
-                return 0.0, reward_extra_info
+                return 0.0
 
-        # Check if the tool call is valid
-        if not tool_call_check_fn(content["tool_call"], reward_extra_info):
-            return 0.0, reward_extra_info
-
-    # Try to parse the last response as an answer response
-    if responses:
+    # If must_have_answer is True, the last response must end with <answer>...</answer>
+    if must_have_answer:
         try:
-            content = parse_response(responses[-1], required_tags=["think", "answer"], excluded_tags=["tool_call"])
+            parse_response(responses[-1], required_tags=["think", "answer"], excluded_tags=["tool_call"])
         except ParseError:
-            if must_have_answer:
-                return 0.0, reward_extra_info
+            return 0.0
 
-        if "answer" in content:
-            if core_answer_extraction_fn:
-                reward_extra_info["extracted_answer"] = core_answer_extraction_fn(content["answer"])
-                if must_have_answer and reward_extra_info["extracted_answer"] is None:
-                    return 0.0, reward_extra_info
+    return 1.0
+
+
+def compute_format_reward_simple(solution_str: str, must_have_answer: bool = True) -> float:
+    """Simpler version of compute_format_reward that does not require <think>...</think>.
+
+    We reward the model if its response follows this format in every round:
+        ...
+        <tool_call>...</tool_call> (if a tool is needed)
+        <answer>...</answer>       (otherwise)
+
+    Everything else follows that of compute_format_reward.
+    """
+    # Extract the responses from the conversation
+    responses = [round.split("assistant\n")[-1] for round in solution_str.split("user\n")]
+
+    # Check if every response strictly follows the format
+    for i, response in enumerate(responses):
+        # Check if this is a tool-call response
+        if "<tool_call>" in response:
+            # Ensure there is exactly one <tool_call> and one </tool_call>
+            if response.count("<tool_call>") != 1 or response.count("</tool_call>") != 1:
+                return 0.0
+            # Ensure that </tool_call> is after <tool_call>
+            if "</tool_call>" not in response.split("<tool_call>", 1)[1]:
+                return 0.0
+            # Ensure there is nothing else after </tool_call>
+            if response.split("</tool_call>", 1)[1].strip():
+                return 0.0
+            # Ensure that there is no <answer> or </answer> in the response
+            if "<answer>" in response or "</answer>" in response:
+                return 0.0
+        else:
+            # If this is not a tool-call response, it should have an answer
+            if i + 1 == len(responses):
+                must_have_answer = True
             else:
-                reward_extra_info["extracted_answer"] = content["answer"].strip()
+                return 0.0
 
-    return 1.0, reward_extra_info
+    # If must_have_answer is True, the last response must end with <answer>...</answer>
+    if must_have_answer:
+        # Ensure there is exactly one <answer> and one </answer>
+        if responses[-1].count("<answer>") != 1 or responses[-1].count("</answer>") != 1:
+            return 0.0
+        # Ensure that </answer> is after <answer>
+        if "</answer>" not in responses[-1].split("<answer>", 1)[1]:
+            return 0.0
+        # Ensure there is nothing else after </answer>
+        if responses[-1].split("</answer>", 1)[1].strip():
+            return 0.0
+        # Ensure there is no tool call in the last response
+        if "<tool_call>" in responses[-1] or "</tool_call>" in responses[-1]:
+            return 0.0
+
+    return 1.0
 
 
 async def compute_accuracy_reward(
@@ -458,62 +476,40 @@ async def compute_accuracy_reward(
 async def compute_score_single_vsearch_base(
     solution_str: str,
     extra_info: dict,
-    core_answer_extraction_fn: Callable | None = None,
     **reward_kwargs: dict,
-) -> tuple[Score, dict]:
+) -> Score:
     assert len(extra_info["image_processed_wh"]) == 1, "only support single input image"
+    image_processed_wh = extra_info["image_processed_wh"][0]
+
     score_cls = SCORE_CLASS_MAP[reward_kwargs["reward_type"]]
     score = score_cls(reward_kwargs["reward_weights"])
 
-    def tool_call_check_fn(tool_call: str, reward_extra_info: dict) -> bool:
-        try:
-            tool_call_dict = json.loads(tool_call)
-        except json.JSONDecodeError as e:
-            logger.warning(f"[RewardWorker] Error parsing tool call JSON: {e}")
-            return False
-        if not isinstance(tool_call_dict, dict):
-            return False
-        if tool_call_dict.get("name") != "image_zoom_in_tool":
-            return False
-        try:
-            bbox = extract_bbox_from_tool_call(tool_call)
-        except Exception as e:
-            logger.warning(f"[RewardWorker] Error extracting bbox from tool call: {e}")
-            return False
-        if intersection_area(bbox, (0, 0, *extra_info["image_processed_wh"][0])) == 0.0:
-            return False
-        reward_extra_info.setdefault("bboxes", []).append(bbox)
-        return True
-
     # Compute the format reward
-    score.format_reward, reward_extra_info = compute_format_reward(
+    fn = compute_format_reward_simple if reward_kwargs["format_reward"]["simple"] else compute_format_reward
+    score.format_reward = fn(
         solution_str,
-        tool_call_check_fn,
-        core_answer_extraction_fn=core_answer_extraction_fn,
         must_have_answer=reward_kwargs["format_reward"]["must_have_answer"],
-        skip_last_response_if_empty=reward_kwargs["format_reward"]["skip_last_response_if_empty"],
     )
 
-    score.extracted_answer = reward_extra_info["extracted_answer"]
-    bboxes_crop = reward_extra_info.setdefault("bboxes", [])
+    bboxes_crop = extra_info["tool_call_bboxes"]
     score.n_valid_tool_calls = min(len(bboxes_crop), solution_str.count("user\n<tool_response>"))
 
     # Compute the iou if the ground truth bboxes are available
     if extra_info.get("bboxes"):
         tool_iou = compute_overall_iou_with_gt(
-            bboxes_crop, extra_info["bboxes"], extra_info["image_processed_wh"][0], extra_info["image_ori_wh"][0]
+            bboxes_crop, extra_info["bboxes"], image_processed_wh, extra_info["image_ori_wh"][0]
         )
         score.tool_iou = tool_iou
 
     # If the format is wrong, return 0.0 for all rewards
     if not score.format_reward:
-        return score, reward_extra_info
+        return score
 
     # Compute the tool reward
     score.tool_reward = float(score.n_valid_tool_calls > 0)
 
     # Penalize bad tool usage: cropping similar regions in two consecutive tool calls
-    seen_bboxes = [(0, 0, *extra_info["image_processed_wh"][0]), *bboxes_crop]
+    seen_bboxes = [(0, 0, *image_processed_wh), *bboxes_crop]
     for i in range(1, len(seen_bboxes)):
         iou = compute_iou(seen_bboxes[i-1], seen_bboxes[i])
         max_consecutive_iou = reward_kwargs["tool_reward"]["max_consecutive_iou"]
@@ -522,28 +518,19 @@ async def compute_score_single_vsearch_base(
             score.tool_reward = 0.0
             break
 
-    return score, reward_extra_info
+    return score
 
 
 async def compute_score_single_vsearcher(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **reward_kwargs: dict
 ) -> Score:
-    def core_answer_extraction_fn(answer: str) -> BBox | None:
-        try:
-            return parse_bbox(answer)
-        except Exception as e:
-            logger.warning(f"[RewardWorker] compute_score_single_vsearcher: {e}")
-            return None
-
-    score, _ = await compute_score_single_vsearch_base(
-        solution_str,
-        extra_info,
-        core_answer_extraction_fn=core_answer_extraction_fn,
-        **reward_kwargs,
-    )
+    score = await compute_score_single_vsearch_base(solution_str, extra_info, **reward_kwargs)
 
     # Compute the iou reward
-    bbox_2d = score.extracted_answer
+    # Use pre-converted final_bbox if available, otherwise use extracted_answer
+    bbox_2d = extra_info["final_bbox"]
+    if bbox_2d is not None:
+        bbox_2d = tuple(bbox_2d)  # Ensure it's a tuple
     if bbox_2d is None or bbox_2d == (0, 0, 0, 0):
         return score
 
@@ -562,7 +549,7 @@ async def compute_score_single_vsearcher(
 async def compute_score_single_vsearcher_as_subagent(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **reward_kwargs: dict
 ) -> Score:
-    score, _ = await compute_score_single_vsearch_base(solution_str, extra_info, **reward_kwargs)
+    score = await compute_score_single_vsearch_base(solution_str, extra_info, **reward_kwargs)
     return score
 
 
@@ -628,7 +615,11 @@ def _update_subagent_iou_rewards(
 
         # Get root job's accuracy_reward
         root_idx = job_id_to_idx[extra_info["root_job_id"]]
-        root_accuracy_reward = scores[root_idx].accuracy_reward
+        root_score = scores[root_idx]
+        if root_score is None:
+            # Root job's score computation failed, skip this subagent
+            continue
+        root_accuracy_reward = root_score.accuracy_reward
 
         # Compute pseudo_iou_reward based on pseudo_iou_reward_type
         caller_feedback = extra_info["caller_feedback"]
@@ -664,12 +655,12 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
             if "agent_name" not in extra_info:
                 raise KeyError(f"agent_name not found in extra_info: {extra_info}")
 
-            if extra_info["agent_name"] == "vsearcher":
+            if extra_info["agent_name"].startswith("vsearcher"):
                 if extra_info.get("parent_job_id") is None:
                     compute_single_fns.append(compute_score_single_vsearcher)
                 else:
                     compute_single_fns.append(compute_score_single_vsearcher_as_subagent)
-            elif extra_info["agent_name"] == "vreasoner":
+            elif extra_info["agent_name"].startswith("vreasoner"):
                 compute_single_fns.append(compute_score_single_vreasoner)
             else:
                 raise ValueError(f"Unknown agent name: {extra_info['agent_name']}")

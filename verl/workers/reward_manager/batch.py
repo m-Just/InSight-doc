@@ -73,7 +73,7 @@ class BatchRewardManager(AbstractRewardManager):
         # First, we deepcopy the extras, so we can safely modify its content
         # NOTE: we can't use `extras = deepcopy(extras)` because it does *not* deepcopy the objects in the array!
         extras = np.array([deepcopy(e) for e in extras])
-        for info in ("agent_name", "job_id", "parent_job_id", "root_job_id", "caller_feedback"):
+        for info in ("agent_name", "job_id", "parent_job_id", "root_job_id", "caller_feedback", "final_bbox", "tool_call_bboxes"):
             if info in data.non_tensor_batch:
                 for i in range(len(data)):
                     extras[i] = extras[i] or {}
@@ -142,11 +142,17 @@ class BatchRewardManager(AbstractRewardManager):
                 print("[data_source]", data_source)
                 if "agent_name" in data.non_tensor_batch:
                     print("[agent_name]", data.non_tensor_batch["agent_name"][i])
+                if "failure_reasons" in data.non_tensor_batch:
+                    print("[failure_reasons]", data.non_tensor_batch["failure_reasons"][i])
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
         # data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
 
         if return_dict:
+            critical_failure = data.non_tensor_batch.pop("critical_failure", None)
+            if critical_failure is not None:
+                for i in range(len(data)):
+                    reward_extra_info["critical_failure"].append(critical_failure[i])
             return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
         else:
             return reward_tensor

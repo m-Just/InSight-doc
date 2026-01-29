@@ -5,7 +5,7 @@
   max_round_retries: 3
   max_round_retries_val: 5      # more permissive for validation
   gpt_image_max_area: 12250000  # 3500*3500
-  max_completion_tokens: 2048
+  max_completion_tokens: 4096
   reasoning_effort: null
   enable_tool_feedback: True    # whether provide feedback to vsearcher during training;
                                 # during validation, feedback is always disabled, ignoring this setting

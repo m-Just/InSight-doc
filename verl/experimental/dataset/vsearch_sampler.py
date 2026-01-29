@@ -18,17 +18,20 @@ class VSearchBatchSampler(AbstractBatchSampler):
     Key features:
     - Deterministic per-epoch shuffling: Uses a seeded torch.Generator and `set_epoch(epoch)`
       for reproducible shuffling with `torchdata.stateful_dataloader.StatefulDataLoader`.
+      If no seed is provided, a random seed is auto-generated (similar to TorchData's approach).
     - Fixed composition per batch: Computes per-source counts via the largest remainder method
       to match requested ratios within rounding error, and concatenates indices accordingly.
     - Exhaustion-based length: The number of batches equals the minimum over
       floor(len(source_indices) / per_batch_count[source]) across all participating sources.
     - Stateful resume: Supports `state_dict()` / `load_state_dict()` for seamless resumption
-      mid-epoch with identical remaining order.
+      mid-epoch with identical remaining order. The seed is saved in checkpoints, allowing
+      shuffle regeneration on resume.
 
     Configuration:
     - Expects ratios under `data_config.batch_sampler.weights`, e.g.:
       {"batch_sampler": {"weights": {"datasetA": 0.2, "datasetB": 0.8}}}
-      The sampler will also read `seed` from `data_config` if present.
+      The sampler will also read `seed` from `data_config` if present. If not provided,
+      a random seed is auto-generated.
     - The dataset must be an `RLHFDataset` exposing a HuggingFace `datasets.Dataset` as
       `dataframe` and include a `"data_source"` column.
 
@@ -48,8 +51,14 @@ class VSearchBatchSampler(AbstractBatchSampler):
         self.data_source: Sized = data_source
         self.data_config: DictConfig = data_config
 
-        # Seed for reproducible shuffling across epochs
-        self.seed: int = int(data_config.get("seed", 1))
+        # Seed for reproducible shuffling across epochs.
+        # If no seed is provided, auto-generate a random one (like TorchData's RandomSampler).
+        config_seed = data_config.seed
+        if config_seed is None:
+            # Generate a random seed using torch's random number generator
+            self.seed: int = int(torch.empty((), dtype=torch.int64).random_().item())
+        else:
+            self.seed: int = int(config_seed)
 
         # Extract ratios mapping from data_config. The user passes a DictConfig like
         # {"datasetA": 0.2, "datasetB": 0.8}. We treat string->float pairs as ratios.
@@ -79,10 +88,14 @@ class VSearchBatchSampler(AbstractBatchSampler):
             if src in self.source_to_indices:
                 self.source_to_indices[src].append(idx)
 
-        # Filter out sources with 0 samples
-        self.source_to_indices = {s: idxs for s, idxs in self.source_to_indices.items() if len(idxs) > 0}
-        if not self.source_to_indices:
-            raise ValueError("No samples found for any of the specified data sources in ratios")
+        # Validate that all requested sources exist in the dataset
+        missing_sources = {s for s in desired_sources if len(self.source_to_indices[s]) == 0}
+        if missing_sources:
+            available_sources = set(source_column)
+            raise ValueError(
+                f"Data sources specified in batch_sampler.weights not found in dataset: {missing_sources}. "
+                f"Available data sources in dataset: {available_sources}"
+            )
 
         # Renormalize ratios to present sources only
         present_sources = list(self.source_to_indices.keys())
@@ -151,6 +164,7 @@ class VSearchBatchSampler(AbstractBatchSampler):
 
     def state_dict(self) -> Dict:
         return {
+            "seed": self.seed,
             "epoch": self._epoch,
             "prepared_epoch": self._prepared_epoch,
             "positions": dict(self._positions),
@@ -158,14 +172,16 @@ class VSearchBatchSampler(AbstractBatchSampler):
         }
 
     def load_state_dict(self, state: Dict) -> None:
+        # Restore the seed; default to 1 if not found in state_dict (e.g., legacy checkpoints)
+        self.seed = int(state.get("seed", 1))
         self._epoch = int(state.get("epoch", 0))
-        # Force regeneration of deterministic shuffle for this epoch on next __iter__
-        # so that resuming in a new process reproduces the same order.
-        self._prepared_epoch = None
         positions = state.get("positions", {})
         for s in self.per_batch_counts.keys():
             self._positions[s] = int(positions.get(s, 0))
         self._yielded_batches = int(state.get("yielded_batches", 0))
+        # Force regeneration of deterministic shuffle for this epoch on next __iter__
+        # so that resuming in a new process reproduces the same order.
+        self._prepared_epoch = None
 
     def _prepare_epoch(self) -> None:
         # If the previous iteration exhausted all batches and a new iteration starts
@@ -179,8 +195,9 @@ class VSearchBatchSampler(AbstractBatchSampler):
             return
 
         # Deterministic per-epoch shuffling using torch.Generator
+        # Use modulo 2**32 to ensure the seed fits in 32 bits (manual_seed requirement)
         g = torch.Generator()
-        g.manual_seed(int(self.seed + self._epoch))
+        g.manual_seed((self.seed + self._epoch) % (2**32))
 
         self._shuffled_indices = {}
         for s, idxs in self.source_to_indices.items():

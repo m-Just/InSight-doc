@@ -77,11 +77,13 @@ actor_rollout_ref:
       enable: True
       max_user_turns: 6        # exluding the initial user turn, so this is essentially max tool response turns
       max_assistant_turns: 7   # max_user_turns + 1
-      tool_config_path: "recipe/deepeyes/configs/image_zoom_in_tool_config.yaml"
+      tool_config_path: "recipe/vsearch/config/image_zoom_in_tool_config.yaml"
+      # qwen_tool_list: ["image_zoom_in_tool"]  # qwen_agent tool names; this is for qwen3_vl and is different from the tool specified in tool_config_path
     # ==================================
 
     agent:
-      _target_: verl.workers.config.AgentLoopConfig
+      # _target_: verl.workers.config.AgentLoopConfig
+      _target_: recipe.vsearch.config.VSearchAgentLoopConfig
       agent_loop_config_path: "recipe/vsearch/config/agent_gpt_5_mini.yaml"
 
   ref:
@@ -89,15 +91,11 @@ actor_rollout_ref:
       param_offload: True
     
 reward_model:
+  use_reward_loop: False
   reward_manager: batch
   launch_reward_fn_async: True     # if True, the reward function will be launched in a separate process
   reward_fn_async_backend: thread  # thread or ray (ray is the default of verl but it comes with issues)
 
-  disable_async_reward: True       # disable async reward compute during agent loop
-                                   # the main branch do not have this option to disable async reward computation,
-                                   # leading to the reward being computed twice:
-                                   # 1. during agent loop
-                                   # 2. during training
   num_examine:
     train: 1
     val: 1
@@ -123,7 +121,7 @@ custom_reward_function:
       tool: 1.0
     format_reward:
       must_have_answer: True
-      skip_last_response_if_empty: False
+      simple: False
     iou_reward:
       iou_low: 0.25
       iou_high: 1.0

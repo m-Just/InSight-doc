@@ -1,19 +1,21 @@
 import base64
 import io
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import logging
 import asyncio
 from functools import partial
+from pprint import pformat
 
 from openai.types.chat import ChatCompletionMessage
 from PIL import Image
 
-import verl.utils.vsearch_role_play_prompt as prompts
+import verl.utils.vsearch_role_play_prompt as prompts_no_tool_feedback
+import verl.utils.vsearch_role_play_prompt_with_tool_feedback as prompts_with_tool_feedback
 from verl.utils.vsearch import BBox
 
-from insight_o3.utils.api import create_async_openai_client, query_api  # pyright: ignore[reportMissingImports]
+from insight_o3.utils.api import create_async_openai_client, query_api, prune_non_text_content  # pyright: ignore[reportMissingImports]
 
 
 logger = logging.getLogger(__file__)
@@ -31,6 +33,7 @@ class GPTVisualSearchRequest:
     is_last_round: bool = False  # Whether last-round prompt was used this call
     tool_feedback: Optional[str] = None  # Parsed <tool_feedback> content if present
     display_text: Optional[str] = None  # Text to display to the user
+    failure_reasons: list[str] = field(default_factory=list)  # Reasons for failure
 
 
 # --- Minimal image helpers --------------------------------------------------
@@ -165,14 +168,13 @@ async def get_gpt_visual_search_request(
 
     is_first_round = prior_tool_calls == 0
     is_last_round = False
-    last_image_used: Optional[str] = None
 
     # Select prompt set based on flag
     if enable_tool_feedback:
-        vsearch_sys_prompt = prompts.vsearch_sys_prompt_with_feedback
+        prompts = prompts_with_tool_feedback
     else:
-        vsearch_sys_prompt = prompts.vsearch_sys_prompt
-
+        prompts = prompts_no_tool_feedback
+    
     # Prepare first prompt/image once
     def _prepare_first_image(img: Image.Image, gpt_image_max_area: int) -> str:
         img = img.convert("RGB") if img.mode != "RGB" else img
@@ -182,15 +184,14 @@ async def get_gpt_visual_search_request(
     loop = asyncio.get_event_loop()
 
     if not out_messages:
-        last_image_used = await loop.run_in_executor(None, _prepare_first_image, original_image, gpt_image_max_area)
-        out_messages = [{"role": "system", "content": vsearch_sys_prompt}]
+        pending_image_url = await loop.run_in_executor(None, _prepare_first_image, original_image, gpt_image_max_area)
+        out_messages = [{"role": "system", "content": prompts.vsearch_sys_prompt}]
         pending_question = initial_question
-        pending_image = last_image_used
     else:
         # Check bbox first; treat [0,0,0,0] as invalid
         bbox_valid = bool(bbox) and any(int(v) != 0 for v in bbox)
         if bbox_valid:
-            pending_image = await loop.run_in_executor(
+            pending_image_url = await loop.run_in_executor(
                 None,
                 partial(
                     _crop_prepare_data_url,
@@ -202,10 +203,9 @@ async def get_gpt_visual_search_request(
                     max_area=gpt_image_max_area,
                 )
             )
-            last_image_used = pending_image
-            pending_question = prompts.vsearch_user_hint if pending_image else prompts.vsearch_user_hint_fail
+            pending_question = prompts.vsearch_user_hint if pending_image_url else prompts.vsearch_user_hint_fail
         else:
-            pending_image = None
+            pending_image_url = None
             pending_question = prompts.vsearch_user_hint_fail
 
     # If exceeded tool-call limit already, force last-round prompt for the first attempt
@@ -213,8 +213,10 @@ async def get_gpt_visual_search_request(
         pending_question = prompts.vsearch_user_hint_last_round
         is_last_round = True
 
-    updated_messages: Optional[list[ChatCompletionMessage]] = None
     current_messages: list = out_messages
+    updated_messages = None
+    failure_reasons = []
+
     attempt = 0
     while attempt < int(max_round_retries):
         try:
@@ -222,7 +224,7 @@ async def get_gpt_visual_search_request(
                 query=pending_question,
                 model=model,
                 client=client,
-                image_url=last_image_used if is_last_round else pending_image,
+                image_url=pending_image_url,
                 image_url_extra_settings={"detail": image_detail},
                 context=current_messages,
                 max_completion_tokens=max_completion_tokens,
@@ -236,59 +238,88 @@ async def get_gpt_visual_search_request(
 
         # If the underlying call failed, keep prior inputs/messages and try again
         if not updated_messages or not isinstance(updated_messages[-1], ChatCompletionMessage):
-            # drop the last message because query_gpt have appended the pending_question
-            # to the messages and it will do so once again in the next attempt
-            current_messages = current_messages[:-1]
+            failure_reasons.append("query_api_failed")
             attempt += 1
             continue
 
         # Successful call: update messages and inspect format
         current_messages = updated_messages
-        assistant_msg: ChatCompletionMessage = updated_messages[-1]
+        assistant_msg: ChatCompletionMessage = current_messages[-1]
         content: str = assistant_msg.content or ""
+        finish_reason = response.choices[0].finish_reason
+
         region_desc = _parse_region_description(content)
         answer = _parse_boxed_answer(content)
-
         tool_feedback = None
         if enable_tool_feedback:
             feedback_str = _parse_tool_feedback(content)
-            if (
-                is_first_round and feedback_str == "NA"
-            ) or (
-                (not is_first_round) and feedback_str in ("helpful", "unhelpful")
-            ):
+            if is_first_round and feedback_str == "NA":
+                tool_feedback = feedback_str
+            if not is_first_round and feedback_str in ("helpful", "unhelpful"):
                 tool_feedback = feedback_str
 
-        if (region_desc is not None or answer is not None) and (tool_feedback is not None or not enable_tool_feedback):
+        # Check if the response follows the expected format
+        import uuid
+        current_messages_text_only_formatted = pformat([prune_non_text_content(message) for message in current_messages])
+        if is_last_round:
+            if not answer:
+                failure_reasons.append(f"no_answer_in_last_round({finish_reason})")
+                success = False
+                logger.warning(
+                    f"no answer from {model} in last round (attempt {attempt + 1} of {max_round_retries}; {finish_reason=})"
+                )
+            else:
+                success = True
+        else:
+            if not (region_desc or answer):
+                failure_reasons.append(f"no_tool_call_nor_answer({finish_reason})")
+                success = False
+                logger.warning(
+                    f"no tool call nor answer from {model} (attempt {attempt + 1} of {max_round_retries}; {finish_reason=})"
+                )
+            else:
+                success = True
+
+        if enable_tool_feedback and not tool_feedback:
+            if success:
+                failure_reasons.append(f"no_feedback({finish_reason})")
+            else:
+                failure_reasons[-1] += f"+no_feedback({finish_reason})"
+            success = False
+            logger.warning(
+                f"no feedback from {model} (attempt {attempt + 1} of {max_round_retries}; {finish_reason=})"
+            )
+
+        if success:
             return GPTVisualSearchRequest(
                 success=True,
-                messages=updated_messages,
+                messages=current_messages,
                 region_description=region_desc,
                 answer=answer,
                 is_last_round=is_last_round,
                 tool_feedback=tool_feedback,
-                display_text=updated_messages[-1].content,
+                display_text=content,
+                failure_reasons=failure_reasons,
             )
-
-        # Neither tool call nor answer -> follow-up with a format hint or last-round
-        logger.warning(f"no tool call nor answer from {model} (attempt {attempt + 1} of {max_round_retries})")
-        attempt += 1
-        if prior_tool_calls >= int(max_tool_calls) or is_last_round:
-            pending_question = prompts.vsearch_user_hint_last_round
-            is_last_round = True
-            # keep using last image if we have one
-            pending_image = last_image_used
         else:
+            attempt += 1
+
+        if is_last_round:
+            # Retry with the same inputs/messages
+            current_messages = out_messages
+        else:
+            # Neither tool call nor answer (or no feedback) -> follow-up with a format hint or last-round
             pending_question = prompts.format_user_hint
-            pending_image = None
+            pending_image_url = None
 
     # Exhausted retries
     return GPTVisualSearchRequest(
         success=False,
-        messages=current_messages,  # type: ignore[arg-type]
+        messages=updated_messages or current_messages,  # type: ignore[arg-type]
         region_description=None,
         answer=None,
         is_last_round=is_last_round,
         tool_feedback=None,
         display_text=None,
+        failure_reasons=failure_reasons,
     )

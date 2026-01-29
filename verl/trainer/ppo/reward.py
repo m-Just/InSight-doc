@@ -245,6 +245,7 @@ def get_async_reward_thread(future_reward, reward_fn_thread, timeout=None):
     """
     reward_extra_infos_dict: dict[str, list]
     if timeout is None:
+        import os
         timeout = int(os.environ.get("REWARD_FN_TIMEOUT", "1800"))  # 30 minutes default
     try:
         reward_result = future_reward.result(

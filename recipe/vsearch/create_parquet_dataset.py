@@ -13,10 +13,27 @@ from datasets import Dataset, load_dataset
 from PIL import Image
 
 
+QWEN3_VL_ANALYSIS_PROMPT = """Your role is that of a research assistant specializing in visual information. Answer questions about images by looking at them closely and then using research tools. Please follow this structured thinking process and show your work.
+
+Start an iterative loop for each question:
+
+- **First, look closely:** Begin with a detailed description of the image, paying attention to the user's question. List what you can tell just by looking, and what you'll need to look up.
+- **Next, find information:** Use a tool to research the things you need to find out.
+- **Then, review the findings:** Carefully analyze what the tool tells you and decide on your next action.
+
+Continue this loop until your research is complete.
+
+To finish, bring everything together in a clear, synthesized answer that fully responds to the user's question."""
+
+
 PROMPTS = {
     "vreasoner": {
         "system": "Dummy system prompt. This will be replaced during rollout.",
         "user_template": "Dummy prompt. This will be replaced during rollout. <image>{question}",
+    },
+    "vreasoner_qwen3_vl": {
+        "system": QWEN3_VL_ANALYSIS_PROMPT,
+        "user_template": "<image>{question}\nPut your final answer inside <answer>...</answer>.",
     },
     "vsearcher_qwen2_5_vl": {
         "system": 'You are a helpful assistant.\n\n# Tools\nYou may call one or more functions to assist with the user query.\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{"type":"function","function":{"name":"image_zoom_in_tool","description":"Zoom in on a specific region of an image by cropping it based on a bounding box (bbox) and an optional object label.","parameters":{"type":"object","properties":{"bbox_2d":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4,"description":"The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner."},"label":{"type":"string","description":"The name or label of the object in the specified bounding box (optional)."}},"required":["bbox"]}}}\n</tools>\n\n# How to call a tool\nReturn a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>\n\n**Example**:  \n<tool_call>  \n{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}  \n</tool_call>',
@@ -25,6 +42,14 @@ PROMPTS = {
             "\nThink first, call **image_zoom_in_tool** if needed, then answer with the bbox coordinates in [x1, y1, x2, y2] format (or [0, 0, 0, 0] if you can't locate it). "
             "Format strictly as:  <think>...</think>  <tool_call>...</tool_call> (if tools needed)  "
             "<answer>[x1, y1, x2, y2]</answer> (otherwise)"
+        ),
+    },
+    "vsearcher_qwen3_vl": {
+        "system": QWEN3_VL_ANALYSIS_PROMPT,
+        "user_template": (
+            "<image>\nLocate {target}."
+            "\nThink first, call **image_zoom_in_tool** if needed, then answer with the bbox coordinates in [x1, y1, x2, y2] format (or [0, 0, 0, 0] if you can't locate it). "
+            "Put your answer inside <answer>...</answer>."
         ),
     },
 }
@@ -388,12 +413,28 @@ if __name__ == "__main__":
         --agent_name vreasoner
 
     python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset O3Bench \
+        --data_root data/O3-Bench \
+        --split test \
+        --prompt vreasoner_qwen3_vl \
+        --output_path data/O3-Bench/test-vreasoner_qwen3vl.parquet \
+        --agent_name vreasoner_qwen3_vl
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
         --dataset VStarBench \
         --data_root data/vstar_bench \
         --split test \
         --prompt vreasoner \
         --output_path data/vstar_bench/test.parquet \
         --agent_name vreasoner
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset VStarBench \
+        --data_root data/vstar_bench \
+        --split test \
+        --prompt vreasoner_qwen3_vl \
+        --output_path data/vstar_bench/test-vreasoner_qwen3vl.parquet \
+        --agent_name vreasoner_qwen3_vl
 
     python verl/recipe/vsearch/create_parquet_dataset.py \
         --dataset VisualProbeHard \
@@ -421,12 +462,30 @@ if __name__ == "__main__":
         --num_workers 32
 
     python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset VisCoT_VStar_Collage \
+        --data_root data/VisCoT_VStar_Collage \
+        --split train \
+        --prompt vreasoner_qwen3_vl \
+        --output_path data/VisCoT_VStar_Collage/train-vreasoner_qwen3vl.parquet \
+        --agent_name vreasoner_qwen3_vl \
+        --num_workers 32
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
         --dataset InfoVQA_RegionLocalization \
         --data_root data/InfoVQA_RegionLocalization \
         --split train \
         --prompt vsearcher_qwen2_5_vl \
         --output_path data/InfoVQA_RegionLocalization/train-vsearcher.parquet \
         --agent_name vsearcher \
+        --num_workers 32
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset InfoVQA_RegionLocalization \
+        --data_root data/InfoVQA_RegionLocalization \
+        --split train \
+        --prompt vsearcher_qwen3_vl \
+        --output_path data/InfoVQA_RegionLocalization/train-vsearcher_qwen3vl.parquet \
+        --agent_name vsearcher_qwen3_vl \
         --num_workers 32
     """
 
@@ -505,7 +564,7 @@ if __name__ == "__main__":
             hf_dataset.to_parquet(args.output_path)
         show_example_data(hf_dataset)
         full_path = str(Path(args.output_path).resolve())
-        print(f"\nFinished {args.split} split with {len(hf_dataset)} samples. Saved to {full_path}")
+        print(f"\nFinished {args.split} split with {len(hf_dataset)} samples.\nSaved to {full_path}")
     else:
         print(f"Original split: {args.split} split with {len(hf_dataset)} samples.")
         hf_dataset_dict = hf_dataset.train_test_split(test_size=args.test_size, seed=42)
@@ -521,4 +580,4 @@ if __name__ == "__main__":
                 hf_dataset_dict[split_name].to_parquet(output_paths[split_name])
             show_example_data(hf_dataset_dict[split_name])
             full_path = str(Path(output_paths[split_name]).resolve())
-            print(f"\nNew {split_name} split: {len(hf_dataset_dict[split_name])} samples. Saved to: {full_path}")
+            print(f"\nNew {split_name} split: {len(hf_dataset_dict[split_name])} samples.\nSaved to: {full_path}")
