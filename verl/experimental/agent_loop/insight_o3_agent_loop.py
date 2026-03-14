@@ -49,6 +49,7 @@ class ExtraFields:
     extra_info: dict[str, Any]
     
     idx_as_child: int | None = None
+    img_idx: int | None = None  # For multi-image VReasoner: which input image this VSearcher operated on (0-indexed)
     n_tool_calls: int = 0
     caller_feedback: str | None = None
     final_bbox: BBox | None = None
@@ -604,6 +605,7 @@ class VReasonerLoop(AgentLoopBase):
         max_completion_tokens: int | None = 2048,  # max completion tokens (per turn) for vReasoner
         reasoning_effort: str | None = None,       # reasoning effort for vReasoner
         enable_tool_feedback: bool = True,         # enable tool feedback for vReasoner
+        multi_image_input: bool = False,           # support multiple input images per query
         **kwargs,                                  # extra kwargs for vReasoner
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, dataset_config, **kwargs)
@@ -615,6 +617,7 @@ class VReasonerLoop(AgentLoopBase):
         self.max_completion_tokens = max_completion_tokens
         self.reasoning_effort = reasoning_effort
         self.enable_tool_feedback = enable_tool_feedback
+        self.multi_image_input = multi_image_input
         vsearcher_loop_cls_name = self.config.actor_rollout_ref.rollout.agent.get("vsearcher_loop_cls", "VSearcherLoop")
         if vsearcher_loop_cls_name == "VSearcherLoop":
             vsearcher_loop_cls = VSearcherLoop
@@ -645,6 +648,7 @@ class VReasonerLoop(AgentLoopBase):
         messages_api = []
         bbox = None
         n_tool_calls = 0
+        last_img_idx = None
         vsearcher_outputs = []
         critical_failure = False
         multi_modal_data = {"images": []}
@@ -657,7 +661,7 @@ class VReasonerLoop(AgentLoopBase):
             with simple_timer("api_calls", profile):
                 request = await get_gpt_visual_search_request(
                     initial_question=kwargs["extra_info"]["question"],
-                    original_image=kwargs["extra_info"]["image_ori"][0],
+                    original_images=kwargs["extra_info"]["image_ori"],
                     messages=messages_api,
                     bbox=bbox,
                     model=self.model,
@@ -667,6 +671,8 @@ class VReasonerLoop(AgentLoopBase):
                     max_completion_tokens=self.max_completion_tokens,
                     reasoning_effort=self.reasoning_effort,
                     enable_tool_feedback=(False if validate else self.enable_tool_feedback),
+                    multi_image_input=self.multi_image_input,
+                    last_img_idx=last_img_idx,
                 )
 
             if not request.success:
@@ -690,9 +696,18 @@ class VReasonerLoop(AgentLoopBase):
             # Prepare vSearcherLoop.run() kwargs and sampling params
             # Extract vision info from raw_prompt messages using qwen_vl_utils
             vision_infos = extract_vision_info(kwargs["raw_prompt"])
-            assert len(vision_infos) == 1, f"expected 1 vision info, got {len(vision_infos)}"
-            image = vision_infos[0]
-            assert image["type"] in ("image", "image_url"), f"expected image or image_url, got {image['type']}"
+            image_infos = [v for v in vision_infos if v["type"] in ("image", "image_url")]
+
+            if self.multi_image_input:
+                img_idx = request.img_idx if request.img_idx is not None else 0
+                assert 0 <= img_idx < len(image_infos), (
+                    f"img_idx {img_idx} out of range for {len(image_infos)} images"
+                )
+                image = image_infos[img_idx]
+                last_img_idx = img_idx
+            else:
+                assert len(image_infos) == 1, f"expected 1 image, got {len(image_infos)}"
+                image = image_infos[0]
 
 
             if self.vsearcher_loop.AGENT_NAME == "vsearcher":
@@ -733,11 +748,31 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     ],
                 },
             ]
+            if self.multi_image_input:
+                tools_kwargs_for_vsearcher = {
+                    **kwargs["tools_kwargs"],
+                    "image_zoom_in_tool": {
+                        "create_kwargs": {
+                            **kwargs["tools_kwargs"].get("image_zoom_in_tool", {}).get("create_kwargs", {}),
+                            "image": kwargs["extra_info"]["image_ori"][img_idx],
+                            "resized_image_size": kwargs["extra_info"]["image_processed_wh"][img_idx],
+                        }
+                    },
+                }
+                extra_info_for_vsearcher = {
+                    **kwargs["extra_info"],
+                    "image_ori": [kwargs["extra_info"]["image_ori"][img_idx]],
+                    "image_ori_wh": [kwargs["extra_info"]["image_ori_wh"][img_idx]],
+                    "image_processed_wh": [kwargs["extra_info"]["image_processed_wh"][img_idx]],
+                }
+            else:
+                tools_kwargs_for_vsearcher = kwargs["tools_kwargs"]
+                extra_info_for_vsearcher = kwargs["extra_info"]
+
             vsearcher_kwargs = {
                 "raw_prompt": raw_prompt,
-                # "multi_modal_data": {"image": [kwargs["multi_modal_data"]["image"][0]]},
-                "tools_kwargs": kwargs["tools_kwargs"],
-                "extra_info": kwargs["extra_info"],
+                "tools_kwargs": tools_kwargs_for_vsearcher,
+                "extra_info": extra_info_for_vsearcher,
                 "parent_job_id": job_id,
                 "root_job_id": root_job_id,
                 "_validate": validate,
@@ -751,6 +786,8 @@ To finish, bring everything together in a clear, synthesized answer that fully r
             with simple_timer("vsearcher_loop.run", profile):
                 vsearcher_output = await self.vsearcher_loop.run(vsearcher_sampling_params, **vsearcher_kwargs)
                 vsearcher_output.extra_fields["idx_as_child"] = len(vsearcher_outputs)
+                if self.multi_image_input:
+                    vsearcher_output.extra_fields["img_idx"] = img_idx
             vsearcher_outputs.append(vsearcher_output)
 
             bbox = vsearcher_output.extra_fields["final_bbox"]
@@ -760,17 +797,23 @@ To finish, bring everything together in a clear, synthesized answer that fully r
 
             # Resize the target region bbox in scale with the original image resolution
             if bbox != (0, 0, 0, 0):
-                source_wh = kwargs["extra_info"]["image_processed_wh"][0]
-                target_wh = kwargs["extra_info"]["image_ori_wh"][0]
+                resize_idx = img_idx if self.multi_image_input else 0
+                source_wh = kwargs["extra_info"]["image_processed_wh"][resize_idx]
+                target_wh = kwargs["extra_info"]["image_ori_wh"][resize_idx]
                 bbox = resize_bbox(bbox, source_wh, target_wh)
 
         logger.info(f"vreasoner loop completed: {profile=}")
 
         # Construct messages for answer evaluation and visualization
+        if self.multi_image_input:
+            n_images = len(kwargs["extra_info"]["image_ori"])
+            vision_tokens = "".join("<|vision_start|><|vision_end|>" for _ in range(n_images))
+        else:
+            vision_tokens = "<|vision_start|><|vision_end|>"
         user_message = {
             "role": "user",
             "content": [
-                {"type": "text", "text": "<|vision_start|><|vision_end|>" + kwargs["extra_info"]["question"]},
+                {"type": "text", "text": vision_tokens + kwargs["extra_info"]["question"]},
             ],
         }
 
@@ -813,9 +856,9 @@ To finish, bring everything together in a clear, synthesized answer that fully r
 
             # Collect image data from the message for visualization
             if isinstance(message["content"], list):
-                for content in message["content"]:
-                    if content["type"] == "image_url":
-                        image_url = content["image_url"]["url"]
+                for item in message["content"]:
+                    if item.get("type") == "image_url":
+                        image_url = item["image_url"]["url"]
                         _, b64data = image_url.split(",", 1)
                         img = await loop.run_in_executor(
                             None, lambda b: Image.open(io.BytesIO(base64.b64decode(b))), b64data
@@ -835,14 +878,25 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                 content = [{"type": "text", "text": text}]
                 content_shortened = [{"type": "text", "text": maybe_truncate(text)}]
             elif message["role"] == "user":
-                content = [
-                    {"type": "text", "text": "<tool_response>"},
-                    {"type": "image"},
-                    {"type": "text", "text": "</tool_response>"},
-                ]
-                content_shortened = [
-                    {"type": "text", "text": "<tool_response><|vision_start|><|vision_end|></tool_response>"},
-                ]
+                has_image = (
+                    isinstance(message["content"], list)
+                    and any(c.get("type") == "image_url" for c in message["content"])
+                )
+                if has_image:
+                    content = [
+                        {"type": "text", "text": "<tool_response>"},
+                        {"type": "image"},
+                        {"type": "text", "text": "</tool_response>"},
+                    ]
+                    content_shortened = [
+                        {"type": "text", "text": "<tool_response><|vision_start|><|vision_end|></tool_response>"},
+                    ]
+                else:
+                    text = message["content"] if isinstance(message["content"], str) else " ".join(
+                        c.get("text", "") for c in message["content"] if c.get("type") == "text"
+                    )
+                    content = [{"type": "text", "text": text}]
+                    content_shortened = [{"type": "text", "text": maybe_truncate(text)}]
             else:
                 logger.warning(f"vreasoner: unexpected message role: {message['role']}")
                 continue

@@ -1,0 +1,14 @@
+- name: vreasoner
+  _target_: verl.experimental.agent_loop.insight_o3_agent_loop.VReasonerLoop
+  model: gpt-5-mini
+  max_tool_calls: 6
+  max_round_retries: 3
+  max_round_retries_val: 5      # more permissive for validation
+  gpt_image_max_area: 1638400   # 1280*1280
+  max_completion_tokens: 4096
+  reasoning_effort: null
+  enable_tool_feedback: True    # whether provide feedback to vsearcher during training;
+                                # during validation, feedback is always disabled, ignoring this setting
+  multi_image_input: True
+- name: vsearcher
+  _target_: verl.experimental.agent_loop.insight_o3_agent_loop.VSearcherLoop

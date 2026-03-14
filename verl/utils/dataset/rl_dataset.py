@@ -117,7 +117,7 @@ def _setup_vsearch_fields(row_dict: dict[str, Any], patch_size: int, config: Dic
 
     # Filter for images only (exclude videos)
     image_elements = [info for info in vision_infos if "image" in info or "image_url" in info]
-    assert len(image_elements) == 1, f"expected 1 image element, got {len(image_elements)}"
+    assert len(image_elements) >= 1, f"expected at least 1 image element, got {len(image_elements)}"
 
     # Create image_ori by loading images without resize
     image_ori = [fetch_image_wo_resize(img) for img in image_elements]

@@ -90,7 +90,7 @@ class VerlFormatDataset(ABC):
     def get_answer(self, example) -> str: ...
 
     @abstractmethod
-    def get_image_obj_or_url(self, example) -> Image.Image | str: ...
+    def get_image_objs_or_urls(self, example) -> list[Image.Image | str]: ...
 
     def get_extra_info(self, example) -> dict:
         return {
@@ -127,10 +127,10 @@ class O3Bench(VerlFormatDataset):
     def get_answer(self, example):
         return example["answer"]
 
-    def get_image_obj_or_url(self, example):
+    def get_image_objs_or_urls(self, example):
         img_path = Path(self.data_root, "test", example["image"])
         assert img_path.exists(), f"Image file does not exist: {img_path}"
-        return f"file://{img_path}"
+        return [f"file://{img_path}"]
 
     def get_extra_info(self, example):
         return {
@@ -156,10 +156,10 @@ class VStarBench(VerlFormatDataset):
     def get_answer(self, example):
         return example["answer"]
 
-    def get_image_obj_or_url(self, example):
+    def get_image_objs_or_urls(self, example):
         img_path = Path(self.data_root, example["image"])
         assert img_path.exists(), f"Image file does not exist: {img_path}"
-        return f"file://{img_path}"
+        return [f"file://{img_path}"]
 
     def get_extra_info(self, example):
         return {
@@ -170,7 +170,7 @@ class VStarBench(VerlFormatDataset):
         }
 
     def get_bboxes(self, example):
-        with Path(self.get_image_obj_or_url(example).replace("file://", "")).with_suffix(".json").open("rb") as f:
+        with Path(self.get_image_objs_or_urls(example)[0].replace("file://", "")).with_suffix(".json").open("rb") as f:
             attributes = json.load(f)
         bboxes = []
         for bbox_xywh in attributes["bbox"]:
@@ -195,10 +195,10 @@ class MME_RealWorld_Lite(VerlFormatDataset):
     def get_answer(self, example):
         return example["answer"]
 
-    def get_image_obj_or_url(self, example):
+    def get_image_objs_or_urls(self, example):
         img_path = Path(self.data_root, "imgs", example["image"])
         assert img_path.exists(), f"Image file does not exist: {img_path}"
-        return f"file://{img_path}"
+        return [f"file://{img_path}"]
 
     def get_extra_info(self, example):
         return {
@@ -222,10 +222,10 @@ class VisualProbeHard(VerlFormatDataset):
     def get_answer(self, example):
         return example["answer"]
 
-    def get_image_obj_or_url(self, example):
+    def get_image_objs_or_urls(self, example):
         img_path = Path(self.data_root).parent / example["image"]
         assert img_path.exists(), f"Image file does not exist: {img_path}"
-        return f"file://{img_path}"
+        return [f"file://{img_path}"]
 
     def get_extra_info(self, example):
         return {
@@ -259,10 +259,10 @@ class VisCoT_VStar_Collage(VerlFormatDataset):
     def get_answer(self, example):
         return example["answer"]
 
-    def get_image_obj_or_url(self, example):
+    def get_image_objs_or_urls(self, example):
         image_path = self.images_dir / f"{example['index']}.jpg"
         example["image"].save(image_path)
-        return f"file://{image_path}"
+        return [f"file://{image_path}"]
 
     def get_extra_info(self, example):
         return {
@@ -309,12 +309,12 @@ class InfoVQA_RegionLocalization(VerlFormatDataset):
     def get_answer(self, example):
         return str(example["bbox"])
 
-    def get_image_obj_or_url(self, example):
+    def get_image_objs_or_urls(self, example):
         img_id, _ = example["question_id"].split("_")
         image_path = self.images_dir / f"{img_id}.jpg"
         if example["extract_img_flag"]:
             example["image"].save(image_path)
-        return f"file://{image_path}"
+        return [f"file://{image_path}"]
 
     def get_extra_info(self, example):
         return {
@@ -322,6 +322,68 @@ class InfoVQA_RegionLocalization(VerlFormatDataset):
             "question_id": str(example["question_id"]),
             "search_target": example["region_description"],
             "bboxes": [example["bbox"]],
+        }
+
+
+class InSightDoc(VerlFormatDataset):
+    """Document QA dataset from gather_qa_outputs output.
+
+    Expects the directory layout:
+        <data_root>/
+        ├── qa_samples.jsonl
+        └── images/
+            └── <document_id>/
+                ├── 000000.jpg
+                └── ...
+
+    Each sample may reference multiple page images.  When ``document_slice``
+    is set, only the sliced pages are included.
+    """
+
+    DATA_SOURCE = "insight_doc"
+    SPLITS = ["all"]
+
+    def _load_raw_data(self, split_name):
+        jsonl_path = Path(self.data_root) / "qa_samples.jsonl"
+        assert jsonl_path.exists(), f"qa_samples.jsonl not found at {jsonl_path}"
+        data = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+        return data
+
+    def get_question(self, example):
+        return example["question"]
+
+    def get_answer(self, example):
+        return example["answer"]
+
+    def get_image_objs_or_urls(self, example):
+        document_id = example["document_id"]
+        images_dir = Path(self.data_root) / "images" / document_id
+        assert images_dir.is_dir(), f"Images directory not found: {images_dir}"
+
+        all_pages = sorted(images_dir.glob("*.jpg"))
+        assert all_pages, f"No page images found in {images_dir}"
+
+        doc_slice = example.get("document_slice")
+        if doc_slice is not None:
+            start, end = doc_slice
+            all_pages = [p for p in all_pages if start <= int(p.stem) < end]
+            assert all_pages, (
+                f"No page images in slice [{start}, {end}) for document {document_id}"
+            )
+
+        return [f"file://{p}" for p in all_pages]
+
+    def get_extra_info(self, example):
+        return {
+            **super().get_extra_info(example),
+            "question_id": example["question_id"],
+            "document_id": example["document_id"],
+            "document_slice": example.get("document_slice"),
         }
 
 
@@ -350,18 +412,32 @@ def make_map_fn(dataset, split_name, prompt_style, agent_name=None, validate_ima
             user_prompt = prompts["user_template"].format(question=dataset.get_question(example))
         else:
             raise ValueError(f"Invalid prompt template: {prompts['user_template']}")
-        assert user_prompt.count("<image>") == 1
 
-        image_obj_or_url = dataset.get_image_obj_or_url(example)
-        assert isinstance(image_obj_or_url, str | Image.Image), f"Invalid image object or URL: {image_obj_or_url}"
-        if validate_images and isinstance(image_obj_or_url, str):
-            image_obj = get_image_obj(image_obj_or_url)
-            try:
-                image_obj.load()
-            except Exception:
-                raise
-            finally:
-                image_obj.close()
+        image_objs_or_urls = dataset.get_image_objs_or_urls(example)
+        num_images = len(image_objs_or_urls)
+        assert num_images >= 1, "Expected at least one image"
+
+        # Expand a single <image> placeholder to match the actual number of images.
+        num_tags = user_prompt.count("<image>")
+        if num_tags == 1 and num_images > 1:
+            user_prompt = user_prompt.replace("<image>", "<image>" * num_images, 1)
+            num_tags = num_images
+        assert num_tags == num_images, (
+            f"Prompt has {num_tags} <image> tags but dataset returned {num_images} images"
+        )
+
+        for img in image_objs_or_urls:
+            assert isinstance(img, str | Image.Image), f"Invalid image object or URL: {img}"
+        if validate_images:
+            for img in image_objs_or_urls:
+                if isinstance(img, str):
+                    image_obj = get_image_obj(img)
+                    try:
+                        image_obj.load()
+                    except Exception:
+                        raise
+                    finally:
+                        image_obj.close()
 
         extra_info = dataset.get_extra_info(example)
         for reserved_key in ("split", "index", "prompt_style"):
@@ -379,7 +455,7 @@ def make_map_fn(dataset, split_name, prompt_style, agent_name=None, validate_ima
                     "content": user_prompt,
                 },
             ],
-            "images": [{"image": image_obj_or_url}],
+            "images": [{"image": img} for img in image_objs_or_urls],
             "reward_model": {
                 "style": "rule",
                 "ground_truth": dataset.get_answer(example),
@@ -486,6 +562,15 @@ if __name__ == "__main__":
         --prompt vsearcher_qwen3_vl \
         --output_path data/InfoVQA_RegionLocalization/train-vsearcher_qwen3vl.parquet \
         --agent_name vsearcher_qwen3_vl \
+        --num_workers 32
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset InSightDoc \
+        --data_root /scratch/ywxzml3j/likaican/temp/0207select234 \
+        --split all \
+        --prompt vreasoner \
+        --output_path /scratch/ywxzml3j/likaican/temp/0207select234-vreasoner.parquet \
+        --agent_name vreasoner \
         --num_workers 32
     """
 

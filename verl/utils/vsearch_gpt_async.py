@@ -1,12 +1,12 @@
 import base64
 import io
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Optional
 import logging
 import asyncio
 from functools import partial
-from pprint import pformat
 
 from openai.types.chat import ChatCompletionMessage
 from PIL import Image
@@ -15,7 +15,7 @@ import verl.utils.vsearch_role_play_prompt as prompts_no_tool_feedback
 import verl.utils.vsearch_role_play_prompt_with_tool_feedback as prompts_with_tool_feedback
 from verl.utils.vsearch import BBox
 
-from insight_o3.utils.api import create_async_openai_client, query_api, prune_non_text_content  # pyright: ignore[reportMissingImports]
+from insight_o3.utils.api import create_async_openai_client, query_api  # pyright: ignore[reportMissingImports]
 
 
 logger = logging.getLogger(__file__)
@@ -29,6 +29,7 @@ class GPTVisualSearchRequest:
     success: bool
     messages: list[ChatCompletionMessage]
     region_description: Optional[str] = None  # None if GPT makes no (further) request
+    img_idx: Optional[int] = None  # 0-indexed image to search (multi-image mode only)
     answer: Optional[str] = None  # None if GPT returns no answer
     is_last_round: bool = False  # Whether last-round prompt was used this call
     tool_feedback: Optional[str] = None  # Parsed <tool_feedback> content if present
@@ -120,6 +121,22 @@ def _parse_region_description(text: str) -> Optional[str]:
     return None
 
 
+def _parse_region_description_multi_image(text: str) -> Optional[tuple[str, int]]:
+    """Parse JSON tool call format: {"region_description": "...", "img_idx": N}"""
+    if "<tool_call>" not in text or "</tool_call>" not in text:
+        return None
+    segment = text.split("<tool_call>", 1)[1].split("</tool_call>", 1)[0].strip()
+    try:
+        parsed = json.loads(segment)
+    except json.JSONDecodeError:
+        return None
+    region_desc = parsed.get("region_description")
+    img_idx = parsed.get("img_idx")
+    if not isinstance(region_desc, str) or not isinstance(img_idx, int):
+        return None
+    return (region_desc, img_idx)
+
+
 def _parse_boxed_answer(text: str) -> Optional[str]:
     if "\\boxed{" not in text:
         return None
@@ -138,7 +155,7 @@ def _parse_tool_feedback(text: str) -> Optional[str]:
 
 async def get_gpt_visual_search_request(
     initial_question: str,  # the initial question from the user, e.g., "What is the color of the car?"
-    original_image: Image.Image,  # the original image (w/o any resize) from the user
+    original_images: list[Image.Image],  # the original image(s) (w/o any resize) from the user
     messages: list[dict],  # history messages, initially empty
     bbox: BBox,  # the bounding box returned by the visual search tool
     model: str = "gpt-5-nano",  # which gpt model to use
@@ -153,6 +170,8 @@ async def get_gpt_visual_search_request(
     max_round_retries: int = 3,
     reasoning_effort: str = None,
     enable_tool_feedback: bool = False,
+    multi_image_input: bool = False,
+    last_img_idx: int | None = None,  # img_idx from the previous tool call (for cropping the right image)
 ) -> GPTVisualSearchRequest:
     # Start with history and compute prior tool-call count
     out_messages: list = [] if messages is None else list(messages)
@@ -184,18 +203,40 @@ async def get_gpt_visual_search_request(
     loop = asyncio.get_event_loop()
 
     if not out_messages:
-        pending_image_url = await loop.run_in_executor(None, _prepare_first_image, original_image, gpt_image_max_area)
-        out_messages = [{"role": "system", "content": prompts.vsearch_sys_prompt}]
-        pending_question = initial_question
+        if multi_image_input:
+            # Multi-image first turn: prepare all images and build query content
+            image_urls = []
+            for img in original_images:
+                url = await loop.run_in_executor(None, _prepare_first_image, img, gpt_image_max_area)
+                image_urls.append(url)
+            sys_prompt = prompts.vsearch_sys_prompt_multi_image
+            out_messages = [{"role": "system", "content": sys_prompt}]
+            # Build query content with labeled images followed by the question
+            query_content: list[dict] = []
+            for i, url in enumerate(image_urls):
+                query_content.append({"type": "text", "text": f"Image {i}:"})
+                query_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": url, "detail": image_detail},
+                })
+            query_content.append({"type": "text", "text": initial_question})
+            # Embed images directly in the query; no separate image_url for query_api
+            pending_image_url = None
+            pending_question = query_content
+        else:
+            pending_image_url = await loop.run_in_executor(None, _prepare_first_image, original_images[0], gpt_image_max_area)
+            out_messages = [{"role": "system", "content": prompts.vsearch_sys_prompt}]
+            pending_question = initial_question
     else:
         # Check bbox first; treat [0,0,0,0] as invalid
         bbox_valid = bool(bbox) and any(int(v) != 0 for v in bbox)
+        crop_source = original_images[last_img_idx] if (multi_image_input and last_img_idx is not None) else original_images[0]
         if bbox_valid:
             pending_image_url = await loop.run_in_executor(
                 None,
                 partial(
                     _crop_prepare_data_url,
-                    original=original_image,
+                    original=crop_source,
                     bbox=bbox,
                     expand_ratio=crop_expand_ratio,
                     min_side=crop_min_side,
@@ -248,7 +289,15 @@ async def get_gpt_visual_search_request(
         content: str = assistant_msg.content or ""
         finish_reason = response.choices[0].finish_reason
 
-        region_desc = _parse_region_description(content)
+        img_idx = None
+        if multi_image_input:
+            parsed = _parse_region_description_multi_image(content)
+            if parsed is not None:
+                region_desc, img_idx = parsed
+            else:
+                region_desc = None
+        else:
+            region_desc = _parse_region_description(content)
         answer = _parse_boxed_answer(content)
         tool_feedback = None
         if enable_tool_feedback:
@@ -259,8 +308,6 @@ async def get_gpt_visual_search_request(
                 tool_feedback = feedback_str
 
         # Check if the response follows the expected format
-        import uuid
-        current_messages_text_only_formatted = pformat([prune_non_text_content(message) for message in current_messages])
         if is_last_round:
             if not answer:
                 failure_reasons.append(f"no_answer_in_last_round({finish_reason})")
@@ -295,6 +342,7 @@ async def get_gpt_visual_search_request(
                 success=True,
                 messages=current_messages,
                 region_description=region_desc,
+                img_idx=img_idx,
                 answer=answer,
                 is_last_round=is_last_round,
                 tool_feedback=tool_feedback,
@@ -309,7 +357,7 @@ async def get_gpt_visual_search_request(
             current_messages = out_messages
         else:
             # Neither tool call nor answer (or no feedback) -> follow-up with a format hint or last-round
-            pending_question = prompts.format_user_hint
+            pending_question = prompts.format_user_hint_multi_image if multi_image_input else prompts.format_user_hint
             pending_image_url = None
 
     # Exhausted retries

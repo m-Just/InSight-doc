@@ -478,7 +478,7 @@ async def compute_score_single_vsearch_base(
     extra_info: dict,
     **reward_kwargs: dict,
 ) -> Score:
-    assert len(extra_info["image_processed_wh"]) == 1, "only support single input image"
+    assert len(extra_info["image_processed_wh"]) >= 1, f"expected at least 1 image, got {len(extra_info['image_processed_wh'])}"
     image_processed_wh = extra_info["image_processed_wh"][0]
 
     score_cls = SCORE_CLASS_MAP[reward_kwargs["reward_type"]]

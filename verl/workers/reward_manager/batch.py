@@ -73,7 +73,7 @@ class BatchRewardManager(AbstractRewardManager):
         # First, we deepcopy the extras, so we can safely modify its content
         # NOTE: we can't use `extras = deepcopy(extras)` because it does *not* deepcopy the objects in the array!
         extras = np.array([deepcopy(e) for e in extras])
-        for info in ("agent_name", "job_id", "parent_job_id", "root_job_id", "caller_feedback", "final_bbox", "tool_call_bboxes"):
+        for info in ("agent_name", "job_id", "parent_job_id", "root_job_id", "caller_feedback", "final_bbox", "tool_call_bboxes", "img_idx"):
             if info in data.non_tensor_batch:
                 for i in range(len(data)):
                     extras[i] = extras[i] or {}
