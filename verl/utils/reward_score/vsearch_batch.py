@@ -321,6 +321,54 @@ def parse_response(
     return parsed_content
 
 
+def _extract_last_assistant_response(solution_str: str) -> str:
+    if "assistant\n" not in solution_str:
+        return solution_str.strip()
+    return solution_str.rsplit("assistant\n", 1)[-1].strip()
+
+
+def _extract_vreasoner_v2_answer(response: str) -> str | None:
+    try:
+        parsed = parse_response(
+            response,
+            required_tags=["observation", "state", "plan", "response"],
+            excluded_tags=["action"],
+        )
+    except ParseError:
+        parsed = None
+
+    if parsed is not None:
+        answer = parsed["response"].strip()
+        return answer or None
+
+    try:
+        parsed = parse_response(
+            response,
+            required_tags=["observation", "state", "plan", "action"],
+            excluded_tags=["response"],
+        )
+    except ParseError:
+        return None
+
+    action = parsed["action"].strip()
+    if not action:
+        return None
+
+    try:
+        payload = json.loads(action)
+    except json.JSONDecodeError:
+        return action
+
+    if (
+        isinstance(payload, dict)
+        and payload.get("name") == "image_zoom_in_tool"
+        and isinstance(payload.get("arguments"), dict)
+    ):
+        return None
+
+    return action
+
+
 def compute_format_reward(solution_str: str, must_have_answer: bool = True) -> dict:
     """Compute the format reward of the model's conversation with the user.
        We assume that the user messages are all tool responses.
@@ -558,27 +606,31 @@ async def compute_score_single_vreasoner(
 ) -> Score:
     """ For vReasonser, we only care about whether the answer is correct.  """
     score = ScoreOnlyAccuracy()
+    last_response = _extract_last_assistant_response(solution_str)
 
     if "\\boxed{" in solution_str:
         score.extracted_answer = solution_str.split("\\boxed{", 1)[1].split("}", 1)[0].strip()
     elif "<answer>" in solution_str and "</answer>" in solution_str:
         score.extracted_answer = solution_str.split("<answer>", 1)[1].split("</answer>", 1)[0].strip()
     else:
-        score.extracted_answer = None
+        score.extracted_answer = _extract_vreasoner_v2_answer(last_response)
 
     if score.extracted_answer:
         score.format_reward = 1.0
     else:
         score.format_reward = 0.0
 
-    score.accuracy_reward = await compute_accuracy_reward(
-        data_source,
-        extra_info["question"],
-        score.extracted_answer,
-        ground_truth,
-        reward_kwargs["judge_client"],
-        reward_kwargs["judge_model"],
-    )
+    if score.extracted_answer:
+        score.accuracy_reward = await compute_accuracy_reward(
+            data_source,
+            extra_info["question"],
+            score.extracted_answer,
+            ground_truth,
+            reward_kwargs["judge_client"],
+            reward_kwargs["judge_model"],
+        )
+    else:
+        score.accuracy_reward = 0.0
 
     score.n_valid_tool_calls = solution_str.count("<tool_response>")
     return score
@@ -714,4 +766,3 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
         if "asyncio.run()" in str(e):
             raise RuntimeError("compute_score_batch must be called from a non-async context") from e
         raise
-

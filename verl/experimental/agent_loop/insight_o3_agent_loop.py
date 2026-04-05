@@ -13,7 +13,7 @@ from uuid import uuid4
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 from omegaconf import DictConfig
-from qwen_vl_utils import extract_vision_info
+from qwen_vl_utils import extract_vision_info, fetch_image
 
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
@@ -30,6 +30,7 @@ from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.profiler import simple_timer
 from verl.utils.vsearch import BBox, parse_bbox, resize_bbox, extract_bbox_from_tool_call
 from verl.utils.vsearch_gpt_async import get_gpt_visual_search_request
+from verl.utils.vsearch_gpt_async_v2 import ToolResult, get_gpt_visual_search_request_v2
 
 # Qwen3-VL uses relative coordinates in the range [0, 1000) for bounding boxes
 # This is different from Qwen2.5-VL which uses absolute pixel coordinates
@@ -58,6 +59,14 @@ class ExtraFields:
     messages: list[dict] | None = None
     multi_modal_data: dict[str, Any] | None = None
     failure_reasons: list[str] | None = None
+
+
+@dataclass
+class PresentedImage:
+    image: Image.Image
+    source_original_img_idx: int
+    bbox_on_original: BBox
+    display_size: tuple[int, int]
 
 
 @runtime_checkable
@@ -95,6 +104,126 @@ def reconstruct_messages(text: str) -> ReconstructedMessages:
                 content.append({'type': 'image'})
         messages.append({'role': role, 'content': content})
     return messages
+
+
+def _clamp_bbox_to_image(bbox: BBox, image_size: tuple[int, int]) -> BBox | None:
+    x1, y1, x2, y2 = bbox
+    width, height = image_size
+    clamped = (
+        max(0, min(width, int(x1))),
+        max(0, min(height, int(y1))),
+        max(0, min(width, int(x2))),
+        max(0, min(height, int(y2))),
+    )
+    if clamped[0] >= clamped[2] or clamped[1] >= clamped[3]:
+        return None
+    return clamped
+
+
+def _translate_bbox_to_original(parent: PresentedImage, bbox_on_presented: BBox) -> BBox | None:
+    presented_w, presented_h = parent.display_size
+    if presented_w <= 0 or presented_h <= 0:
+        return None
+    original_w = parent.bbox_on_original[2] - parent.bbox_on_original[0]
+    original_h = parent.bbox_on_original[3] - parent.bbox_on_original[1]
+    translated = (
+        parent.bbox_on_original[0] + round(bbox_on_presented[0] * original_w / presented_w),
+        parent.bbox_on_original[1] + round(bbox_on_presented[1] * original_h / presented_h),
+        parent.bbox_on_original[0] + round(bbox_on_presented[2] * original_w / presented_w),
+        parent.bbox_on_original[1] + round(bbox_on_presented[3] * original_h / presented_h),
+    )
+    return translated
+
+
+def _translate_processed_bbox_to_original(
+    parent: PresentedImage,
+    bbox_on_processed: BBox,
+    processed_size: tuple[int, int],
+) -> BBox | None:
+    processed_w, processed_h = processed_size
+    if processed_w <= 0 or processed_h <= 0:
+        return None
+    original_w = parent.bbox_on_original[2] - parent.bbox_on_original[0]
+    original_h = parent.bbox_on_original[3] - parent.bbox_on_original[1]
+    translated = (
+        parent.bbox_on_original[0] + round(bbox_on_processed[0] * original_w / processed_w),
+        parent.bbox_on_original[1] + round(bbox_on_processed[1] * original_h / processed_h),
+        parent.bbox_on_original[0] + round(bbox_on_processed[2] * original_w / processed_w),
+        parent.bbox_on_original[1] + round(bbox_on_processed[3] * original_h / processed_h),
+    )
+    return translated
+
+
+def _resize_bbox_by_rounding(
+    bbox: BBox,
+    source_wh: tuple[int, int],
+    target_wh: tuple[int, int],
+) -> BBox | None:
+    source_w, source_h = source_wh
+    target_w, target_h = target_wh
+    if source_w <= 0 or source_h <= 0:
+        return None
+    resized = (
+        max(0, min(target_w, round(bbox[0] * target_w / source_w))),
+        max(0, min(target_h, round(bbox[1] * target_h / source_h))),
+        max(0, min(target_w, round(bbox[2] * target_w / source_w))),
+        max(0, min(target_h, round(bbox[3] * target_h / source_h))),
+    )
+    return resized
+
+
+def _crop_original_image(image: Image.Image, bbox: BBox) -> Image.Image | None:
+    clamped = _clamp_bbox_to_image(bbox, image.size)
+    if clamped is None:
+        return None
+    return image.crop(clamped)
+
+
+def _process_presented_image(image: Image.Image, max_pixels: int | None) -> Image.Image:
+    fetch_kwargs: dict[str, Any] = {"image": image}
+    if max_pixels is not None:
+        fetch_kwargs["max_pixels"] = max_pixels
+    return fetch_image(fetch_kwargs)
+
+
+def _build_processed_child_image(
+    source_original: Image.Image,
+    bbox_on_original: BBox,
+    max_pixels: int | None,
+) -> tuple[Image.Image, Image.Image] | None:
+    child_image = _crop_original_image(source_original, bbox_on_original)
+    if child_image is None:
+        return None
+    return child_image, _process_presented_image(child_image, max_pixels)
+
+
+def _resize_dims_by_factor(size: tuple[int, int], factor: float) -> tuple[int, int]:
+    width, height = size
+    return (max(1, round(width * factor)), max(1, round(height * factor)))
+
+
+def _cap_size_by_area(size: tuple[int, int], max_area: int) -> tuple[int, int]:
+    width, height = size
+    area = width * height
+    if area <= max_area or max_area <= 0:
+        return size
+    ratio = (max_area / float(area)) ** 0.5
+    return (max(1, int(width * ratio)), max(1, int(height * ratio)))
+
+
+def _resample_original_region(
+    original: Image.Image,
+    bbox_on_original: BBox,
+    target_display_size: tuple[int, int],
+    max_area: int,
+) -> tuple[Image.Image, tuple[int, int]] | None:
+    crop = _crop_original_image(original, bbox_on_original)
+    if crop is None:
+        return None
+    capped_size = _cap_size_by_area(target_display_size, max_area)
+    if crop.size != capped_size:
+        crop = crop.resize(capped_size, Image.LANCZOS)
+    return crop, capped_size
 
 
 class VSearcherMixin:
@@ -954,6 +1083,535 @@ To finish, bring everything together in a clear, synthesized answer that fully r
             response_mask=response_mask_shortened,
             response_logprobs=None,
             multi_modal_data={},  # we pass multi_modal_data back through extra_fields instead
+            reward_score=None,
+            num_turns=len(messages_shortened),
+            metrics=metrics,
+            extra_fields=extra_fields,
+            subagent_outputs=vsearcher_outputs,
+        )
+
+
+@register("vreasoner_v2")
+class VReasonerLoopV2(VReasonerLoop):
+    def __init__(
+        self,
+        trainer_config: DictConfigWrap,
+        server_manager: AsyncLLMServerManager,
+        tokenizer: AutoTokenizer,
+        processor: AutoProcessor,
+        dataset_cls: type[RLHFDataset],
+        dataset_config: DictConfig,
+        initial_rescale: float = 0.25,
+        full_image_zoom_in_factor: float = 2.0,
+        region_zoom_in_factor: float = 4.0,
+        zoom_reject_area_ratio: float = 0.9,
+        png_max_area: int = 1280 * 1280,
+        enable_stop: bool = False,
+        **kwargs,
+    ):
+        super().__init__(
+            trainer_config,
+            server_manager,
+            tokenizer,
+            processor,
+            dataset_cls=dataset_cls,
+            dataset_config=dataset_config,
+            **kwargs,
+        )
+        if initial_rescale <= 0:
+            raise ValueError(f"initial_rescale must be positive, got {initial_rescale}")
+        if full_image_zoom_in_factor <= 0:
+            raise ValueError(f"full_image_zoom_in_factor must be positive, got {full_image_zoom_in_factor}")
+        if region_zoom_in_factor <= 0:
+            raise ValueError(f"region_zoom_in_factor must be positive, got {region_zoom_in_factor}")
+        if not (0 < zoom_reject_area_ratio <= 1):
+            raise ValueError(f"zoom_reject_area_ratio must be in (0, 1], got {zoom_reject_area_ratio}")
+        if png_max_area <= 0:
+            raise ValueError(f"png_max_area must be positive, got {png_max_area}")
+        self.initial_rescale = initial_rescale
+        self.full_image_zoom_in_factor = full_image_zoom_in_factor
+        self.region_zoom_in_factor = region_zoom_in_factor
+        self.zoom_reject_area_ratio = zoom_reject_area_ratio
+        self.png_max_area = png_max_area
+        self.enable_stop = enable_stop
+
+    def _build_initial_presented_images(self, original_images: list[Image.Image]) -> list[PresentedImage]:
+        presented_images: list[PresentedImage] = []
+        for img_idx, image in enumerate(original_images):
+            bbox_on_original = (0, 0, image.size[0], image.size[1])
+            target_display_size = _cap_size_by_area(
+                _resize_dims_by_factor(image.size, self.initial_rescale),
+                self.gpt_image_max_area,
+            )
+            displayed = image.resize(target_display_size, Image.LANCZOS) if image.size != target_display_size else image.copy()
+            presented_images.append(
+                PresentedImage(
+                    image=displayed,
+                    source_original_img_idx=img_idx,
+                    bbox_on_original=bbox_on_original,
+                    display_size=target_display_size,
+                )
+            )
+        return presented_images
+
+    def _zoom_is_rejected(self, presented: PresentedImage) -> bool:
+        return presented.display_size[0] * presented.display_size[1] >= self.zoom_reject_area_ratio * self.gpt_image_max_area
+
+    def _append_presented_image(
+        self,
+        presented_images: list[PresentedImage],
+        source_original: Image.Image,
+        source_original_img_idx: int,
+        bbox_on_original: BBox,
+        target_display_size: tuple[int, int],
+    ) -> int | None:
+        resampled = _resample_original_region(
+            source_original,
+            bbox_on_original,
+            target_display_size,
+            self.gpt_image_max_area,
+        )
+        if resampled is None:
+            return None
+        display_image, display_size = resampled
+        presented_images.append(
+            PresentedImage(
+                image=display_image,
+                source_original_img_idx=source_original_img_idx,
+                bbox_on_original=bbox_on_original,
+                display_size=display_size,
+            )
+        )
+        return len(presented_images) - 1
+
+    @rollout_trace_op
+    async def run(
+        self,
+        sampling_params: dict[str, Any],
+        **kwargs,
+    ) -> AgentLoopOutput:
+        job_id = uuid4().hex
+        root_job_id = kwargs.get("root_job_id", job_id)
+
+        validate = kwargs["_validate"]
+
+        messages_api = []
+        n_tool_calls = 0
+        vsearcher_outputs = []
+        critical_failure = False
+        multi_modal_data = {"images": []}
+
+        metrics = AgentLoopMetrics()
+        profile = {}
+
+        original_images = kwargs["extra_info"]["image_ori"]
+        presented_images = self._build_initial_presented_images(original_images)
+        tool_result = None
+        request = None
+
+        base_zoom_create_kwargs = kwargs["tools_kwargs"].get("image_zoom_in_tool", {}).get("create_kwargs", {})
+        max_pixels = base_zoom_create_kwargs.get("max_pixels")
+
+        while True:
+            with simple_timer("api_calls", profile):
+                request = await get_gpt_visual_search_request_v2(
+                    initial_question=kwargs["extra_info"]["question"],
+                    presented_images=[item.image for item in presented_images],
+                    messages=messages_api,
+                    model=self.model,
+                    max_tool_calls=self.max_tool_calls,
+                    max_round_retries=self.max_round_retries if not validate else self.max_round_retries_val,
+                    gpt_image_max_area=self.gpt_image_max_area,
+                    png_max_area=self.png_max_area,
+                    max_completion_tokens=self.max_completion_tokens,
+                    reasoning_effort=self.reasoning_effort,
+                    tool_result=tool_result,
+                    enable_stop=self.enable_stop,
+                )
+
+            if not request.success:
+                logger.warning("API generation failed")
+                critical_failure = True
+                break
+
+            messages_api = request.messages
+
+            if request.region_description is None and request.img_idx is None:
+                break
+
+            n_tool_calls += 1
+            assert n_tool_calls <= self.max_tool_calls, (
+                f"vreasoner_v2: executed more tool calls than allowed: {n_tool_calls} > {self.max_tool_calls}"
+            )
+
+            img_idx = request.img_idx if request.img_idx is not None else 0
+            if not (0 <= img_idx < len(presented_images)):
+                logger.warning("received out-of-range img_idx %s for %s presented images", img_idx, len(presented_images))
+                tool_result = ToolResult(
+                    status="error",
+                    requested_img_idx=img_idx,
+                    error_message=f"ERROR: Image {img_idx} is not available. Choose an img_idx from the currently visible images.",
+                )
+                continue
+            presented = presented_images[img_idx]
+            source_original = original_images[presented.source_original_img_idx]
+
+            tool_result = None
+
+            if self._zoom_is_rejected(presented):
+                logger.info(
+                    "rejecting zoom on image %s because displayed area %s is already close to cap %s",
+                    img_idx,
+                    presented.display_size[0] * presented.display_size[1],
+                    self.gpt_image_max_area,
+                )
+                tool_result = ToolResult(
+                    status="error",
+                    requested_img_idx=img_idx,
+                    error_message=(
+                        "ERROR: The selected image is already near the maximum zoom level, so further full-image zoom "
+                        "is unlikely to reveal more detail. A more specific region may be needed."
+                    ),
+                )
+                continue
+
+            if request.region_description is None:
+                new_img_idx = self._append_presented_image(
+                    presented_images,
+                    source_original,
+                    presented.source_original_img_idx,
+                    presented.bbox_on_original,
+                    _resize_dims_by_factor(presented.display_size, self.full_image_zoom_in_factor),
+                )
+                if new_img_idx is None:
+                    raise RuntimeError(
+                        "failed to append full-image zoom result after a valid full-image zoom request"
+                    )
+                tool_result = ToolResult(
+                    status="success",
+                    requested_img_idx=img_idx,
+                    new_img_idx=new_img_idx,
+                )
+                continue
+
+            if self.vsearcher_loop.AGENT_NAME == "vsearcher":
+                system_prompt = 'You are a helpful assistant.\n\n# Tools\nYou may call one or more functions to assist with the user query.\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{"type":"function","function":{"name":"image_zoom_in_tool","description":"Zoom in on a specific region of an image by cropping it based on a bounding box (bbox) and an optional object label.","parameters":{"type":"object","properties":{"bbox_2d":{"type":"array","items":{"type":"number"},"minItems":4,"maxItems":4,"description":"The bounding box of the region to zoom in, as [x1, y1, x2, y2], where (x1, y1) is the top-left corner and (x2, y2) is the bottom-right corner."},"label":{"type":"string","description":"The name or label of the object in the specified bounding box (optional)."}},"required":["bbox"]}}}\n</tools>\n\n# How to call a tool\nReturn a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>\n\n**Example**:  \n<tool_call>  \n{"name": "image_zoom_in_tool", "arguments": {"bbox_2d": [10, 20, 100, 200], "label": "the apple on the desk"}}  \n</tool_call>'
+            elif self.vsearcher_loop.AGENT_NAME == "vsearcher_qwen3_vl":
+                system_prompt = """Your role is that of a research assistant specializing in visual information. Answer questions about images by looking at them closely and then using research tools. Please follow this structured thinking process and show your work.
+
+Start an iterative loop for each question:
+
+- **First, look closely:** Begin with a detailed description of the image, paying attention to the user's question. List what you can tell just by looking, and what you'll need to look up.
+- **Next, find information:** Use a tool to research the things you need to find out.
+- **Then, review the findings:** Carefully analyze what the tool tells you and decide on your next action.
+
+Continue this loop until your research is complete.
+
+To finish, bring everything together in a clear, synthesized answer that fully responds to the user's question."""
+            else:
+                raise ValueError(f"Invalid vsearcher loop class: {self.vsearcher_loop.AGENT_NAME}")
+
+            child_images = _build_processed_child_image(
+                source_original,
+                presented.bbox_on_original,
+                max_pixels,
+            )
+            if child_images is None:
+                raise RuntimeError(
+                    "failed to build child vsearcher image from the original region represented by the presented image"
+                )
+            child_source_image, processed_presented = child_images
+            processed_presented_wh = processed_presented.size
+            raw_prompt = [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": processed_presented},
+                        {
+                            "type": "text",
+                            "text": (
+                                f"\nLocate {request.region_description}."
+                                "\nThink first, call **image_zoom_in_tool** if needed, then answer with the bbox coordinates in [x1, y1, x2, y2] format (or [0, 0, 0, 0] if you can't locate it). "
+                                "Format strictly as:  <think>...</think>  <tool_call>...</tool_call> (if tools needed)  "
+                                "<answer>[x1, y1, x2, y2]</answer> (otherwise)"
+                            ),
+                        },
+                    ],
+                },
+            ]
+
+            create_kwargs = {
+                **base_zoom_create_kwargs,
+                "image": child_source_image,
+                "resized_image_size": processed_presented_wh,
+            }
+            tools_kwargs_for_vsearcher = {
+                **kwargs["tools_kwargs"],
+                "image_zoom_in_tool": {
+                    **kwargs["tools_kwargs"].get("image_zoom_in_tool", {}),
+                    "create_kwargs": create_kwargs,
+                },
+            }
+            extra_info_for_vsearcher = {
+                **kwargs["extra_info"],
+                "image_ori": [child_source_image],
+                "image_ori_wh": [child_source_image.size],
+                "image_processed_wh": [processed_presented_wh],
+            }
+            vsearcher_kwargs = {
+                "raw_prompt": raw_prompt,
+                "tools_kwargs": tools_kwargs_for_vsearcher,
+                "extra_info": extra_info_for_vsearcher,
+                "parent_job_id": job_id,
+                "root_job_id": root_job_id,
+                "_validate": validate,
+            }
+
+            with simple_timer("vsearcher_loop.run", profile):
+                vsearcher_output = await self.vsearcher_loop.run(dict(sampling_params), **vsearcher_kwargs)
+                vsearcher_output.extra_fields["idx_as_child"] = len(vsearcher_outputs)
+                vsearcher_output.extra_fields["img_idx"] = img_idx
+            vsearcher_outputs.append(vsearcher_output)
+
+            bbox = vsearcher_output.extra_fields["final_bbox"]
+            error_message_due_to_vsearcher_failure = (
+                "ERROR: The requested region could not be turned into a usable zoomed view. "
+                "Try a more specific region description, or choose a different img_idx."
+            )
+            if bbox is None:
+                logger.warning("vsearcher failed to return a valid bbox")
+                tool_result = ToolResult(
+                    status="error",
+                    requested_img_idx=img_idx,
+                    error_message=error_message_due_to_vsearcher_failure,
+                )
+                continue
+
+            if bbox == (0, 0, 0, 0):
+                tool_result = ToolResult(
+                    status="error",
+                    requested_img_idx=img_idx,
+                    error_message=(
+                        "ERROR: The requested region could not be located in the selected image. The description may be "
+                        "too vague, too broad, too specific, or mismatched to the visible content."
+                    ),
+                )
+                continue
+
+            bbox_on_presented = _resize_bbox_by_rounding(bbox, processed_presented_wh, presented.display_size)
+            if bbox_on_presented is None:
+                logger.warning("failed to project bbox %s onto presented image %s", bbox, processed_presented_wh)
+                tool_result = ToolResult(
+                    status="error",
+                    requested_img_idx=img_idx,
+                    error_message=error_message_due_to_vsearcher_failure,
+                )
+                continue
+
+            bbox_on_original = _translate_processed_bbox_to_original(presented, bbox, processed_presented_wh)
+            if bbox_on_original is None:
+                logger.warning("failed to translate bbox %s from processed image to original coordinates", bbox)
+                tool_result = ToolResult(
+                    status="error",
+                    requested_img_idx=img_idx,
+                    error_message=error_message_due_to_vsearcher_failure,
+                )
+                continue
+
+            bbox_on_original = _clamp_bbox_to_image(bbox_on_original, source_original.size)
+            if bbox_on_original is None:
+                logger.warning("translated bbox is invalid on original image: %s", bbox_on_presented)
+                tool_result = ToolResult(
+                    status="error",
+                    requested_img_idx=img_idx,
+                    error_message=error_message_due_to_vsearcher_failure,
+                )
+                continue
+
+            region_display_size = (
+                max(1, bbox_on_presented[2] - bbox_on_presented[0]),
+                max(1, bbox_on_presented[3] - bbox_on_presented[1]),
+            )
+
+            converted_tool_call_bboxes = []
+            for tool_bbox in vsearcher_output.extra_fields.get("tool_call_bboxes") or []:
+                if tool_bbox == (0, 0, 0, 0):
+                    converted_tool_call_bboxes.append(tool_bbox)
+                    continue
+                tool_bbox_on_original = _translate_processed_bbox_to_original(
+                    presented,
+                    tool_bbox,
+                    processed_presented_wh,
+                )
+                if tool_bbox_on_original is None:
+                    continue
+                tool_bbox_on_original = _clamp_bbox_to_image(tool_bbox_on_original, source_original.size)
+                if tool_bbox_on_original is None:
+                    continue
+                converted_tool_call_bboxes.append(tool_bbox_on_original)
+
+            vsearcher_output.extra_fields["final_bbox"] = bbox_on_original
+            vsearcher_output.extra_fields["tool_call_bboxes"] = converted_tool_call_bboxes
+
+            new_img_idx = self._append_presented_image(
+                presented_images,
+                source_original,
+                presented.source_original_img_idx,
+                bbox_on_original,
+                _resize_dims_by_factor(region_display_size, self.region_zoom_in_factor),
+            )
+            if new_img_idx is None:
+                raise RuntimeError(
+                    "failed to append region zoom result after successful localization and bbox conversion"
+                )
+            tool_result = ToolResult(
+                status="success",
+                requested_img_idx=img_idx,
+                new_img_idx=new_img_idx,
+            )
+
+        logger.info(f"vreasoner_v2 loop completed: {profile=}")
+
+        if self.multi_image_input:
+            n_images = len(kwargs["extra_info"]["image_ori"])
+            vision_tokens = "".join("<|vision_start|><|vision_end|>" for _ in range(n_images))
+        else:
+            vision_tokens = "<|vision_start|><|vision_end|>"
+        user_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": vision_tokens + kwargs["extra_info"]["question"]},
+            ],
+        }
+
+        messages = [user_message]
+
+        apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+        raw_prompt = self.processor.apply_chat_template(
+            messages,
+            tools=None,
+            add_generation_prompt=False,
+            tokenize=False,
+            **apply_chat_template_kwargs,
+        )
+
+        loop = asyncio.get_event_loop()
+        model_inputs = await loop.run_in_executor(
+            None, partial(self.processor, text=[raw_prompt], return_tensors="pt")
+        )
+        prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+
+        def maybe_truncate(text: str, max_length_char: int = 4096) -> str:
+            if len(text) > max_length_char:
+                logger.info(
+                    f"vreasoner_v2 turn response is too long: {len(text)} chars; left-truncating to {max_length_char} chars"
+                )
+                return "..." + text[-max_length_char:][len("..."):]
+            return text
+
+        messages_shortened = messages.copy()
+        response_ids_shortened = []
+        response_mask_shortened = []
+        response_started = False
+
+        for message in messages_api:
+            if not isinstance(message, dict):
+                message = message.to_dict()
+
+            if isinstance(message["content"], list):
+                for item in message["content"]:
+                    if item.get("type") == "image_url":
+                        image_url = item["image_url"]["url"]
+                        _, b64data = image_url.split(",", 1)
+                        img = await loop.run_in_executor(
+                            None, lambda b: Image.open(io.BytesIO(base64.b64decode(b))), b64data
+                        )
+                        multi_modal_data["images"].append(img)
+
+            if message["role"] in ("system", "user") and not response_started:
+                continue
+
+            if message["role"] == "assistant":
+                response_started = True
+                text = message["content"]
+                if text is None:
+                    logger.warning("vreasoner_v2: assistant message content is None")
+                    continue
+                content = [{"type": "text", "text": text}]
+                content_shortened = [{"type": "text", "text": maybe_truncate(text)}]
+            elif message["role"] == "user":
+                has_image = (
+                    isinstance(message["content"], list)
+                    and any(c.get("type") == "image_url" for c in message["content"])
+                )
+                if has_image:
+                    content = [
+                        {"type": "text", "text": "<tool_response>"},
+                        {"type": "image"},
+                        {"type": "text", "text": "</tool_response>"},
+                    ]
+                    content_shortened = [
+                        {"type": "text", "text": "<tool_response><|vision_start|><|vision_end|></tool_response>"},
+                    ]
+                else:
+                    text = message["content"] if isinstance(message["content"], str) else " ".join(
+                        c.get("text", "") for c in message["content"] if c.get("type") == "text"
+                    )
+                    content = [{"type": "text", "text": text}]
+                    content_shortened = [{"type": "text", "text": maybe_truncate(text)}]
+            else:
+                logger.warning(f"vreasoner_v2: unexpected message role: {message['role']}")
+                continue
+
+            messages.append({"role": message["role"], "content": content})
+            messages_shortened.append({"role": message["role"], "content": content_shortened})
+
+            raw_prompt_shortened = self.processor.apply_chat_template(
+                messages_shortened,
+                tools=None,
+                add_generation_prompt=False,
+                tokenize=False,
+                **apply_chat_template_kwargs,
+            )
+
+            model_inputs_shortened = await loop.run_in_executor(
+                None, partial(self.processor, text=[raw_prompt_shortened], return_tensors="pt")
+            )
+            seq_ids_shortened = model_inputs_shortened.pop("input_ids").squeeze(0).tolist()
+            new_response_ids = seq_ids_shortened[len(prompt_ids) + len(response_ids_shortened):]
+            response_ids_shortened += new_response_ids
+            response_mask_shortened += [int(message["role"] == "assistant")] * len(new_response_ids)
+
+        response_length = self.config.actor_rollout_ref.rollout.response_length
+        response_ids_shortened = response_ids_shortened[-response_length:]
+        response_mask_shortened = response_mask_shortened[-response_length:]
+
+        extra_fields = ExtraFields(
+            agent_name='vreasoner_v2',
+            job_id=job_id,
+            parent_job_id=kwargs.get("parent_job_id", None),
+            root_job_id=root_job_id,
+            extra_info=kwargs["extra_info"],
+            n_tool_calls=n_tool_calls,
+            critical_failure=critical_failure,
+            messages=messages,
+            multi_modal_data=multi_modal_data,
+            failure_reasons=(request.failure_reasons if request is not None and request.failure_reasons else None),
+        )
+
+        extra_fields = asdict(extra_fields)
+        extra_fields.update({"turn_scores": [], "tool_rewards": []})
+
+        return AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids_shortened,
+            response_mask=response_mask_shortened,
+            response_logprobs=None,
+            multi_modal_data={},
             reward_score=None,
             num_turns=len(messages_shortened),
             metrics=metrics,

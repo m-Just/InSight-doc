@@ -387,6 +387,135 @@ class InSightDoc(VerlFormatDataset):
         }
 
 
+class InSightDocRegionLocalization(VerlFormatDataset):
+    """Region-localization dataset gathered from region description generation.
+
+    Expects the directory layout:
+        <data_root>/
+        ├── region_desc_samples.jsonl
+        └── images/
+            └── <document_id>/
+                ├── 000000.jpg
+                └── ...
+    """
+
+    DATA_SOURCE = "insight_doc_region_localization"
+    SPLITS = ["all"]
+
+    def _load_raw_data(self, split_name):
+        jsonl_path = Path(self.data_root) / "region_desc_samples.jsonl"
+        assert jsonl_path.exists(), f"region_desc_samples.jsonl not found at {jsonl_path}"
+        data = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+        return data
+
+    def get_question(self, example):
+        return self.get_search_target(example)
+
+    def get_search_target(self, example):
+        desc = example["region_description"].replace("<image>", "< image >")  # workaround for <image> placeholder in prompt
+        return desc
+
+    def get_answer(self, example):
+        return str(example["bbox"])
+
+    def get_image_objs_or_urls(self, example):
+        page_image_path = example.get("page_image_path")
+        if page_image_path is not None:
+            image_path = Path(self.data_root) / page_image_path
+        else:
+            image_path = (
+                Path(self.data_root) / "images" / example["document_id"]
+                / f"{int(example['page_id']):06d}.jpg"
+            )
+        assert image_path.exists(), f"Image file does not exist: {image_path}"
+        return [f"file://{image_path}"]
+
+    def get_extra_info(self, example):
+        return {
+            **super().get_extra_info(example),
+            "question_id": example.get("question_id", example["sample_id"]),
+            "sample_id": example["sample_id"],
+            "document_id": example["document_id"],
+            "page_id": example["page_id"],
+            "search_target": example["region_description"],
+            "bboxes": [example["bbox_image"]],
+            "description_mode": example.get("description_mode"),
+            "block_types": example.get("block_types"),
+            "num_blocks": example.get("num_blocks"),
+        }
+
+
+class InSightDoc0352(VerlFormatDataset):
+    """Document QA dataset from postprocess Stage-4 augmented output.
+
+    Expects the directory layout produced by ``run_postprocess_stage4_png_from_json.py``::
+
+        <data_root>/                        # = <postprocess_dir>/<augment_id>/
+        ├── manifest.jsonl
+        └── pdf_image/
+            └── <document_stem>/
+                ├── 000000.jpg
+                └── ...
+
+    Each line in ``manifest.jsonl`` contains ``question_id``, ``document_id``,
+    ``question``, ``answer``, ``images`` (relative to ``pdf_image/``), ``subset``
+    (``veqa`` | ``mveqa``), and optional visual detail fields.
+    """
+
+    DATA_SOURCE = "insight_doc_0352"
+    SPLITS = ["all"]
+
+    def __init__(self, data_root, **extra_options):
+        super().__init__(data_root, **extra_options)
+        self.manifest_file = extra_options.get("manifest_file", "manifest.jsonl")
+
+    def _load_raw_data(self, split_name):
+        jsonl_path = Path(self.data_root) / self.manifest_file
+        assert jsonl_path.exists(), f"{self.manifest_file} not found at {jsonl_path}"
+        data = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+        return data
+
+    def get_question(self, example):
+        return example["question"]
+
+    def get_answer(self, example):
+        return example["answer"]
+
+    def get_image_objs_or_urls(self, example):
+        pdf_image_dir = Path(self.data_root) / "pdf_image"
+        images = example.get("images", [])
+        assert images, f"No images for question {example.get('question_id')}"
+        urls = []
+        for rel in images:
+            img_path = pdf_image_dir / rel
+            assert img_path.exists(), f"Image file does not exist: {img_path}"
+            urls.append(f"file://{img_path}")
+        return urls
+
+    def get_extra_info(self, example):
+        visual_details = example.get("question_involved_visual_details")
+        if visual_details is not None:
+            visual_details = json.dumps(visual_details, ensure_ascii=False)
+        return {
+            **super().get_extra_info(example),
+            "question_id": str(example["question_id"]),
+            "document_id": example["document_id"],
+            "subset": example.get("subset"),
+            "question_involved_visuals": example.get("question_involved_visuals"),
+            "question_involved_visual_details": visual_details,
+        }
+
+
 def get_image_obj(url_or_path: str | Path) -> Image.Image:
     if url_or_path.startswith("http://") or url_or_path.startswith("https://"):
         response = requests.get(url_or_path, stream=True)
@@ -423,7 +552,7 @@ def make_map_fn(dataset, split_name, prompt_style, agent_name=None, validate_ima
             user_prompt = user_prompt.replace("<image>", "<image>" * num_images, 1)
             num_tags = num_images
         assert num_tags == num_images, (
-            f"Prompt has {num_tags} <image> tags but dataset returned {num_images} images"
+            f"Prompt has {num_tags} <image> tags but dataset returned {num_images} images."
         )
 
         for img in image_objs_or_urls:
@@ -565,6 +694,15 @@ if __name__ == "__main__":
         --num_workers 32
 
     python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset InSightDocRegionLocalization \
+        --data_root /scratch/ywxzml3j/likaican/data/InSightDocRegionLocalization \
+        --split all \
+        --prompt vsearcher_qwen3_vl \
+        --output_path /scratch/ywxzml3j/likaican/data/InSightDocRegionLocalization/all-vsearcher_qwen3vl.parquet \
+        --agent_name vsearcher_qwen3_vl \
+        --num_workers 32
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
         --dataset InSightDoc \
         --data_root /scratch/ywxzml3j/likaican/temp/0207select234 \
         --split all \
@@ -572,6 +710,25 @@ if __name__ == "__main__":
         --output_path /scratch/ywxzml3j/likaican/temp/0207select234-vreasoner.parquet \
         --agent_name vreasoner \
         --num_workers 32
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset InSightDoc \
+        --data_root /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_filtered_cs_reduced_sample_50_max_pages_50 \
+        --split all \
+        --prompt vreasoner \
+        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_filtered_cs_reduced_sample_50_max_pages_50-vreasoner_v2.parquet \
+        --agent_name vreasoner_v2 \
+        --num_workers 32
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset InSightDoc0352 \
+        --data_root /home/ywxzml3j/ywxzml3juser40/data/insight_doc/arxiv_0307_sample/qa_gen/postprocess/veqa_batch_0350_mveqa_batch_0352/dpi200_aug_noaug_maxp40 \
+        --split all \
+        --prompt vreasoner \
+        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_veqa_batch_0350_mveqa_batch_0352_sample_50_maxp40-vreasoner_v2.parquet \
+        --agent_name vreasoner_v2 \
+        --num_workers 32 \
+        --extra_options "{\"manifest_file\": \"manifest_sample_50.jsonl\"}"
     """
 
     parser = argparse.ArgumentParser()
