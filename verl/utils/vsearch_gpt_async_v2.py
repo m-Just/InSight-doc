@@ -3,7 +3,6 @@ import io
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
@@ -18,42 +17,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 client = create_async_openai_client()
-TERMINAL_STOP_SEQUENCES = ["</action>", "</response>"]
-STRICT_REPLY_RE = re.compile(
-    r"""
-    ^\s*
-    <observation>\s*(?P<observation>.*?)\s*</observation>\s*
-    <state>\s*(?P<state>.*?)\s*</state>\s*
-    <plan>\s*(?P<plan>.*?)\s*</plan>\s*
-    (?:
-        <action>\s*(?P<action>.*?)\s*</action>
-        |
-        <response>\s*(?P<response>.*?)\s*</response>
-    )
-    \s*$
-    """,
-    re.DOTALL | re.VERBOSE,
-)
-OBSERVATION_PLANNING_PATTERNS = [
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in [
-        r"\bi will\b",
-        r"\bi'll\b",
-        r"\bi plan to\b",
-        r"\bmy plan is to\b",
-        r"\bi need to\b",
-        r"\bi should\b",
-        r"\bi want to\b",
-        r"\bnext i\b",
-        r"\bawait(?:ing)?\b",
-        r"\bzoom in\b",
-        r"\bcall the tool\b",
-        r"\buse the tool\b",
-        r"\btool call\b",
-        r"\bi requested\b",
-        r"\bi am going to\b",
-    ]
-]
+TERMINAL_STOP_SEQUENCES = ["</tool_call>"]
 
 
 @dataclass
@@ -106,32 +70,11 @@ def _prepare_image_data_url(image: Image.Image, max_area: int, png_max_area: int
     return _pil_to_data_url(scaled, image_format)
 
 
-def _extract_section(text: str, tag: str) -> Optional[str]:
-    start_tag = f"<{tag}>"
-    end_tag = f"</{tag}>"
-    if start_tag not in text or end_tag not in text:
-        return None
-    return text.split(start_tag, 1)[1].split(end_tag, 1)[0].strip()
-
-
-def _extract_terminal_section(text: str, tag: str) -> Optional[str]:
-    start_tag = f"<{tag}>"
-    end_tag = f"</{tag}>"
-    if start_tag not in text:
-        return None
-    tail = text.split(start_tag, 1)[1]
-    if end_tag in tail:
-        return tail.split(end_tag, 1)[0].strip()
-    # Allow EOF-terminated content when generation stops on the closing tag.
-    return tail.strip() or None
-
-
-def _normalize_terminal_content(text: str) -> str:
+def _normalize_tool_call_content(text: str) -> str:
+    """Append </tool_call> when generation was cut off by a stop sequence."""
     stripped = text.rstrip()
-    if "<response>" in stripped and "</response>" not in stripped and "<action>" not in stripped:
-        return stripped + "\n</response>"
-    if "<action>" in stripped and "</action>" not in stripped and "<response>" not in stripped:
-        return stripped + "\n</action>"
+    if "<tool_call>" in stripped and "</tool_call>" not in stripped:
+        return stripped + "</tool_call>"
     return text
 
 
@@ -139,85 +82,44 @@ def _normalize_assistant_message(message: ChatCompletionMessage) -> dict:
     normalized = message.to_dict()
     content = normalized.get("content")
     if isinstance(content, str):
-        normalized["content"] = _normalize_terminal_content(content)
+        normalized["content"] = _normalize_tool_call_content(content)
     return normalized
 
 
-def _extract_action_content(text: str) -> Optional[str]:
-    action = _extract_terminal_section(text, "action")
-    if action is None or not action:
+def _parse_tool_call(text: str) -> Optional[tuple[str, int]]:
+    """Parse <tool_call>{"region_description": "...", "img_idx": N}</tool_call>."""
+    if "<tool_call>" not in text or "</tool_call>" not in text:
         return None
-    return action
-
-
-def _parse_action(text: str) -> Optional[tuple[Optional[str], int]]:
-    action = _extract_action_content(text)
-    if action is None:
-        return None
+    segment = text.split("<tool_call>", 1)[1].split("</tool_call>", 1)[0].strip()
     try:
-        payload = json.loads(action)
+        parsed = json.loads(segment)
     except json.JSONDecodeError:
         return None
-    if payload.get("name") != "image_zoom_in_tool":
+    region_desc = parsed.get("region_description")
+    img_idx = parsed.get("img_idx")
+    if not isinstance(region_desc, str) or not isinstance(img_idx, int):
         return None
-    arguments = payload.get("arguments")
-    if not isinstance(arguments, dict):
+    return (region_desc, img_idx)
+
+
+def _parse_boxed_answer(text: str) -> Optional[str]:
+    if "\\boxed{" not in text:
         return None
-    img_idx = arguments.get("img_idx")
-    if not isinstance(img_idx, int):
-        return None
-    region_description = arguments.get("region_description")
-    if region_description is None:
-        return None, img_idx
-    if not isinstance(region_description, str):
-        return None
-    region_description = region_description.strip()
-    return (region_description or None), img_idx
-
-
-def _parse_response(text: str) -> Optional[str]:
-    response = _extract_terminal_section(text, "response")
-    if response is None:
-        return None
-    response = response.strip()
-    return response or None
-
-
-def _has_required_sections(text: str) -> bool:
-    return STRICT_REPLY_RE.fullmatch(text) is not None
-
-
-def _observation_is_semantically_valid(text: str) -> bool:
-    observation = _extract_section(text, "observation")
-    if observation is None:
-        return False
-    lowered = observation.strip()
-    if not lowered:
-        return False
-    return not any(pattern.search(lowered) for pattern in OBSERVATION_PLANNING_PATTERNS)
+    return text.split("\\boxed{", 1)[1].split("}", 1)[0].strip()
 
 
 def _build_multimodal_query(
     labeled_images: list[tuple[int, str]],
     trailing_text: str,
     image_detail: str,
-    wrapper_tag: str | None = None,
-    format_hint: str | None = None,
 ) -> list[dict]:
     content: list[dict] = []
-    if wrapper_tag is not None:
-        content.append({"type": "text", "text": f"<{wrapper_tag}>\n"})
     for i, (img_idx, url) in enumerate(labeled_images):
         if i > 0:
             content.append({"type": "text", "text": prompts.IMAGE_SEPARATOR})
         content.append({"type": "text", "text": f"Image {img_idx}:"})
         content.append({"type": "image_url", "image_url": {"url": url, "detail": image_detail}})
-    if wrapper_tag is not None:
-        content.append({"type": "text", "text": f"\n</{wrapper_tag}>"})
-    trailing_suffix = ""
-    if format_hint is not None:
-        trailing_suffix = f"\n\n{format_hint}"
-    content.append({"type": "text", "text": trailing_text + trailing_suffix})
+    content.append({"type": "text", "text": trailing_text})
     return content
 
 
@@ -243,7 +145,7 @@ async def get_gpt_visual_search_request_v2(
         try:
             role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
             content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
-            if role == "assistant" and isinstance(content, str) and _parse_action(content) is not None:
+            if role == "assistant" and isinstance(content, str) and _parse_tool_call(content) is not None:
                 prior_tool_calls += 1
         except Exception:
             continue
@@ -258,10 +160,7 @@ async def get_gpt_visual_search_request_v2(
             labeled_images.append((img_idx, _prepare_image_data_url(image, gpt_image_max_area, png_max_area)))
         pending_question = _build_multimodal_query(
             labeled_images,
-            (
-                f"\n\nUser question: {initial_question}\n\n"
-                f"{prompts.INITIAL_QUERY_HINT}"
-            ),
+            f"\n\n{initial_question}",
             image_detail,
         )
         current_messages = [{"role": "system", "content": prompts.VSEARCH_SYS_PROMPT}]
@@ -271,17 +170,8 @@ async def get_gpt_visual_search_request_v2(
             raise RuntimeError("tool_result is required after the initial round")
         if tool_result.status == "error":
             hint = prompts.build_tool_result_fail_hint(tool_result.requested_img_idx)
-            tool_error = tool_result.error_message or "ERROR: The previous zoom request did not produce a usable result."
-            pending_question = [
-                {
-                    "type": "text",
-                    "text": (
-                        f"<tool_response>\n{tool_error}\n</tool_response>\n\n"
-                        f"{hint}\n\n"
-                        f"{prompts.FOLLOWUP_FORMAT_HINT}"
-                    ),
-                }
-            ]
+            tool_error = tool_result.error_message or "The previous zoom request did not produce a usable result."
+            pending_question = [{"type": "text", "text": f"{tool_error}\n\n{hint}"}]
         else:
             if tool_result.status != "success":
                 raise RuntimeError(f"invalid tool_result status: {tool_result.status}")
@@ -294,10 +184,8 @@ async def get_gpt_visual_search_request_v2(
             hint = prompts.build_tool_result_hint(tool_result.new_img_idx)
             pending_question = _build_multimodal_query(
                 [(tool_result.new_img_idx, _prepare_image_data_url(image, gpt_image_max_area, png_max_area))],
-                hint,
+                f"\n\n{hint}",
                 image_detail,
-                wrapper_tag="tool_response",
-                format_hint=prompts.FOLLOWUP_FORMAT_HINT,
             )
 
     if is_last_round:
@@ -309,7 +197,6 @@ async def get_gpt_visual_search_request_v2(
 
     attempt = 0
     while attempt < int(max_round_retries):
-        retry_hint = prompts.FORMAT_REPAIR_HINT
         try:
             messages_out, response = await query_api(
                 query=pending_question,
@@ -341,33 +228,25 @@ async def get_gpt_visual_search_request_v2(
         content: str = content_value if isinstance(content_value, str) else ""
         finish_reason = response.choices[0].finish_reason
 
-        action = _parse_action(content)
-        answer = _parse_response(content)
-        has_sections = _has_required_sections(content)
-        observation_ok = _observation_is_semantically_valid(content)
+        tool_call = _parse_tool_call(content)
+        answer = _parse_boxed_answer(content)
 
         if is_last_round:
-            success = has_sections and observation_ok and answer is not None and action is None
+            success = answer is not None and tool_call is None
             if not success:
-                if has_sections and not observation_ok:
-                    failure_reasons.append("invalid_observation_semantics")
-                    retry_hint = prompts.OBSERVATION_REPAIR_HINT
-                if action is not None:
+                if tool_call is not None:
                     failure_reasons.append("tool_call_budget_exceeded")
-                failure_reasons.append(f"invalid_last_round({finish_reason})")
+                failure_reasons.append(f"no_answer_in_last_round({finish_reason})")
         else:
-            success = has_sections and observation_ok and (action is not None or answer is not None)
+            success = tool_call is not None or answer is not None
             if not success:
-                if has_sections and not observation_ok:
-                    failure_reasons.append("invalid_observation_semantics")
-                    retry_hint = prompts.OBSERVATION_REPAIR_HINT
-                failure_reasons.append(f"invalid_format_or_empty({finish_reason})")
+                failure_reasons.append(f"no_tool_call_nor_answer({finish_reason})")
 
         if success:
             region_description = None
             img_idx = None
-            if action is not None:
-                region_description, img_idx = action
+            if tool_call is not None:
+                region_description, img_idx = tool_call
             return GPTVisualSearchRequest(
                 success=True,
                 messages=current_messages,
@@ -380,7 +259,7 @@ async def get_gpt_visual_search_request_v2(
             )
 
         attempt += 1
-        pending_question = [{"type": "text", "text": retry_hint}]
+        pending_question = [{"type": "text", "text": prompts.FORMAT_REPAIR_HINT}]
 
     return GPTVisualSearchRequest(
         success=False,

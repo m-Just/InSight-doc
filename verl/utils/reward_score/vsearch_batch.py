@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -321,54 +320,6 @@ def parse_response(
     return parsed_content
 
 
-def _extract_last_assistant_response(solution_str: str) -> str:
-    if "assistant\n" not in solution_str:
-        return solution_str.strip()
-    return solution_str.rsplit("assistant\n", 1)[-1].strip()
-
-
-def _extract_vreasoner_v2_answer(response: str) -> str | None:
-    try:
-        parsed = parse_response(
-            response,
-            required_tags=["observation", "state", "plan", "response"],
-            excluded_tags=["action"],
-        )
-    except ParseError:
-        parsed = None
-
-    if parsed is not None:
-        answer = parsed["response"].strip()
-        return answer or None
-
-    try:
-        parsed = parse_response(
-            response,
-            required_tags=["observation", "state", "plan", "action"],
-            excluded_tags=["response"],
-        )
-    except ParseError:
-        return None
-
-    action = parsed["action"].strip()
-    if not action:
-        return None
-
-    try:
-        payload = json.loads(action)
-    except json.JSONDecodeError:
-        return action
-
-    if (
-        isinstance(payload, dict)
-        and payload.get("name") == "image_zoom_in_tool"
-        and isinstance(payload.get("arguments"), dict)
-    ):
-        return None
-
-    return action
-
-
 def compute_format_reward(solution_str: str, must_have_answer: bool = True) -> dict:
     """Compute the format reward of the model's conversation with the user.
        We assume that the user messages are all tool responses.
@@ -604,16 +555,15 @@ async def compute_score_single_vsearcher_as_subagent(
 async def compute_score_single_vreasoner(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **reward_kwargs: dict
 ) -> Score:
-    """ For vReasonser, we only care about whether the answer is correct.  """
+    """ For vReasoner, we only care about whether the answer is correct.  """
     score = ScoreOnlyAccuracy()
-    last_response = _extract_last_assistant_response(solution_str)
 
     if "\\boxed{" in solution_str:
         score.extracted_answer = solution_str.split("\\boxed{", 1)[1].split("}", 1)[0].strip()
     elif "<answer>" in solution_str and "</answer>" in solution_str:
         score.extracted_answer = solution_str.split("<answer>", 1)[1].split("</answer>", 1)[0].strip()
     else:
-        score.extracted_answer = _extract_vreasoner_v2_answer(last_response)
+        score.extracted_answer = None
 
     if score.extracted_answer:
         score.format_reward = 1.0
