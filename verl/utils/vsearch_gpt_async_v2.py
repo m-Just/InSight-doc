@@ -17,7 +17,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 client = create_async_openai_client()
-TERMINAL_STOP_SEQUENCES = ["</tool_call>"]
+TERMINAL_STOP_SEQUENCES = ["</tool_call>", "</answer>"]
 
 
 @dataclass
@@ -70,11 +70,13 @@ def _prepare_image_data_url(image: Image.Image, max_area: int, png_max_area: int
     return _pil_to_data_url(scaled, image_format)
 
 
-def _normalize_tool_call_content(text: str) -> str:
-    """Append </tool_call> when generation was cut off by a stop sequence."""
+def _normalize_terminal_content(text: str) -> str:
+    """Append a missing closing tag when generation was cut off by a stop sequence."""
     stripped = text.rstrip()
     if "<tool_call>" in stripped and "</tool_call>" not in stripped:
         return stripped + "</tool_call>"
+    if "<answer>" in stripped and "</answer>" not in stripped:
+        return stripped + "</answer>"
     return text
 
 
@@ -82,7 +84,7 @@ def _normalize_assistant_message(message: ChatCompletionMessage) -> dict:
     normalized = message.to_dict()
     content = normalized.get("content")
     if isinstance(content, str):
-        normalized["content"] = _normalize_tool_call_content(content)
+        normalized["content"] = _normalize_terminal_content(content)
     return normalized
 
 
@@ -102,10 +104,12 @@ def _parse_tool_call(text: str) -> Optional[tuple[str, int]]:
     return (region_desc, img_idx)
 
 
-def _parse_boxed_answer(text: str) -> Optional[str]:
+def _parse_answer(text: str) -> Optional[str]:
+    if "<answer>" in text and "</answer>" in text:
+        return text.rsplit("<answer>", 1)[1].split("</answer>", 1)[0].strip()
     if "\\boxed{" not in text:
         return None
-    return text.split("\\boxed{", 1)[1].split("}", 1)[0].strip()
+    return text.rsplit("\\boxed{", 1)[1].split("}", 1)[0].strip()
 
 
 def _build_multimodal_query(
@@ -229,7 +233,7 @@ async def get_gpt_visual_search_request_v2(
         finish_reason = response.choices[0].finish_reason
 
         tool_call = _parse_tool_call(content)
-        answer = _parse_boxed_answer(content)
+        answer = _parse_answer(content)
 
         if is_last_round:
             success = answer is not None and tool_call is None

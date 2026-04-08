@@ -27,7 +27,7 @@ VSEARCH_SYS_PROMPT = (
     "<tool_call>{\"region_description\": \"...\", \"img_idx\": N}</tool_call>.\n"
     "- Immediately after each </think>, do exactly one of:\n"
     "  1) Call the tool; or\n"
-    "  2) Provide the final answer (no tool call) \u2014 include the result in \\boxed{...}. "
+    "  2) Provide the final answer (no tool call) \u2014 wrap it in <answer>...</answer>. "
     "Do not mix tool calls and answers in the same turn.\n"
     "You **must strictly follow the output format**, otherwise your answer will be judged as wrong.\n"
     "\n"
@@ -47,7 +47,7 @@ VSEARCH_SYS_PROMPT = (
     "\n"
     "Assistant (final turn):\n"
     "<think>{final reasoning; explain why the available visual evidence is sufficient}</think>\n"
-    "Answer: \\boxed{...}"
+    "<answer>...</answer>"
 )
 
 
@@ -81,16 +81,16 @@ def build_tool_result_fail_hint(requested_img_idx: int | None) -> str:
 
 
 FORMAT_REPAIR_HINT = (
-    "In your previous response, neither a tool call nor a final boxed answer was provided "
+    "In your previous response, neither a tool call nor a final answer wrapped in <answer>...</answer> was provided "
     "(or the format is incorrect).\n\n"
     "Please do exactly one of the following:\n"
     "- If you still need more visual detail, call the tool using the exact JSON format:\n"
     "  <tool_call>{\"region_description\": \"...\", \"img_idx\": N}</tool_call>\n"
-    "- Otherwise, provide the final answer now and include the result in \\boxed{...}."
+    "- Otherwise, provide the final answer now using <answer>...</answer>."
 )
 
 
 LAST_ROUND_HINT = (
     "You have reached the limit for using the visual tool and cannot call it again.\n"
-    "In this turn, based on the available information, provide your final answer using the required format."
+    "In this turn, based on the available information, provide your final answer using <answer>...</answer>."
 )

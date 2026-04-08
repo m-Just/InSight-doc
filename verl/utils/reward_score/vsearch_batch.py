@@ -320,6 +320,20 @@ def parse_response(
     return parsed_content
 
 
+def _extract_last_tagged_content(text: str, tag: str) -> str | None:
+    start_tag = f"<{tag}>"
+    end_tag = f"</{tag}>"
+    if start_tag not in text or end_tag not in text:
+        return None
+    return text.rsplit(start_tag, 1)[1].split(end_tag, 1)[0].strip()
+
+
+def _extract_last_boxed_answer(text: str) -> str | None:
+    if "\\boxed{" not in text:
+        return None
+    return text.rsplit("\\boxed{", 1)[1].split("}", 1)[0].strip()
+
+
 def compute_format_reward(solution_str: str, must_have_answer: bool = True) -> dict:
     """Compute the format reward of the model's conversation with the user.
        We assume that the user messages are all tool responses.
@@ -558,12 +572,9 @@ async def compute_score_single_vreasoner(
     """ For vReasoner, we only care about whether the answer is correct.  """
     score = ScoreOnlyAccuracy()
 
-    if "\\boxed{" in solution_str:
-        score.extracted_answer = solution_str.split("\\boxed{", 1)[1].split("}", 1)[0].strip()
-    elif "<answer>" in solution_str and "</answer>" in solution_str:
-        score.extracted_answer = solution_str.split("<answer>", 1)[1].split("</answer>", 1)[0].strip()
-    else:
-        score.extracted_answer = None
+    score.extracted_answer = _extract_last_tagged_content(solution_str, "answer")
+    if score.extracted_answer is None:
+        score.extracted_answer = _extract_last_boxed_answer(solution_str)
 
     if score.extracted_answer:
         score.format_reward = 1.0
