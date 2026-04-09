@@ -16,6 +16,12 @@ top_k: -1
 # Top-p sampling parameter. Default 1.0.
 top_p: 1
 
+# Repetition penalty for rollout.
+repetition_penalty: 1.0
+
+# Presence penalty for rollout.
+presence_penalty: 0.0
+
 # typically the same as data max prompt length
 # same as data.max_prompt_length if it exists
 prompt_length: ${oc.select:data.max_prompt_length,512}
@@ -141,6 +147,12 @@ val_kwargs:
   # Sampling temperature for rollout.
   temperature: 0
 
+  # Repetition penalty for validation.
+  repetition_penalty: 1.0
+
+  # Presence penalty for validation.
+  presence_penalty: 0.0
+
   # whether to repeat n times for validation
   n: 1
 
@@ -158,6 +170,10 @@ multi_turn:
 
   # null for no limit (default max_length // 3)
   max_assistant_turns: null
+
+  # qwen_agent tool names used by QwenAgentLoop-based agent loops
+  qwen_tool_list:
+    - image_zoom_in_tool
 
   # null for no tool
   tool_config_path: null

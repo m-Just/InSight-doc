@@ -513,8 +513,10 @@ class RLHFDataset(Dataset):
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
 
-        # Set up vsearch fields if enabled
-        if self.config.get("use_vsearch", False):
+        # InSightQwenAgentLoop loads prompt images on the rollout worker from refs in
+        # raw_prompt, so eagerly materializing vsearch image blobs here only inflates
+        # host RAM before the batch is repeated for rollout.
+        if self.config.get("use_vsearch", False) and row_dict.get("agent_name") != "insight_qwen_agent":
             _setup_vsearch_fields(row_dict, self.processor.image_processor.patch_size, self.config, self._is_train)
 
         return row_dict

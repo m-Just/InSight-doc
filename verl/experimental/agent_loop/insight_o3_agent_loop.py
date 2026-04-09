@@ -655,6 +655,7 @@ class VSearcherLoopQwen3VL(VSearcherMixin, QwenAgentLoop):
     the rest of verl always receives pixel coordinates.
     """
     AGENT_NAME = "vsearcher_qwen3_vl"
+    DEFAULT_QWEN_TOOL_LIST = ["image_zoom_in_tool"]
     DISABLE_TOOL_SCHEMAS = False
     MAX_ALLOWED_TOKEN_ID = 151668
     EXPECTED_VALIDATION_SAMPLING_PARAMS = {
@@ -662,6 +663,7 @@ class VSearcherLoopQwen3VL(VSearcherMixin, QwenAgentLoop):
         "top_p": 0.8,
         "top_k": 20,
         "repetition_penalty": 1.0,
+        "presence_penalty": 1.5,
         "logprobs": None,
     }  # https://hf.co/Qwen/Qwen3-VL-8B-Instruct/blob/main/generation_config.json
 
@@ -1104,9 +1106,7 @@ class VReasonerLoopV2(VReasonerLoop):
         dataset_cls: type[RLHFDataset],
         dataset_config: DictConfig,
         initial_rescale: float = 0.25,
-        full_image_zoom_in_factor: float = 2.0,
         region_zoom_in_factor: float = 4.0,
-        zoom_reject_area_ratio: float = 0.9,
         png_max_area: int = 1280 * 1280,
         enable_stop: bool = False,
         **kwargs,
@@ -1122,18 +1122,12 @@ class VReasonerLoopV2(VReasonerLoop):
         )
         if initial_rescale <= 0:
             raise ValueError(f"initial_rescale must be positive, got {initial_rescale}")
-        if full_image_zoom_in_factor <= 0:
-            raise ValueError(f"full_image_zoom_in_factor must be positive, got {full_image_zoom_in_factor}")
         if region_zoom_in_factor <= 0:
             raise ValueError(f"region_zoom_in_factor must be positive, got {region_zoom_in_factor}")
-        if not (0 < zoom_reject_area_ratio <= 1):
-            raise ValueError(f"zoom_reject_area_ratio must be in (0, 1], got {zoom_reject_area_ratio}")
         if png_max_area <= 0:
             raise ValueError(f"png_max_area must be positive, got {png_max_area}")
         self.initial_rescale = initial_rescale
-        self.full_image_zoom_in_factor = full_image_zoom_in_factor
         self.region_zoom_in_factor = region_zoom_in_factor
-        self.zoom_reject_area_ratio = zoom_reject_area_ratio
         self.png_max_area = png_max_area
         self.enable_stop = enable_stop
         self.conversation_export_dir = self.config.actor_rollout_ref.rollout.agent.get(
@@ -1159,9 +1153,6 @@ class VReasonerLoopV2(VReasonerLoop):
                 )
             )
         return presented_images
-
-    def _zoom_is_rejected(self, presented: PresentedImage) -> bool:
-        return presented.display_size[0] * presented.display_size[1] >= self.zoom_reject_area_ratio * self.gpt_image_max_area
 
     def _append_presented_image(
         self,
@@ -1294,19 +1285,12 @@ class VReasonerLoopV2(VReasonerLoop):
 
             tool_result = None
 
-            if self._zoom_is_rejected(presented):
-                logger.info(
-                    "rejecting zoom on image %s because displayed area %s is already close to cap %s",
-                    img_idx,
-                    presented.display_size[0] * presented.display_size[1],
-                    self.gpt_image_max_area,
-                )
+            if request.region_description is None:
                 tool_result = ToolResult(
                     status="error",
                     requested_img_idx=img_idx,
                     error_message=(
-                        "ERROR: The selected image is already near the maximum zoom level, so further full-image zoom "
-                        "is unlikely to reveal more detail. A more specific region may be needed."
+                        "ERROR: region_description is required. This zoom tool only supports region-based zoom requests."
                     ),
                 )
                 failure_events.append(
@@ -1315,37 +1299,6 @@ class VReasonerLoopV2(VReasonerLoop):
                         "status": "error",
                         "requested_img_idx": img_idx,
                         "error_message": tool_result.error_message,
-                    }
-                )
-                continue
-
-            if request.region_description is None:
-                new_img_idx = self._append_presented_image(
-                    presented_images,
-                    source_original,
-                    presented.source_original_img_idx,
-                    presented.bbox_on_original,
-                    _resize_dims_by_factor(presented.display_size, self.full_image_zoom_in_factor),
-                )
-                if new_img_idx is None:
-                    raise RuntimeError(
-                        "failed to append full-image zoom result after a valid full-image zoom request"
-                    )
-                tool_result = ToolResult(
-                    status="success",
-                    requested_img_idx=img_idx,
-                    new_img_idx=new_img_idx,
-                )
-                new_presented = presented_images[new_img_idx]
-                presented_image_refs.append(
-                    {
-                        "presented_img_idx": new_img_idx,
-                        "kind": "full_image_zoom",
-                        "parent_presented_img_idx": img_idx,
-                        "source_original_img_idx": new_presented.source_original_img_idx,
-                        "bbox_on_original": list(new_presented.bbox_on_original),
-                        "display_size": list(new_presented.display_size),
-                        "zoom_in_factor": self.full_image_zoom_in_factor,
                     }
                 )
                 continue
@@ -1736,9 +1689,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     },
                     loop_params={
                         "initial_rescale": self.initial_rescale,
-                        "full_image_zoom_in_factor": self.full_image_zoom_in_factor,
                         "region_zoom_in_factor": self.region_zoom_in_factor,
-                        "zoom_reject_area_ratio": self.zoom_reject_area_ratio,
                         "png_max_area": self.png_max_area,
                         "model": self.model,
                         "max_tool_calls": self.max_tool_calls,

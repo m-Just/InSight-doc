@@ -22,6 +22,7 @@ import json
 import os
 import pickle
 import shutil
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -760,11 +761,13 @@ class RayPPOTrainer:
         sample_gts = []
         sample_scores = []
         sample_turns = []
+        sample_conversation_wall_times = []
         sample_uids = []
 
         packets_count_by_data_source = defaultdict(int)
 
         for test_data in tqdm(self.val_dataloader, desc="Validation Progress"):
+            t_batch_start = time.perf_counter()
             test_batch = DataProto.from_single_dict(test_data)
 
             if "uid" not in test_batch.non_tensor_batch:
@@ -802,18 +805,27 @@ class RayPPOTrainer:
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            t_before_generate = time.perf_counter()
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
             else:
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            t_after_generate = time.perf_counter()
 
             # unpad
             # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             test_batch, test_output_gen_batch, new_pad_size = self._reorganize_batch(
                 test_batch, test_output_gen_batch_padded, pad_size
             )
+            t_after_reorganize = time.perf_counter()
 
             print("validation generation end")
+            print(
+                "Validation phase timing: "
+                f"batch_prep={t_before_generate - t_batch_start:.2f}s "
+                f"generate={t_after_generate - t_before_generate:.2f}s "
+                f"reorganize={t_after_reorganize - t_after_generate:.2f}s"
+            )
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -840,6 +852,14 @@ class RayPPOTrainer:
             reward_tensor, reward_extra_info = self._compute_or_extract_reward(
                 test_batch, reward_fn=self.val_reward_fn, reward_for_val=True
             )
+            if "response_truncated" in test_batch.non_tensor_batch and "response_truncated" not in reward_extra_info:
+                reward_extra_info["response_truncated"] = test_batch.non_tensor_batch["response_truncated"]
+            t_after_reward = time.perf_counter()
+            print(
+                "Validation reward timing: "
+                f"reward_compute={t_after_reward - t_after_reorganize:.2f}s "
+                f"total_batch={t_after_reward - t_batch_start:.2f}s"
+            )
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
@@ -852,16 +872,29 @@ class RayPPOTrainer:
                 else:
                     reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
 
-            assert all(key not in test_batch.non_tensor_batch for key in reward_extra_infos_dict), (
-                f"{test_batch.non_tensor_batch.keys()=}, {reward_extra_infos_dict.keys()=}"
+            overlapping_keys = {
+                key for key in reward_extra_infos_dict if key in test_batch.non_tensor_batch
+            }
+            overlapping_keys.discard("response_truncated")
+            assert not overlapping_keys, (
+                f"{test_batch.non_tensor_batch.keys()=}, {reward_extra_infos_dict.keys()=}, "
+                f"{overlapping_keys=}"
             )
             test_batch.non_tensor_batch.update(
-                {k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()}
+                {
+                    k: np.array(v, dtype=object)
+                    for k, v in reward_extra_infos_dict.items()
+                    if k not in test_batch.non_tensor_batch
+                }
             )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+            if "conversation_wall_time" in test_batch.non_tensor_batch:
+                sample_conversation_wall_times.append(
+                    np.asarray(test_batch.non_tensor_batch["conversation_wall_time"], dtype=np.float64)
+                )
 
             sample_data_sources = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
             data_source_lst.append(sample_data_sources)
@@ -904,12 +937,26 @@ class RayPPOTrainer:
                 "data_sources": data_source_lst,
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
+                "sample_conversation_wall_times": sample_conversation_wall_times,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            sample_conversation_wall_times,
+        )
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+    def _val_metrics_update(
+        self,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        sample_turns,
+        sample_conversation_wall_times,
+    ):
         metric_dict = {}
 
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
@@ -938,11 +985,28 @@ class RayPPOTrainer:
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
+        if "response_truncated" in reward_extra_infos_dict:
+            response_truncated = np.asarray(reward_extra_infos_dict["response_truncated"], dtype=bool)
+            for data_source in np.unique(data_sources):
+                ds_mask = data_sources == data_source
+                metric_dict[f"val-aux/{data_source}/truncation_rate/mean"] = float(response_truncated[ds_mask].mean())
+
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        if len(sample_conversation_wall_times) > 0:
+            sample_conversation_wall_times = np.concatenate(sample_conversation_wall_times)
+            metric_dict["val-aux/conversation_wall_time/min"] = sample_conversation_wall_times.min()
+            metric_dict["val-aux/conversation_wall_time/max"] = sample_conversation_wall_times.max()
+            metric_dict["val-aux/conversation_wall_time/mean"] = sample_conversation_wall_times.mean()
+            for data_source in np.unique(data_sources):
+                ds_mask = data_sources == data_source
+                metric_dict[f"val-aux/{data_source}/conversation_wall_time/mean"] = float(
+                    sample_conversation_wall_times[ds_mask].mean()
+                )
 
         return metric_dict
 
@@ -950,9 +1014,21 @@ class RayPPOTrainer:
         if result_a is None and result_b is None:
             return {}
         if result_a is None:
-            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_a = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "sample_conversation_wall_times": [],
+                "reward_extra_infos_dict": {},
+            }
         if result_b is None:
-            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_b = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "sample_conversation_wall_times": [],
+                "reward_extra_infos_dict": {},
+            }
 
         if not result_a.get("data_sources") and not result_b.get("data_sources"):
             return {}
@@ -960,6 +1036,9 @@ class RayPPOTrainer:
         data_sources = np.concatenate(result_a["data_sources"] + result_b["data_sources"], axis=0)
         sample_uids = result_a["sample_uids"] + result_b["sample_uids"]
         sample_turns = result_a["sample_turns"] + result_b["sample_turns"]
+        sample_conversation_wall_times = (
+            result_a["sample_conversation_wall_times"] + result_b["sample_conversation_wall_times"]
+        )
 
         reward_extra_infos_dict = {}
         all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
@@ -968,7 +1047,13 @@ class RayPPOTrainer:
             list_b = result_b["reward_extra_infos_dict"].get(key, [])
             reward_extra_infos_dict[key] = list_a + list_b
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            sample_turns,
+            sample_conversation_wall_times,
+        )
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -2085,14 +2170,15 @@ class RayPPOTrainer:
                             # - None: the score computation is not performed (e.g., for subagent results)
                             # We only replace the failed ones (and their descendants) here.
                             idxs_to_keep = np.where(batch.non_tensor_batch["compute_score_success"] != False)[0]  # noqa: E712
-                            job_ids_to_keep = set(batch.non_tensor_batch["job_id"][idxs_to_keep])
-                            idxs_to_keep = np.array(
-                                [
-                                    idx
-                                    for idx in idxs_to_keep
-                                    if batch.non_tensor_batch["root_job_id"][idx] in job_ids_to_keep
-                                ]
-                            )
+                            if "job_id" in batch.non_tensor_batch and "root_job_id" in batch.non_tensor_batch:
+                                job_ids_to_keep = set(batch.non_tensor_batch["job_id"][idxs_to_keep])
+                                idxs_to_keep = np.array(
+                                    [
+                                        idx
+                                        for idx in idxs_to_keep
+                                        if batch.non_tensor_batch["root_job_id"][idx] in job_ids_to_keep
+                                    ]
+                                )
                             assert len(idxs_to_keep), f"{len(idxs_to_keep)=}, {len(batch.batch)=}"
 
                             if len(idxs_to_keep) < len(batch.batch):

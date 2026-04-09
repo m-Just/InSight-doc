@@ -38,6 +38,8 @@ class SamplingConfig(BaseConfig):
     temperature: float = 1.0
     top_k: int = -1
     top_p: float = 1.0
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
     do_sample: bool = True
     n: int = 1
 
@@ -48,6 +50,7 @@ class MultiTurnConfig(BaseConfig):
 
     enable: bool = False
     max_assistant_turns: Optional[int] = None
+    qwen_tool_list: list[str] = field(default_factory=lambda: ["image_zoom_in_tool"])
     tool_config_path: Optional[str] = None
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1
@@ -130,6 +133,7 @@ class RolloutConfig(BaseConfig):
     do_sample: bool = True
     n: int = 1
     repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
 
     # Early termination threshold for multi-turn rollout in sglang.
     # Abort remaining requests when (1 - over_sample_rate) * total_requests are completed.

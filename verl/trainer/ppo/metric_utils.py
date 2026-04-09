@@ -228,12 +228,18 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 def compute_agent_metrics(batch: DataProto) -> dict[str, Any]:
     data = {k: v for k, v in batch.non_tensor_batch.items()}
     data["rewards"] = batch.batch["token_level_rewards"].sum(-1).tolist()
+    parent_job_ids = data.get("parent_job_id")
 
     def collect_metrics(metric_names: list[str], agent_name_displayed: str):
         for metric_name in metric_names:
-            value = data[metric_name][sample_idx]
+            source_metric_name = metric_name
+            if source_metric_name not in data and source_metric_name == "n_tool_calls" and "n_valid_tool_calls" in data:
+                source_metric_name = "n_valid_tool_calls"
+            if source_metric_name not in data:
+                continue
+            value = data[source_metric_name][sample_idx]
             agent2var2vals[agent_name_displayed][metric_name].append(value)
-            if data["parent_job_id"][sample_idx] is None:
+            if parent_job_ids is None or parent_job_ids[sample_idx] is None:
                 agent2var2vals[f"{agent_name_displayed}/main"][metric_name].append(value)
             else:
                 agent2var2vals[f"{agent_name_displayed}/sub"][metric_name].append(value)
@@ -243,7 +249,7 @@ def compute_agent_metrics(batch: DataProto) -> dict[str, Any]:
         if agent_name.startswith("vsearcher"):
             agent_name_displayed = "vsearcher"
             collect_metrics(["iou_reward", "final_iou", "tool_iou"], agent_name_displayed)
-        elif agent_name.startswith("vreasoner"):
+        elif agent_name.startswith("vreasoner") or agent_name == "insight_qwen_agent":
             agent_name_displayed = "vreasoner"
             collect_metrics(["accuracy_reward"], agent_name_displayed)
         collect_metrics(["rewards", "format_reward", "tool_reward", "n_tool_calls"], agent_name_displayed)
@@ -724,11 +730,11 @@ def _compute_vsearch_val_metrics(var2vals: dict[str, list]) -> dict[str, dict[st
     def safe_ratio(num, den):
         return float(num / den) if den > 0 else float("nan")
 
-    if "critical_failure" not in var2vals:
-        raise ValueError("critical_failure not found")
-
-    critical_failure = np.array(var2vals["critical_failure"], dtype=object)
-    failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)
+    if "critical_failure" in var2vals:
+        critical_failure = np.array(var2vals["critical_failure"], dtype=object)
+        failure_ratio = (critical_failure == True).sum() / max((critical_failure != None).sum(), 1)
+    else:
+        failure_ratio = 0.0
 
     return {
         "critical_failure_ratio": {"mean": failure_ratio},

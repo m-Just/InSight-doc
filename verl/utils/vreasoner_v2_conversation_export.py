@@ -408,6 +408,18 @@ def _load_image_from_input_ref(ref: dict[str, Any] | None) -> Image.Image | None
             return None
         _, b64data = url.split("base64,", 1)
         return Image.open(BytesIO(base64.b64decode(b64data))).copy()
+    if source_type == "path_or_url":
+        value = ref.get("value")
+        if not value:
+            return None
+        if isinstance(value, str) and value.startswith("file://"):
+            path = value[len("file://") :]
+            return Image.open(path).copy()
+        if isinstance(value, str) and (value.startswith("http://") or value.startswith("https://")):
+            with urlopen(value) as response:
+                return Image.open(BytesIO(response.read())).copy()
+        if isinstance(value, str):
+            return Image.open(value).copy()
     return None
 
 

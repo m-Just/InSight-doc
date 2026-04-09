@@ -4,9 +4,11 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 import logging
+import re
 
 from openai import AsyncOpenAI
 
+from verl.utils.reward_score.search_r1_like_qa_em import normalize_answer
 from verl.utils.vsearch import (
     BBox,
     iou as compute_iou,
@@ -16,8 +18,10 @@ from verl.utils.vsearch import (
     parse_bbox,
 )
 from verl.utils.vsearch_role_play_prompt import qa_verify as verify_prompt
+from verl.utils.vreasoner_v2_conversation_export import append_reward_info
 
 from insight_o3.utils.api import create_async_openai_client, query_api  # pyright: ignore[reportMissingImports]
+from insight_o3 import prompts as insight_o3_prompts  # pyright: ignore[reportMissingImports]
 
 
 logger = logging.getLogger(__file__)
@@ -334,6 +338,114 @@ def _extract_last_boxed_answer(text: str) -> str | None:
     return text.rsplit("\\boxed{", 1)[1].split("}", 1)[0].strip()
 
 
+def _extract_responses(solution_str: str) -> list[str]:
+    return [round.split("assistant\n")[-1] for round in solution_str.split("user\n")]
+
+
+def _extract_last_plain_answer(text: str) -> str | None:
+    responses = _extract_responses(text)
+    if not responses:
+        return None
+    candidate = responses[-1].strip()
+    candidate = candidate.removesuffix("<|im_end|>").strip()
+    if not candidate or "<tool_call>" in candidate or "</tool_call>" in candidate:
+        return None
+    return candidate
+
+
+def _extract_last_assistant_message(solution_str: str) -> str | None:
+    responses = _extract_responses(solution_str)
+    if not responses:
+        return None
+    candidate = responses[-1].strip()
+    candidate = candidate.removesuffix("<|im_end|>").strip()
+    return candidate or None
+
+
+def _crop_judge_answer_context(text: str, max_len: int = 2000) -> str:
+    if len(text) <= max_len:
+        return text
+    crop_marker = " ... "
+    kept_chars = max(1, max_len - len(crop_marker))
+    prefix_chars = kept_chars // 2
+    suffix_chars = kept_chars - prefix_chars
+    return f"{text[:prefix_chars]}{crop_marker}{text[-suffix_chars:]}"
+
+
+def _normalize_judge_extracted_answer(text: str | None) -> str | None:
+    if text is None:
+        return None
+    candidate = text.strip()
+    if not candidate:
+        return None
+
+    tagged = re.findall(r"<answer>(.*?)</answer>", candidate, re.DOTALL)
+    if tagged:
+        candidate = tagged[-1].strip()
+    else:
+        candidate = candidate.removeprefix("<answer>").strip()
+
+    boxed = re.findall(r"\\boxed\{(.*?)\}", candidate, re.DOTALL)
+    if boxed:
+        candidate = boxed[-1].strip()
+
+    candidate = candidate.strip().strip("`").strip()
+    return candidate or None
+
+
+async def _extract_answer_for_insight_qwen_agent(
+    *,
+    question: str,
+    final_message: str,
+    extra_info: dict,
+    judge_client: AsyncOpenAI,
+    judge_model: str,
+) -> str | None:
+    raw_answer = _extract_last_tagged_content(final_message, "answer")
+    if raw_answer is None:
+        raw_answer = _extract_last_boxed_answer(final_message)
+    if raw_answer is None:
+        raw_answer = final_message.strip()
+    if not raw_answer:
+        return None
+
+    raw_answer = _crop_judge_answer_context(raw_answer)
+    options = extra_info.get("options")
+    if options:
+        prompt = insight_o3_prompts.GPT_EVAL_MCQA_PROMPT.format(
+            question=question,
+            options=options,
+            model_answer=raw_answer,
+        )
+    else:
+        prompt = insight_o3_prompts.GPT_EVAL_OPEN_QA_PROMPT.format(
+            question=question,
+            model_response=raw_answer,
+        )
+
+    try:
+        _, response = await query_api(
+            query=prompt,
+            model=judge_model,
+            client=judge_client,
+            max_completion_tokens=2048,
+        )
+    except Exception as e:
+        logger.warning("Answer extraction judge failed (%s); falling back to rule-based extraction.", e)
+        return raw_answer
+
+    content = response.choices[0].message.content
+    if isinstance(content, list):
+        content = "".join(
+            item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
+        )
+    elif content is None:
+        return raw_answer
+
+    extracted_answer = _normalize_judge_extracted_answer(str(content))
+    return extracted_answer or raw_answer
+
+
 def compute_format_reward(solution_str: str, must_have_answer: bool = True) -> dict:
     """Compute the format reward of the model's conversation with the user.
        We assume that the user messages are all tool responses.
@@ -368,7 +480,7 @@ def compute_format_reward(solution_str: str, must_have_answer: bool = True) -> d
     """
 
     # Extract the responses from the conversation
-    responses = [round.split("assistant\n")[-1] for round in solution_str.split("user\n")]
+    responses = _extract_responses(solution_str)
 
     # Check if every response strictly follows the format
     for i, response in enumerate(responses):
@@ -409,7 +521,7 @@ def compute_format_reward_simple(solution_str: str, must_have_answer: bool = Tru
     Everything else follows that of compute_format_reward.
     """
     # Extract the responses from the conversation
-    responses = [round.split("assistant\n")[-1] for round in solution_str.split("user\n")]
+    responses = _extract_responses(solution_str)
 
     # Check if every response strictly follows the format
     for i, response in enumerate(responses):
@@ -465,6 +577,22 @@ async def compute_accuracy_reward(
     if extracted_answer == ground_truth:
         return 1.0
 
+    normalized_extracted = normalize_answer(extracted_answer)
+    normalized_ground_truth = normalize_answer(ground_truth)
+    fallback_accuracy = float(
+        bool(normalized_extracted)
+        and bool(normalized_ground_truth)
+        and (
+            normalized_extracted == normalized_ground_truth
+            or normalized_extracted in normalized_ground_truth
+            or normalized_ground_truth in normalized_extracted
+        )
+    )
+
+    if not os.getenv("OPENAI_API_KEY") and not os.getenv("OPENAI_BASE_URL"):
+        logger.warning("No judge endpoint configured; falling back to normalized exact/substring accuracy.")
+        return fallback_accuracy
+
     # Use judge model to verify the answer
     query = verify_prompt.format(
         question=question,
@@ -481,7 +609,8 @@ async def compute_accuracy_reward(
         )
         response_text = judge_response.choices[0].message.content
     except Exception as e:
-        raise JudgeError(f"failed to verify answer correctness: {e}")
+        logger.warning("Judge query failed (%s); falling back to normalized exact/substring accuracy.", e)
+        return fallback_accuracy
 
     return float("<correct>" in response_text)
 
@@ -575,12 +704,58 @@ async def compute_score_single_vreasoner(
     score.extracted_answer = _extract_last_tagged_content(solution_str, "answer")
     if score.extracted_answer is None:
         score.extracted_answer = _extract_last_boxed_answer(solution_str)
+    if score.extracted_answer is None and extra_info.get("agent_name") == "insight_qwen_agent":
+        score.extracted_answer = _extract_last_plain_answer(solution_str)
 
     if score.extracted_answer:
         score.format_reward = 1.0
     else:
         score.format_reward = 0.0
 
+    if score.extracted_answer:
+        score.accuracy_reward = await compute_accuracy_reward(
+            data_source,
+            extra_info["question"],
+            score.extracted_answer,
+            ground_truth,
+            reward_kwargs["judge_client"],
+            reward_kwargs["judge_model"],
+        )
+    else:
+        score.accuracy_reward = 0.0
+
+    score.n_valid_tool_calls = solution_str.count("<tool_response>")
+    return score
+
+
+async def compute_score_single_insight_qwen_agent(
+    data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **reward_kwargs: dict
+) -> Score:
+    score = ScoreOnlyAccuracy()
+
+    final_message = _extract_last_assistant_message(solution_str)
+    if final_message is None:
+        score.format_reward = 0.0
+        score.accuracy_reward = 0.0
+        score.n_valid_tool_calls = solution_str.count("<tool_response>")
+        return score
+
+    rule_based_answer = _extract_last_tagged_content(final_message, "answer")
+    if rule_based_answer is None:
+        rule_based_answer = _extract_last_boxed_answer(final_message)
+
+    if rule_based_answer == ground_truth:
+        score.extracted_answer = rule_based_answer
+    else:
+        score.extracted_answer = await _extract_answer_for_insight_qwen_agent(
+            question=extra_info["question"],
+            final_message=final_message,
+            extra_info=extra_info,
+            judge_client=reward_kwargs["judge_client"],
+            judge_model=reward_kwargs["judge_model"],
+        )
+
+    score.format_reward = float(bool(score.extracted_answer))
     if score.extracted_answer:
         score.accuracy_reward = await compute_accuracy_reward(
             data_source,
@@ -673,7 +848,11 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
                     compute_single_fns.append(compute_score_single_vsearcher)
                 else:
                     compute_single_fns.append(compute_score_single_vsearcher_as_subagent)
-            elif extra_info["agent_name"].startswith("vreasoner"):
+            elif extra_info["agent_name"] == "insight_qwen_agent":
+                compute_single_fns.append(compute_score_single_insight_qwen_agent)
+            elif (
+                extra_info["agent_name"].startswith("vreasoner")
+            ):
                 compute_single_fns.append(compute_score_single_vreasoner)
             else:
                 raise ValueError(f"Unknown agent name: {extra_info['agent_name']}")
@@ -716,6 +895,34 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
             score_dict = asdict(score)
             score_dict["compute_score_success"] = compute_score_success
             score_dicts.append(score_dict)
+
+        for data_source, ground_truth, extra_info, score_dict in zip(
+            data_sources,
+            ground_truths,
+            extra_infos,
+            score_dicts,
+            strict=True,
+        ):
+            export_path = extra_info.get("conversation_export_json_path")
+            if not export_path:
+                continue
+
+            reward_payload = {
+                "reward": score_dict.get("score"),
+                "score": score_dict,
+                "data_source": data_source,
+                "ground_truth": ground_truth,
+                "agent_name": extra_info.get("agent_name"),
+                "failure_reasons": extra_info.get("failure_reasons"),
+                "compute_score_success": score_dict.get("compute_score_success"),
+            }
+            if score_dict.get("extracted_answer") is not None:
+                reward_payload["extracted_answer"] = score_dict["extracted_answer"]
+
+            try:
+                append_reward_info(str(export_path), reward_payload)
+            except Exception as exc:
+                logger.warning("[conversation_export_update_failed] path=%s error=%s", export_path, exc)
 
         logger.info(f"[RewardWorker] Reward computation completed, time: {time.time() - start_time:.2f}s")
         return score_dicts

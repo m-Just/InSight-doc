@@ -16,7 +16,8 @@ from .agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopWorker, AsyncL
 from .insight_o3_agent_loop import VReasonerLoop, VReasonerLoopV2, VSearcherLoop, VSearcherLoopQwen3VL
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
+from .qwen_agent_loop import QwenAgentLoop, InSightQwenAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop, VReasonerLoop, VReasonerLoopV2, VSearcherLoop, VSearcherLoopQwen3VL]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, VReasonerLoop, VReasonerLoopV2, VSearcherLoop, VSearcherLoopQwen3VL, QwenAgentLoop, InSightQwenAgentLoop]
 
 __all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker"]

@@ -90,6 +90,7 @@ class MultiTurnSFTDataset(Dataset):
             "image_patch_size", processor.image_processor.patch_size if processor else None
         )
         self.tools_key = config.get("tools_key", "tools")
+        self.message_loss_mask_key = config.get("message_loss_mask_key", "message_loss_mask")
         self.enable_thinking_key = config.get("enable_thinking_key", "enable_thinking")
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
         self.shuffle = config.get("shuffle", False)
@@ -150,6 +151,12 @@ class MultiTurnSFTDataset(Dataset):
             self.tools = self.dataframe[self.tools_key].apply(convert_nested_value_to_list_recursive).tolist()
         else:
             self.tools = None
+        if self.message_loss_mask_key in self.dataframe.columns:
+            self.message_loss_masks = self.dataframe[self.message_loss_mask_key].apply(
+                convert_nested_value_to_list_recursive
+            ).tolist()
+        else:
+            self.message_loss_masks = None
         # Extract enable_thinking list from dataframe
         if self.enable_thinking_key in self.dataframe.columns:
             self.enable_thinking = self.dataframe[self.enable_thinking_key].tolist()
@@ -169,6 +176,7 @@ class MultiTurnSFTDataset(Dataset):
         message: dict[str, Any],
         tools: Optional[list[dict[str, Any]]] = None,
         enable_thinking: Optional[bool] = None,
+        assistant_loss_enabled: bool = True,
     ) -> tuple[list[int], list[int], list[int]]:
         """
         Process a single message and return its tokenized representation.
@@ -208,7 +216,7 @@ class MultiTurnSFTDataset(Dataset):
             input_ids = input_ids[len(self.system_prompt) :]
             attention_mask = attention_mask[len(self.system_prompt) :]
 
-        if message["role"] == "assistant":
+        if message["role"] == "assistant" and assistant_loss_enabled:
             loss_mask = torch.ones_like(attention_mask)
             # mask out generation prompt if assistant message
             loss_mask[: len(self.generation_prompt)] = 0
@@ -267,16 +275,23 @@ class MultiTurnSFTDataset(Dataset):
         row_dict: dict = self.dataframe.iloc[item].to_dict()
         messages = self._build_messages(row_dict)
         tools = self.tools[item] if self.tools is not None else None
+        message_loss_mask = self.message_loss_masks[item] if self.message_loss_masks is not None else None
         enable_thinking = self.enable_thinking[item] if self.enable_thinking is not None else None
+        if message_loss_mask is not None and len(message_loss_mask) != len(messages):
+            raise ValueError(
+                f"message_loss_mask length {len(message_loss_mask)} does not match messages length {len(messages)}"
+            )
 
         # 1. tokenize each message
         input_ids, loss_mask, attention_mask, multi_modal_inputs = [], [], [], {}
         for i, message in enumerate(messages):
+            assistant_loss_enabled = True if message_loss_mask is None else bool(message_loss_mask[i])
             _input_ids, _loss_mask, _attention_mask, _inputs = self._process_single_message(
                 index=i,
                 message=message,
                 tools=tools if i == 0 else None,
                 enable_thinking=enable_thinking,
+                assistant_loss_enabled=assistant_loss_enabled,
             )
             input_ids.append(_input_ids)
             loss_mask.append(_loss_mask)

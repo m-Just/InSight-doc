@@ -31,6 +31,10 @@ PROMPTS = {
         "system": "Dummy system prompt. This will be replaced during rollout.",
         "user_template": "Dummy prompt. This will be replaced during rollout. <image>{question}",
     },
+    "insight_qwen_agent": {
+        "system": QWEN3_VL_ANALYSIS_PROMPT,
+        "user_template": "<image>{question}",
+    },
     "vreasoner_qwen3_vl": {
         "system": QWEN3_VL_ANALYSIS_PROMPT,
         "user_template": "<image>{question}\nPut your final answer inside <answer>...</answer>.",
@@ -719,6 +723,38 @@ if __name__ == "__main__":
         --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_filtered_cs_reduced_sample_50_max_pages_50-vreasoner_v2.parquet \
         --agent_name vreasoner_v2 \
         --num_workers 32
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset InSightDoc0352 \
+        --data_root /home/ywxzml3j/ywxzml3juser40/data/insight_doc/arxiv_0307_sample/qa_gen/postprocess/veqa_batch_0350_mveqa_batch_0352/dpi200_aug_noaug_maxp40 \
+        --split all \
+        --prompt insight_qwen_agent \
+        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_veqa_batch_0350_mveqa_batch_0352_maxp40-insight_qwen_agent.parquet \
+        --agent_name insight_qwen_agent \
+        --num_workers 32 \
+        --extra_options "{\"manifest_file\": \"manifest.jsonl\"}" \
+        --test_size 0.2
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset InSightDoc0352 \
+        --data_root /home/ywxzml3j/ywxzml3juser40/data/insight_doc/arxiv_0307_sample/qa_gen/postprocess/veqa_batch_0350_mveqa_batch_0352/dpi200_aug_noaug_maxp40 \
+        --split all \
+        --prompt insight_qwen_agent \
+        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_veqa_batch_0350_mveqa_batch_0352_sample_50_maxp40-insight_qwen_agent.parquet \
+        --agent_name insight_qwen_agent \
+        --num_workers 32 \
+        --extra_options "{\"manifest_file\": \"manifest_sample_50.jsonl\"}"
+
+    python verl/recipe/vsearch/create_parquet_dataset.py \
+        --dataset InSightDoc0352 \
+        --data_root /home/ywxzml3j/ywxzml3juser40/data/insight_doc/arxiv_0307_sample/qa_gen/postprocess/veqa_batch_0350_mveqa_batch_0352/dpi200_aug_noaug_maxp40 \
+        --split all \
+        --prompt vreasoner \
+        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_veqa_batch_0350_mveqa_batch_0352_maxp40-vreasoner_v2.parquet \
+        --agent_name vreasoner_v2 \
+        --num_workers 32 \
+        --extra_options "{\"manifest_file\": \"manifest.jsonl\"}" \
+        --test_size 0.2
 
     python verl/recipe/vsearch/create_parquet_dataset.py \
         --dataset InSightDoc0352 \

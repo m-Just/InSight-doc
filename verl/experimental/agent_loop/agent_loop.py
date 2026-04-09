@@ -16,6 +16,7 @@ import heapq
 import logging
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -127,6 +128,7 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+    conversation_wall_time: float = 0.0
     num_preempted: int = -1  # -1 means not available
 
 
@@ -381,9 +383,14 @@ class AgentLoopWorker:
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
             resolved_path = resolve_config_path(agent_loop_config_path)
-            agent_loop_configs = OmegaConf.load(resolved_path)
+            loaded_configs = OmegaConf.load(resolved_path)
+            agent_loop_configs = list(loaded_configs) if OmegaConf.is_list(loaded_configs) else [loaded_configs]
             for agent_loop_config in agent_loop_configs:
-                _agent_loop_registry[agent_loop_config.name] = agent_loop_config
+                detached_config = OmegaConf.create(
+                    OmegaConf.to_container(agent_loop_config, resolve=False)
+                )
+                agent_name = detached_config.pop("name")
+                _agent_loop_registry[agent_name] = detached_config
         if self.config.actor_rollout_ref.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
                 self.processor.chat_template = self.config.actor_rollout_ref.model.custom_chat_template
@@ -435,7 +442,8 @@ class AgentLoopWorker:
             temperature=config.temperature,
             top_k=config.top_k,
             top_p=config.top_p,
-            repetition_penalty=1.0,
+            repetition_penalty=config.repetition_penalty,
+            presence_penalty=config.presence_penalty,
             logprobs=(1 if config.calculate_log_probs else None),
         )
 
@@ -444,6 +452,8 @@ class AgentLoopWorker:
             sampling_params["temperature"] = config.val_kwargs.temperature
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["top_p"] = config.val_kwargs.top_p
+            sampling_params["repetition_penalty"] = config.val_kwargs.repetition_penalty
+            sampling_params["presence_penalty"] = config.val_kwargs.presence_penalty
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -535,6 +545,8 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, **kwargs) -> list[_InternalAgentLoopOutput]:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        if "extra_info" in kwargs and "extra_info" not in output.extra_fields:
+            output.extra_fields["extra_info"] = kwargs["extra_info"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -892,8 +904,17 @@ class AgentLoopManager:
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
 
+        t0 = time.perf_counter()
         self._initialize_llm_servers()
+        t1 = time.perf_counter()
         self._init_agent_loop_workers()
+        t2 = time.perf_counter()
+        print(
+            "AgentLoopManager phase timing: "
+            f"init_llm_servers={t1 - t0:.2f}s "
+            f"init_agent_loop_workers={t2 - t1:.2f}s "
+            f"total={t2 - t0:.2f}s"
+        )
 
         # Initially we're in sleep mode.
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
@@ -967,22 +988,40 @@ class AgentLoopManager:
 
         # Fix for Issue #4147: Always call wake_up() to ensure weight sync
         # The wake_up()/sleep() methods internally check free_cache_engine
+        t0 = time.perf_counter()
         self.wake_up()
+        t1 = time.perf_counter()
         if self.reward_model_manager:
             self.reward_model_manager.wake_up()
+        t2 = time.perf_counter()
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
+        t3 = time.perf_counter()
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        t4 = time.perf_counter()
         output = DataProto.concat(outputs)
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()
+        t5 = time.perf_counter()
         if self.reward_model_manager:
             self.reward_model_manager.sleep()
+        t6 = time.perf_counter()
+
+        print(
+            "AgentLoopManager.generate_sequences timing: "
+            f"wake_up={t1 - t0:.2f}s "
+            f"reward_wake_up={t2 - t1:.2f}s "
+            f"chunk={t3 - t2:.2f}s "
+            f"ray_get={t4 - t3:.2f}s "
+            f"concat={t5 - t4:.2f}s "
+            f"sleep={t6 - t5:.2f}s "
+            f"total={t6 - t0:.2f}s"
+        )
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
