@@ -88,6 +88,33 @@ def concat_multi_modal_inputs(mm_inputs: Sequence[dict], new_mm_inputs: Sequence
     return mm_inputs
 
 
+def _normalize_image_source_ref(image_value: Any) -> dict[str, Any] | None:
+    if isinstance(image_value, str):
+        if image_value.startswith("file://"):
+            return {
+                "source_type": "path",
+                "path": image_value[7:],
+                "uri": image_value,
+            }
+        if image_value.startswith(("http://", "https://")):
+            return {
+                "source_type": "url",
+                "url": image_value,
+            }
+        if image_value.startswith("data:image"):
+            return {
+                "source_type": "data_url",
+                "url": image_value,
+            }
+        return {
+            "source_type": "path",
+            "path": image_value,
+        }
+    if isinstance(image_value, Image.Image):
+        return None
+    return None
+
+
 def _setup_vsearch_fields(row_dict: dict[str, Any], patch_size: int, config: DictConfig, is_train: bool) -> None:
     """Create vsearch fields (image_ori, image_ori_wh, image_processed_wh) in extra_info.
 
@@ -118,6 +145,17 @@ def _setup_vsearch_fields(row_dict: dict[str, Any], patch_size: int, config: Dic
     # Filter for images only (exclude videos)
     image_elements = [info for info in vision_infos if "image" in info or "image_url" in info]
     assert len(image_elements) >= 1, f"expected at least 1 image element, got {len(image_elements)}"
+
+    if "original_image_refs" not in extra_info or extra_info["original_image_refs"] is None:
+        original_image_refs = []
+        for img_elem in image_elements:
+            if "image" in img_elem:
+                original_image_refs.append(_normalize_image_source_ref(img_elem["image"]))
+            elif "image_url" in img_elem:
+                image_url = img_elem["image_url"]
+                url = image_url.get("url") if isinstance(image_url, dict) else image_url
+                original_image_refs.append(_normalize_image_source_ref(url))
+        extra_info["original_image_refs"] = original_image_refs
 
     # Create image_ori by loading images without resize
     image_ori = [fetch_image_wo_resize(img) for img in image_elements]

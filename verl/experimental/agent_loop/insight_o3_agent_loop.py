@@ -31,6 +31,7 @@ from verl.utils.profiler import simple_timer
 from verl.utils.vsearch import BBox, parse_bbox, resize_bbox, extract_bbox_from_tool_call
 from verl.utils.vsearch_gpt_async import get_gpt_visual_search_request
 from verl.utils.vsearch_gpt_async_v2 import ToolResult, get_gpt_visual_search_request_v2
+from verl.utils.vreasoner_v2_conversation_export import build_export_record, export_conversation
 
 # Qwen3-VL uses relative coordinates in the range [0, 1000) for bounding boxes
 # This is different from Qwen2.5-VL which uses absolute pixel coordinates
@@ -59,6 +60,7 @@ class ExtraFields:
     messages: list[dict] | None = None
     multi_modal_data: dict[str, Any] | None = None
     failure_reasons: list[str] | None = None
+    conversation_export_json_path: str | None = None
 
 
 @dataclass
@@ -1134,6 +1136,10 @@ class VReasonerLoopV2(VReasonerLoop):
         self.zoom_reject_area_ratio = zoom_reject_area_ratio
         self.png_max_area = png_max_area
         self.enable_stop = enable_stop
+        self.conversation_export_dir = self.config.actor_rollout_ref.rollout.agent.get(
+            "vreasoner_v2_conversation_export_dir",
+            None,
+        )
 
     def _build_initial_presented_images(self, original_images: list[Image.Image]) -> list[PresentedImage]:
         presented_images: list[PresentedImage] = []
@@ -1206,8 +1212,21 @@ class VReasonerLoopV2(VReasonerLoop):
 
         original_images = kwargs["extra_info"]["image_ori"]
         presented_images = self._build_initial_presented_images(original_images)
+        presented_image_refs = [
+            {
+                "presented_img_idx": img_idx,
+                "kind": "initial",
+                "source_original_img_idx": presented.source_original_img_idx,
+                "bbox_on_original": list(presented.bbox_on_original),
+                "display_size": list(presented.display_size),
+                "original_size": list(original_images[presented.source_original_img_idx].size),
+                "initial_rescale": self.initial_rescale,
+            }
+            for img_idx, presented in enumerate(presented_images)
+        ]
         tool_result = None
         request = None
+        failure_events: list[dict[str, Any]] = []
 
         base_zoom_create_kwargs = kwargs["tools_kwargs"].get("image_zoom_in_tool", {}).get("create_kwargs", {})
         max_pixels = base_zoom_create_kwargs.get("max_pixels")
@@ -1227,6 +1246,15 @@ class VReasonerLoopV2(VReasonerLoop):
                     reasoning_effort=self.reasoning_effort,
                     tool_result=tool_result,
                     enable_stop=self.enable_stop,
+                )
+
+            if request.failure_reasons:
+                failure_events.append(
+                    {
+                        "kind": "assistant_generation_or_parsing",
+                        "request_success": request.success,
+                        "failure_reasons": list(request.failure_reasons),
+                    }
                 )
 
             if not request.success:
@@ -1252,6 +1280,14 @@ class VReasonerLoopV2(VReasonerLoop):
                     requested_img_idx=img_idx,
                     error_message=f"ERROR: Image {img_idx} is not available. Choose an img_idx from the currently visible images.",
                 )
+                failure_events.append(
+                    {
+                        "kind": "tool_execution",
+                        "status": "error",
+                        "requested_img_idx": img_idx,
+                        "error_message": tool_result.error_message,
+                    }
+                )
                 continue
             presented = presented_images[img_idx]
             source_original = original_images[presented.source_original_img_idx]
@@ -1273,6 +1309,14 @@ class VReasonerLoopV2(VReasonerLoop):
                         "is unlikely to reveal more detail. A more specific region may be needed."
                     ),
                 )
+                failure_events.append(
+                    {
+                        "kind": "tool_execution",
+                        "status": "error",
+                        "requested_img_idx": img_idx,
+                        "error_message": tool_result.error_message,
+                    }
+                )
                 continue
 
             if request.region_description is None:
@@ -1291,6 +1335,18 @@ class VReasonerLoopV2(VReasonerLoop):
                     status="success",
                     requested_img_idx=img_idx,
                     new_img_idx=new_img_idx,
+                )
+                new_presented = presented_images[new_img_idx]
+                presented_image_refs.append(
+                    {
+                        "presented_img_idx": new_img_idx,
+                        "kind": "full_image_zoom",
+                        "parent_presented_img_idx": img_idx,
+                        "source_original_img_idx": new_presented.source_original_img_idx,
+                        "bbox_on_original": list(new_presented.bbox_on_original),
+                        "display_size": list(new_presented.display_size),
+                        "zoom_in_factor": self.full_image_zoom_in_factor,
+                    }
                 )
                 continue
 
@@ -1389,6 +1445,15 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     requested_img_idx=img_idx,
                     error_message=error_message_due_to_vsearcher_failure,
                 )
+                failure_events.append(
+                    {
+                        "kind": "tool_execution",
+                        "status": "error",
+                        "requested_img_idx": img_idx,
+                        "error_message": tool_result.error_message,
+                        "region_description": request.region_description,
+                    }
+                )
                 continue
 
             if bbox == (0, 0, 0, 0):
@@ -1400,6 +1465,15 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                         "too vague, too broad, too specific, or mismatched to the visible content."
                     ),
                 )
+                failure_events.append(
+                    {
+                        "kind": "tool_execution",
+                        "status": "error",
+                        "requested_img_idx": img_idx,
+                        "error_message": tool_result.error_message,
+                        "region_description": request.region_description,
+                    }
+                )
                 continue
 
             bbox_on_presented = _resize_bbox_by_rounding(bbox, processed_presented_wh, presented.display_size)
@@ -1409,6 +1483,16 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     status="error",
                     requested_img_idx=img_idx,
                     error_message=error_message_due_to_vsearcher_failure,
+                )
+                failure_events.append(
+                    {
+                        "kind": "tool_execution",
+                        "status": "error",
+                        "requested_img_idx": img_idx,
+                        "error_message": tool_result.error_message,
+                        "region_description": request.region_description,
+                        "bbox_from_vsearcher": list(bbox),
+                    }
                 )
                 continue
 
@@ -1420,6 +1504,16 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     requested_img_idx=img_idx,
                     error_message=error_message_due_to_vsearcher_failure,
                 )
+                failure_events.append(
+                    {
+                        "kind": "tool_execution",
+                        "status": "error",
+                        "requested_img_idx": img_idx,
+                        "error_message": tool_result.error_message,
+                        "region_description": request.region_description,
+                        "bbox_from_vsearcher": list(bbox),
+                    }
+                )
                 continue
 
             bbox_on_original = _clamp_bbox_to_image(bbox_on_original, source_original.size)
@@ -1429,6 +1523,16 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     status="error",
                     requested_img_idx=img_idx,
                     error_message=error_message_due_to_vsearcher_failure,
+                )
+                failure_events.append(
+                    {
+                        "kind": "tool_execution",
+                        "status": "error",
+                        "requested_img_idx": img_idx,
+                        "error_message": tool_result.error_message,
+                        "region_description": request.region_description,
+                        "bbox_on_presented": list(bbox_on_presented),
+                    }
                 )
                 continue
 
@@ -1472,6 +1576,21 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                 status="success",
                 requested_img_idx=img_idx,
                 new_img_idx=new_img_idx,
+            )
+            new_presented = presented_images[new_img_idx]
+            presented_image_refs.append(
+                {
+                    "presented_img_idx": new_img_idx,
+                    "kind": "region_crop",
+                    "parent_presented_img_idx": img_idx,
+                    "source_original_img_idx": new_presented.source_original_img_idx,
+                    "bbox_on_original": list(new_presented.bbox_on_original),
+                    "display_size": list(new_presented.display_size),
+                    "zoom_in_factor": self.region_zoom_in_factor,
+                    "region_description": request.region_description,
+                    "bbox_on_presented": list(bbox_on_presented),
+                    "region_display_size_before_zoom": list(region_display_size),
+                }
             )
 
         logger.info(f"vreasoner_v2 loop completed: {profile=}")
@@ -1590,6 +1709,68 @@ To finish, bring everything together in a clear, synthesized answer that fully r
         response_ids_shortened = response_ids_shortened[-response_length:]
         response_mask_shortened = response_mask_shortened[-response_length:]
 
+        conversation_export_json_path = None
+        if self.conversation_export_dir:
+            try:
+                record = build_export_record(
+                    job_id=job_id,
+                    parent_job_id=kwargs.get("parent_job_id", None),
+                    root_job_id=root_job_id,
+                    validate=validate,
+                    initial_question=kwargs["extra_info"]["question"],
+                    messages_api=messages_api,
+                    raw_prompt=kwargs["raw_prompt"],
+                    original_images=original_images,
+                    presented_image_refs=presented_image_refs,
+                    request_params={
+                        "model": self.model,
+                        "temperature": 1.0,
+                        "gpt_image_max_area": self.gpt_image_max_area,
+                        "png_max_area": self.png_max_area,
+                        "image_detail": "high",
+                        "max_tool_calls": self.max_tool_calls,
+                        "max_completion_tokens": self.max_completion_tokens,
+                        "max_round_retries": self.max_round_retries if not validate else self.max_round_retries_val,
+                        "reasoning_effort": self.reasoning_effort,
+                        "enable_stop": self.enable_stop,
+                    },
+                    loop_params={
+                        "initial_rescale": self.initial_rescale,
+                        "full_image_zoom_in_factor": self.full_image_zoom_in_factor,
+                        "region_zoom_in_factor": self.region_zoom_in_factor,
+                        "zoom_reject_area_ratio": self.zoom_reject_area_ratio,
+                        "png_max_area": self.png_max_area,
+                        "model": self.model,
+                        "max_tool_calls": self.max_tool_calls,
+                        "max_round_retries": self.max_round_retries,
+                        "max_round_retries_val": self.max_round_retries_val,
+                        "gpt_image_max_area": self.gpt_image_max_area,
+                        "max_completion_tokens": self.max_completion_tokens,
+                        "reasoning_effort": self.reasoning_effort,
+                        "multi_image_input": self.multi_image_input,
+                    },
+                    sampling_params=dict(sampling_params),
+                    tools_kwargs=kwargs["tools_kwargs"],
+                    extra_info=kwargs["extra_info"],
+                    failure_events=failure_events,
+                    critical_failure=critical_failure,
+                    final_failure_reasons=(request.failure_reasons if request is not None and request.failure_reasons else None),
+                )
+                conversation_export_json_path = export_conversation(
+                    self.conversation_export_dir,
+                    record,
+                    job_id=job_id,
+                )
+            except Exception as exc:
+                logger.warning("failed to export vreasoner_v2 conversation for %s: %s", job_id, exc)
+                failure_events.append(
+                    {
+                        "kind": "conversation_export",
+                        "status": "error",
+                        "error_message": str(exc),
+                    }
+                )
+
         extra_fields = ExtraFields(
             agent_name='vreasoner_v2',
             job_id=job_id,
@@ -1601,6 +1782,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
             messages=messages,
             multi_modal_data=multi_modal_data,
             failure_reasons=(request.failure_reasons if request is not None and request.failure_reasons else None),
+            conversation_export_json_path=conversation_export_json_path,
         )
 
         extra_fields = asdict(extra_fields)

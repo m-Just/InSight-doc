@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-
+from typing import Optional
 from omegaconf import MISSING
 
 from verl.workers.config import AgentLoopConfig, FSDPActorConfig
@@ -13,6 +13,7 @@ __all__ = [
 @dataclass
 class VSearchAgentLoopConfig(AgentLoopConfig):
     vsearcher_loop_cls: str = MISSING
+    vreasoner_v2_conversation_export_dir: Optional[str] = None
 
 
 @dataclass

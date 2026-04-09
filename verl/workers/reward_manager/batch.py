@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from verl import DataProto
+from verl.utils.vreasoner_v2_conversation_export import append_reward_info
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager, RawRewardFn
 
@@ -111,6 +112,7 @@ class BatchRewardManager(AbstractRewardManager):
             length = valid_response_lengths[i].item()
             score = scores[i]
             extracted_answer = None
+            score_for_export = score.copy() if isinstance(score, dict) else {"score": score}
 
             if isinstance(score, dict):
                 if "extracted_answer" in score:
@@ -125,6 +127,25 @@ class BatchRewardManager(AbstractRewardManager):
             reward_tensor[i, length - 1] = reward
 
             data_source = data_sources[i]
+            export_path = None
+            if "conversation_export_json_path" in data.non_tensor_batch:
+                export_path = data.non_tensor_batch["conversation_export_json_path"][i]
+            if export_path:
+                reward_payload = {
+                    "reward": reward,
+                    "score": score_for_export,
+                    "data_source": data_source,
+                    "ground_truth": data[i].non_tensor_batch["reward_model"].get("ground_truth", None),
+                    "agent_name": data.non_tensor_batch["agent_name"][i] if "agent_name" in data.non_tensor_batch else None,
+                    "failure_reasons": data.non_tensor_batch["failure_reasons"][i] if "failure_reasons" in data.non_tensor_batch else None,
+                }
+                if extracted_answer is not None:
+                    reward_payload["extracted_answer"] = extracted_answer
+                try:
+                    append_reward_info(str(export_path), reward_payload)
+                except Exception as exc:
+                    print(f"[conversation_export_update_failed] path={export_path} error={exc}")
+
             if already_printed.get(data_source, 0) < self.num_examine:
                 response_str = self.tokenizer.decode(data.batch["responses"][i][:length], skip_special_tokens=True)
                 prompt_str = self.tokenizer.decode(data.batch["prompts"][i], skip_special_tokens=True)
