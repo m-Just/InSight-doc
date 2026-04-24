@@ -62,6 +62,7 @@ import hashlib
 import io
 import json
 import os
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -131,17 +132,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", required=True, help="Directory containing exported conversation JSON files.")
     parser.add_argument("--output-dir", required=True, help="Directory to write train.parquet and val.parquet.")
     parser.add_argument("--val-ratio", type=float, default=0.02, help="Fraction of rows to put into validation.")
+    parser.add_argument(
+        "--output-parquet-name",
+        type=str,
+        default=None,
+        help=(
+            "Override the default output parquet filename. "
+            "When specified, --val-ratio must be 0 and only a single parquet is written."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="Shuffle seed for train/val split.")
     parser.add_argument(
         "--system-prompt-mode",
         choices=["exported", "vsearcher_qwen3_vl"],
-        default="exported",
+        default="vsearcher_qwen3_vl",
         help="Which system prompt to place into converted rows.",
     )
     parser.add_argument(
         "--assistant-format-mode",
         choices=["tagged", "plain"],
-        default="tagged",
+        default="plain",
         help="Whether assistant reasoning/answers keep <think>/<answer> tags or are written as plain text.",
     )
     parser.add_argument(
@@ -155,7 +165,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-storage-mode",
         choices=["bytes", "path"],
-        default="bytes",
+        default="path",
         help="Store images inline as bytes or on disk as file URIs in an output-dir image cache.",
     )
     parser.add_argument(
@@ -163,6 +173,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of worker processes for per-conversation conversion.",
+    )
+    parser.add_argument(
+        "--only-correct-answers",
+        action="store_true",
+        help="Keep only exported conversations whose accuracy_reward is exactly 1.0.",
     )
     return parser.parse_args()
 
@@ -209,7 +224,7 @@ def build_assistant_content(content: dict[str, Any], message_type: str, assistan
         answer = normalize_text(content.get("answer", ""))
         if assistant_format_mode == "plain":
             if think and answer:
-                return f"{think}\n{answer}"
+                return f"{think}\n\n{answer}"
             return think or answer
         return f"<think>{think}</think>\n<answer>{answer}</answer>"
     if think:
@@ -245,6 +260,17 @@ def scale_bbox_to_qwen_range(bbox: list[int] | tuple[int, int, int, int], size: 
     ]
     scaled = [max(0, min(1000, value)) for value in scaled]
     return scaled
+
+
+def bbox_within_tolerance(
+    actual_bbox: list[int] | tuple[int, int, int, int],
+    expected_bbox: list[int] | tuple[int, int, int, int],
+    *,
+    tolerance: int = 1,
+) -> bool:
+    if len(actual_bbox) != 4 or len(expected_bbox) != 4:
+        return False
+    return all(abs(int(a) - int(b)) <= tolerance for a, b in zip(actual_bbox, expected_bbox, strict=True))
 
 
 def append_text(text_parts: list[str], new_text: str) -> None:
@@ -371,10 +397,40 @@ def convert_exact_tool_call(
     if not isinstance(payload, dict):
         raise DropConversationError("assistant tool_call payload is not parsed JSON")
 
+    qwen_arguments_from_export: dict[str, Any] | None = None
     region_description = payload.get("region_description")
     img_idx = payload.get("img_idx")
-    if not isinstance(region_description, str) or not isinstance(img_idx, int):
-        raise DropConversationError("assistant tool_call does not have exact VReasonerLoopV2 arguments")
+    if isinstance(region_description, str) and isinstance(img_idx, int):
+        pass
+    else:
+        tool_name = payload.get("name")
+        arguments = payload.get("arguments")
+        if tool_name != "image_zoom_in_tool":
+            raise DropConversationError("assistant tool_call is not image_zoom_in_tool")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise DropConversationError(f"assistant tool_call arguments are not valid JSON: {exc}") from exc
+        if not isinstance(arguments, dict):
+            raise DropConversationError("assistant tool_call arguments are not a dict")
+
+        region_description = arguments.get("label")
+        img_idx = arguments.get("img_idx")
+        bbox_2d = arguments.get("bbox_2d")
+        if (
+            not isinstance(region_description, str)
+            or not isinstance(img_idx, int)
+            or not isinstance(bbox_2d, list)
+            or len(bbox_2d) != 4
+            or not all(isinstance(v, (int, float)) for v in bbox_2d)
+        ):
+            raise DropConversationError("assistant tool_call does not have exact Qwen-style arguments")
+        qwen_arguments_from_export = {
+            "img_idx": img_idx,
+            "label": region_description,
+            "bbox_2d": [int(round(v)) for v in bbox_2d],
+        }
 
     result_content = tool_result_message.get("content", {})
     presented_img_indices = result_content.get("presented_img_indices")
@@ -412,6 +468,21 @@ def convert_exact_tool_call(
         "label": region_description,
         "bbox_2d": scale_bbox_to_qwen_range(bbox_on_presented, parent_display_size),
     }
+    if (
+        qwen_arguments_from_export is not None
+        and (
+            qwen_arguments_from_export.get("img_idx") != qwen_arguments["img_idx"]
+            or qwen_arguments_from_export.get("label") != qwen_arguments["label"]
+            or not bbox_within_tolerance(
+                qwen_arguments_from_export.get("bbox_2d", []),
+                qwen_arguments["bbox_2d"],
+                tolerance=1,
+            )
+        )
+    ):
+        raise DropConversationError(
+            "assistant tool_call Qwen-style arguments do not exactly match exported region_crop metadata"
+        )
     return {
         "role": "assistant",
         "content": build_assistant_content(content, "tool_call", assistant_format_mode),
@@ -546,8 +617,24 @@ def convert_one_path(
     assistant_format_mode: str,
     image_storage_mode: str,
     image_cache_dir: Path | None,
-) -> tuple[str, dict[str, Any] | None, str | None]:
+    only_correct_answers: bool,
+) -> tuple[str, dict[str, Any] | None, str | None, str | None]:
     record = load_exported_conversation(str(path))
+    extra_info = record.get("extra_info")
+    question_id = None
+    if isinstance(extra_info, dict) and extra_info.get("question_id") is not None:
+        question_id = str(extra_info["question_id"])
+    if only_correct_answers:
+        reward = record.get("reward")
+        accuracy_reward = None
+        if isinstance(reward, dict):
+            score = reward.get("score")
+            if isinstance(score, dict) and score.get("accuracy_reward") is not None:
+                accuracy_reward = float(score["accuracy_reward"])
+            elif reward.get("accuracy_reward") is not None:
+                accuracy_reward = float(reward["accuracy_reward"])
+        if accuracy_reward != 1.0:
+            return path.name, None, f"filtered out by only-correct-answers (accuracy_reward={accuracy_reward})", question_id
     try:
         converted = convert_record(
             record,
@@ -558,14 +645,14 @@ def convert_one_path(
             image_cache_dir=image_cache_dir,
         )
     except DropConversationError as exc:
-        return path.name, None, str(exc)
+        return path.name, None, str(exc), question_id
     except Exception as exc:
         raise RuntimeError(f"Failed to convert {path}") from exc
-    return path.name, converted, None
+    return path.name, converted, None, question_id
 
 
-def _convert_one_path_star(args: tuple[Path, bool, str, str, str, Path | None]) -> tuple[str, dict[str, Any] | None, str | None]:
-    path, stitch_runtime_hints, system_prompt_mode, assistant_format_mode, image_storage_mode, image_cache_dir = args
+def _convert_one_path_star(args: tuple[Path, bool, str, str, str, Path | None, bool]) -> tuple[str, dict[str, Any] | None, str | None, str | None]:
+    path, stitch_runtime_hints, system_prompt_mode, assistant_format_mode, image_storage_mode, image_cache_dir, only_correct_answers = args
     return convert_one_path(
         path,
         stitch_runtime_hints=stitch_runtime_hints,
@@ -573,6 +660,7 @@ def _convert_one_path_star(args: tuple[Path, bool, str, str, str, Path | None]) 
         assistant_format_mode=assistant_format_mode,
         image_storage_mode=image_storage_mode,
         image_cache_dir=image_cache_dir,
+        only_correct_answers=only_correct_answers,
     )
 
 
@@ -584,39 +672,55 @@ def load_records(
     image_storage_mode: str,
     image_cache_dir: Path | None,
     num_workers: int,
-) -> list[dict[str, Any]]:
+    only_correct_answers: bool,
+) -> tuple[list[dict[str, Any]], int, Counter[str], list[str]]:
     records: list[dict[str, Any]] = []
     paths = sorted(input_dir.glob("*.json"))
+    warning_counts: Counter[str] = Counter()
+    wrong_question_ids: list[str] = []
     if num_workers <= 1:
         for path in paths:
-            path_name, converted, warning = convert_one_path(
+            _, converted, warning, question_id = convert_one_path(
                 path,
                 stitch_runtime_hints=stitch_runtime_hints,
                 system_prompt_mode=system_prompt_mode,
                 assistant_format_mode=assistant_format_mode,
                 image_storage_mode=image_storage_mode,
                 image_cache_dir=image_cache_dir,
+                only_correct_answers=only_correct_answers,
             )
             if warning is not None:
-                print(f"Warning: dropping {path_name}: {warning}")
+                warning_counts[warning] += 1
+                if only_correct_answers and question_id is not None and warning.startswith("filtered out by only-correct-answers"):
+                    wrong_question_ids.append(question_id)
                 continue
             assert converted is not None
             records.append(converted)
     else:
         tasks = [
-            (path, stitch_runtime_hints, system_prompt_mode, assistant_format_mode, image_storage_mode, image_cache_dir)
+            (
+                path,
+                stitch_runtime_hints,
+                system_prompt_mode,
+                assistant_format_mode,
+                image_storage_mode,
+                image_cache_dir,
+                only_correct_answers,
+            )
             for path in paths
         ]
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for path_name, converted, warning in executor.map(_convert_one_path_star, tasks, chunksize=8):
+            for _, converted, warning, question_id in executor.map(_convert_one_path_star, tasks, chunksize=8):
                 if warning is not None:
-                    print(f"Warning: dropping {path_name}: {warning}")
+                    warning_counts[warning] += 1
+                    if only_correct_answers and question_id is not None and warning.startswith("filtered out by only-correct-answers"):
+                        wrong_question_ids.append(question_id)
                     continue
                 assert converted is not None
                 records.append(converted)
     if not records:
-        raise ValueError(f"No JSON files found in {input_dir}")
-    return records
+        raise ValueError(f"No convertible records produced from JSON files in {input_dir}")
+    return records, len(paths), warning_counts, wrong_question_ids
 
 
 def split_dataframe(df: pd.DataFrame, val_ratio: float) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -637,7 +741,10 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     image_cache_dir = output_dir / "images" if args.image_storage_mode == "path" else None
 
-    rows = load_records(
+    if args.output_parquet_name is not None and args.val_ratio != 0:
+        raise ValueError("--val-ratio must be 0 when --output-parquet-name is specified")
+
+    rows, total_jsons, warning_counts, wrong_question_ids = load_records(
         input_dir,
         stitch_runtime_hints=args.stitch_runtime_hints,
         system_prompt_mode=args.system_prompt_mode,
@@ -645,8 +752,33 @@ def main() -> None:
         image_storage_mode=args.image_storage_mode,
         image_cache_dir=image_cache_dir,
         num_workers=args.num_workers,
+        only_correct_answers=args.only_correct_answers,
     )
     df = pd.DataFrame(rows).sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+
+    dropped = total_jsons - len(df)
+    print(f"Scanned {total_jsons} JSON files")
+    print(f"Kept {len(df)} convertible conversations")
+    print(f"Dropped or filtered {dropped} conversations")
+    if warning_counts:
+        print("Skip reason summary:")
+        for reason, count in warning_counts.most_common():
+            print(f"  {count}\t{reason}")
+    if args.only_correct_answers:
+        wrong_question_ids_path = output_dir / "wrong_question_ids.txt"
+        unique_wrong_question_ids = sorted(set(wrong_question_ids))
+        wrong_question_ids_path.write_text(
+            "".join(f"{question_id}\n" for question_id in unique_wrong_question_ids),
+            encoding="utf-8",
+        )
+        print(f"Wrote {len(unique_wrong_question_ids)} wrong-answer question_ids to {wrong_question_ids_path}")
+
+    if args.output_parquet_name is not None:
+        output_path = output_dir / args.output_parquet_name
+        df.to_parquet(output_path)
+        print(f"Wrote {len(df)} rows to {output_path}")
+        return
+
     train_df, val_df = split_dataframe(df, args.val_ratio)
 
     train_path = output_dir / "train.parquet"

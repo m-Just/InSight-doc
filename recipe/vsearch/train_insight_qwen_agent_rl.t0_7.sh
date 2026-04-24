@@ -52,4 +52,5 @@ run_experiment \
     actor_rollout_ref.rollout.presence_penalty=1.5 \
     algorithm.subagent_advantage_estimator=null \
     trainer.test_freq=15 \
+    trainer.total_training_steps=500 \
     "$@"

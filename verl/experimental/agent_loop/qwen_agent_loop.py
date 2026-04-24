@@ -13,7 +13,6 @@ import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -33,12 +32,27 @@ from verl.experimental.agent_loop.agent_loop import (
     AsyncLLMServerManager,
     DictConfigWrap,
     register,
+    resolve_dynamic_initial_rescale,
+)
+from verl.experimental.agent_loop.presented_images import (
+    PresentedImageState,
+    cap_size_by_area as _cap_size_by_area,
+    clamp_bbox_to_image as _clamp_bbox_to_image,
+    presented_image_to_export_ref as _presented_image_to_export_ref,
+    resize_dims_by_factor as _resize_dims_by_factor,
+    scale_bbox_from_qwen_range as _scale_bbox_from_qwen_range,
+    translate_bbox_to_original as _translate_bbox_to_original,
 )
 from verl.experimental.agent_loop.tool_agent_loop import AgentState, AgentData
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
-from verl.utils.vreasoner_v2_conversation_export import build_export_record, export_conversation
+from verl.utils.vreasoner_v2_conversation_export import (
+    build_export_record,
+    export_conversation,
+    parse_assistant_message,
+    parse_user_message,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -49,21 +63,6 @@ TOOL_NAME_ALIASES = {
 
 QWEN_IMAGE_MAX_ASPECT_RATIO = 200.0
 IMAGE_LABEL_RE = re.compile(r"^Image (\d+):$")
-
-
-def _resize_dims_by_factor(size: tuple[int, int], factor: float) -> tuple[int, int]:
-    width, height = size
-    return (max(1, round(width * factor)), max(1, round(height * factor)))
-
-
-def _cap_size_by_area(size: tuple[int, int], max_area: int) -> tuple[int, int]:
-    width, height = size
-    area = width * height
-    if area <= max_area or max_area <= 0:
-        return size
-    ratio = (max_area / float(area)) ** 0.5
-    return (max(1, int(width * ratio)), max(1, int(height * ratio)))
-
 
 def _image_aspect_ratio(size: tuple[int, int]) -> float:
     width, height = size
@@ -139,158 +138,152 @@ def _message_text_content(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def _build_vreasoner_style_export_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    exported_messages: list[dict[str, Any]] = []
-    next_presented_idx = 0
+def _strip_wrapped_tag(text: str, tag: str) -> str:
+    pattern = rf"<{tag}>.*?</{tag}>"
+    return re.sub(pattern, "", text, flags=re.DOTALL).strip()
 
-    for message in messages:
+
+def _text_before_tag(text: str, tag: str) -> str:
+    marker = f"<{tag}>"
+    if marker not in text:
+        return text.strip()
+    return text.split(marker, 1)[0].strip()
+
+
+def _convert_export_multimodal_content(
+    content: Any,
+    *,
+    next_presented_idx: int,
+) -> tuple[Any, int]:
+    if not isinstance(content, list):
+        return _message_text_content(content), next_presented_idx
+
+    converted_content: list[dict[str, Any]] = []
+    pending_presented_idx: int | None = None
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text", "")
+            converted_content.append({"type": "text", "text": text})
+            match = IMAGE_LABEL_RE.match(text.strip())
+            if match:
+                pending_presented_idx = int(match.group(1))
+            continue
+
+        if item_type == "image":
+            presented_idx = pending_presented_idx if pending_presented_idx is not None else next_presented_idx
+            converted_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"presented://{presented_idx}",
+                        "detail": "high",
+                    },
+                }
+            )
+            next_presented_idx = max(next_presented_idx, presented_idx + 1)
+            pending_presented_idx = None
+            continue
+
+        if "text" in item and isinstance(item["text"], str):
+            converted_content.append({"type": "text", "text": item["text"]})
+
+    return converted_content, next_presented_idx
+
+
+def _build_insight_export_conversation(
+    messages: list[dict[str, Any]],
+    *,
+    initial_question: str,
+) -> list[dict[str, Any]]:
+    conversation: list[dict[str, Any]] = []
+    next_presented_idx = 0
+    last_assistant_idx = max((idx for idx, message in enumerate(messages) if message.get("role") == "assistant"), default=-1)
+
+    for idx, message in enumerate(messages):
         role = message.get("role")
         content = message.get("content")
 
         if role == "system":
-            exported_messages.append({"role": "system", "content": _message_text_content(content)})
+            conversation.append(
+                {
+                    "message_idx": idx,
+                    "role": "system",
+                    "type": "system_prompt",
+                    "content": {"text": _message_text_content(content)},
+                }
+            )
             continue
 
         if role == "assistant":
-            exported_messages.append({"role": "assistant", "content": _message_text_content(content)})
+            text = _message_text_content(content)
+            parsed = parse_assistant_message(text)
+            extracted_tags = parsed.get("content", {}).get("extracted_tags", {})
+            parsed_tool_call = extracted_tags.get("tool_call")
+            if parsed.get("type") == "others" and parsed_tool_call is not None:
+                tool_call_parse_error = parsed.get("tool_call_parse_error")
+                parsed = {
+                    "type": "tool_call",
+                    "content": {
+                        "think": _text_before_tag(text, "tool_call"),
+                        "tool_call": parsed_tool_call,
+                    },
+                    "tag_counts": parsed.get("tag_counts", {}),
+                }
+                if tool_call_parse_error is not None:
+                    parsed["tool_call_parse_error"] = tool_call_parse_error
+            elif parsed.get("type") == "others" and idx == last_assistant_idx and text.strip():
+                parsed = {
+                    "type": "answer",
+                    "content": {
+                        "think": "",
+                        "answer": text.strip(),
+                    },
+                    "tag_counts": parsed.get("tag_counts", {}),
+                }
+            conversation.append({"message_idx": idx, "role": "assistant", **parsed})
             continue
 
-        if role in ("user", "tool"):
-            if not isinstance(content, list):
-                exported_messages.append({"role": "user", "content": _message_text_content(content)})
-                continue
-
-            converted_content: list[dict[str, Any]] = []
-            pending_presented_idx: int | None = None
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-
-                item_type = item.get("type")
-                if item_type == "text":
-                    text = item.get("text", "")
-                    converted_content.append({"type": "text", "text": text})
-                    match = IMAGE_LABEL_RE.match(text.strip())
-                    if match:
-                        pending_presented_idx = int(match.group(1))
-                    continue
-
-                if item_type == "image":
-                    presented_idx = pending_presented_idx if pending_presented_idx is not None else next_presented_idx
-                    converted_content.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"presented://{presented_idx}",
-                                "detail": "high",
-                            },
-                        }
-                    )
-                    next_presented_idx = max(next_presented_idx, presented_idx + 1)
-                    pending_presented_idx = None
-                    continue
-
-                if "text" in item and isinstance(item["text"], str):
-                    converted_content.append({"type": "text", "text": item["text"]})
-
-            exported_messages.append({"role": "user", "content": converted_content})
+        if role == "user":
+            converted_content, next_presented_idx = _convert_export_multimodal_content(
+                content,
+                next_presented_idx=next_presented_idx,
+            )
+            parsed = parse_user_message(converted_content, initial_question=initial_question)
+            conversation.append({"message_idx": idx, "role": "user", **parsed})
             continue
 
-        exported_messages.append({"role": role, "content": _message_text_content(content)})
+        if role == "tool":
+            converted_content, next_presented_idx = _convert_export_multimodal_content(
+                content,
+                next_presented_idx=next_presented_idx,
+            )
+            parsed = parse_user_message(converted_content, initial_question=initial_question)
+            if parsed.get("type") == "others":
+                text = parsed.get("content", {}).get("text", "").strip()
+                parsed = {
+                    "type": "tool_result_fail_hint",
+                    "content": {
+                        "error_message": text,
+                        "hint": "",
+                    },
+                }
+            conversation.append({"message_idx": idx, "role": "user", **parsed})
+            continue
 
-    return exported_messages
+        conversation.append(
+            {
+                "message_idx": idx,
+                "role": role,
+                "type": "others",
+                "content": {"value": _message_text_content(content)},
+            }
+        )
 
-
-@dataclass
-class PresentedImageState:
-    image: Image.Image
-    source_original_img_idx: int
-    bbox_on_original: tuple[int, int, int, int]
-    display_size: tuple[int, int]
-
-
-def _presented_image_to_export_ref(
-    presented_img_idx: int,
-    presented: PresentedImageState,
-    *,
-    kind: str,
-    original_images: list[Image.Image],
-    parent_presented_img_idx: int | None = None,
-    region_description: str | None = None,
-    bbox_on_presented: tuple[int, int, int, int] | None = None,
-) -> dict[str, Any]:
-    ref = {
-        "presented_img_idx": presented_img_idx,
-        "kind": kind,
-        "source_original_img_idx": presented.source_original_img_idx,
-        "bbox_on_original": list(presented.bbox_on_original),
-        "display_size": list(presented.display_size),
-        "original_size": list(original_images[presented.source_original_img_idx].size),
-    }
-    if parent_presented_img_idx is not None:
-        ref["parent_presented_img_idx"] = parent_presented_img_idx
-    if region_description is not None:
-        ref["region_description"] = region_description
-    if bbox_on_presented is not None:
-        ref["bbox_on_presented"] = list(bbox_on_presented)
-    return ref
-
-
-def _clamp_bbox_to_image(
-    bbox: tuple[int, int, int, int],
-    image_size: tuple[int, int],
-) -> tuple[int, int, int, int] | None:
-    x1, y1, x2, y2 = bbox
-    width, height = image_size
-    x1 = max(0, min(width, x1))
-    x2 = max(0, min(width, x2))
-    y1 = max(0, min(height, y1))
-    y2 = max(0, min(height, y2))
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return (x1, y1, x2, y2)
-
-
-def _scale_bbox_from_qwen_range(
-    bbox_2d: list[float] | tuple[float, float, float, float],
-    display_size: tuple[int, int],
-) -> tuple[int, int, int, int] | None:
-    width, height = display_size
-    if width <= 0 or height <= 0:
-        return None
-    try:
-        x1, y1, x2, y2 = [float(v) for v in bbox_2d]
-    except Exception:
-        return None
-    bbox = (
-        round(x1 * width / 1000.0),
-        round(y1 * height / 1000.0),
-        round(x2 * width / 1000.0),
-        round(y2 * height / 1000.0),
-    )
-    return _clamp_bbox_to_image(bbox, display_size)
-
-
-def _translate_bbox_to_original(
-    parent: PresentedImageState,
-    bbox_on_presented: tuple[int, int, int, int],
-) -> tuple[int, int, int, int] | None:
-    presented_w, presented_h = parent.display_size
-    if presented_w <= 0 or presented_h <= 0:
-        return None
-    original_x1, original_y1, original_x2, original_y2 = parent.bbox_on_original
-    original_w = original_x2 - original_x1
-    original_h = original_y2 - original_y1
-    if original_w <= 0 or original_h <= 0:
-        return None
-    x1, y1, x2, y2 = bbox_on_presented
-    return (
-        original_x1 + round(x1 * original_w / presented_w),
-        original_y1 + round(y1 * original_h / presented_h),
-        original_x1 + round(x2 * original_w / presented_w),
-        original_y1 + round(y2 * original_h / presented_h),
-    )
-
+    return conversation
 
 @register("qwen_agent")
 class QwenAgentLoop(AgentLoopBase):
@@ -822,8 +815,9 @@ class InSightQwenAgentLoop(QwenAgentLoop):
     - successful tool results are emitted as indexed image observations like "Image N:"
     """
 
-    DEFAULT_PRESENTED_INITIAL_RESCALE = 0.25
-    DEFAULT_PRESENTED_MAX_AREA = 1280 * 1280
+    DEFAULT_INITIAL_RESCALE = 0.25
+    DEFAULT_GPT_IMAGE_MAX_AREA = 1280 * 1280
+    DEFAULT_INITIAL_INPUT_PIXELS_LOWER_BOUND = 0
     DEFAULT_REGION_ZOOM_IN_FACTOR = 4.0
 
     def __init__(
@@ -832,22 +826,44 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         server_manager: AsyncLLMServerManager,
         tokenizer: AutoTokenizer,
         processor: AutoProcessor,
-        presented_initial_rescale: float = DEFAULT_PRESENTED_INITIAL_RESCALE,
-        presented_max_area: int = DEFAULT_PRESENTED_MAX_AREA,
+        initial_rescale: float = DEFAULT_INITIAL_RESCALE,
+        gpt_image_max_area: int = DEFAULT_GPT_IMAGE_MAX_AREA,
+        initial_input_pixels_lower_bound: int = DEFAULT_INITIAL_INPUT_PIXELS_LOWER_BOUND,
         region_zoom_in_factor: float = DEFAULT_REGION_ZOOM_IN_FACTOR,
         **kwargs,
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, **kwargs)
-        self.presented_initial_rescale = presented_initial_rescale
-        self.presented_max_area = presented_max_area
+        # Backward-compatible aliases for older configs and scripts.
+        if "presented_initial_rescale" in kwargs:
+            initial_rescale = kwargs.pop("presented_initial_rescale")
+        if "presented_max_area" in kwargs:
+            gpt_image_max_area = kwargs.pop("presented_max_area")
+        if "presented_initial_pixels_lower_bound" in kwargs:
+            initial_input_pixels_lower_bound = kwargs.pop("presented_initial_pixels_lower_bound")
+
+        if initial_input_pixels_lower_bound < 0:
+            raise ValueError(
+                f"initial_input_pixels_lower_bound must be non-negative, got {initial_input_pixels_lower_bound}"
+            )
+        self.initial_rescale = initial_rescale
+        self.gpt_image_max_area = gpt_image_max_area
+        self.initial_input_pixels_lower_bound = initial_input_pixels_lower_bound
         self.region_zoom_in_factor = region_zoom_in_factor
+        # Keep alias attrs so older code paths continue to work.
+        self.presented_initial_rescale = self.initial_rescale
+        self.presented_max_area = self.gpt_image_max_area
+        self.presented_initial_pixels_lower_bound = self.initial_input_pixels_lower_bound
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         conversation_wall_time_start = time.perf_counter()
         messages = copy.deepcopy(list(kwargs["raw_prompt"]))
-        aligned_prompt, original_images, presented_images = self._build_presented_prompt(
+        # Smoke-test compatibility only:
+        # some synthetic inference inputs are reconstructed from converted SFT rows whose images are already
+        # in the presented form expected by InSightQwenAgentLoop. Normal eval/training flow should leave this
+        # unset so the loop can build presented images from the raw prompt images itself.
+        aligned_prompt, original_images, presented_images, actual_initial_rescale = self._build_presented_prompt(
             messages,
-            images_are_presented=bool(kwargs.get("insight_images_are_presented", False)),
+            images_are_presented=bool(kwargs.get("initial_images_already_presented", False)),
         )
 
         multi_modal_data = await self.process_vision_info(aligned_prompt)
@@ -873,17 +889,20 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         extra_info["agent_name"] = "insight_qwen_agent"
         agent_data.extra_fields["agent_name"] = "insight_qwen_agent"
         agent_data.extra_fields["extra_info"] = extra_info
+        agent_data.extra_fields["export_failure_events"] = []
         agent_data.extra_fields["insight_original_images"] = original_images
         agent_data.extra_fields["insight_presented_images"] = presented_images
-        agent_data.extra_fields["insight_presented_image_refs"] = [
-            _presented_image_to_export_ref(
-                presented_img_idx,
-                presented,
-                kind="initial",
-                original_images=original_images,
-            )
-            for presented_img_idx, presented in enumerate(presented_images)
-        ]
+        if self.conversation_export_dir:
+            agent_data.extra_fields["insight_presented_image_refs"] = [
+                _presented_image_to_export_ref(
+                    presented_img_idx,
+                    presented,
+                    kind="initial",
+                    original_images=original_images,
+                    initial_rescale=actual_initial_rescale,
+                )
+                for presented_img_idx, presented in enumerate(presented_images)
+            ]
 
         state = AgentState.PENDING
         while state != AgentState.TERMINATED:
@@ -905,9 +924,6 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         prompt_ids = agent_data.prompt_ids[:len(agent_data.prompt_ids) - len(agent_data.response_mask)]
         if len(response_ids) > self.response_length or len(agent_data.response_mask) > self.response_length:
             agent_data.extra_fields["response_truncated"] = True
-        viz_messages, viz_multi_modal_data = _build_visualization_messages(agent_data.messages)
-        agent_data.extra_fields["messages"] = viz_messages
-        agent_data.extra_fields["multi_modal_data"] = viz_multi_modal_data
 
         conversation_export_json_path = None
         if self.conversation_export_dir:
@@ -918,7 +934,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                     root_job_id=kwargs.get("root_job_id", request_id),
                     validate=bool(kwargs.get("_validate", False)),
                     initial_question=kwargs["extra_info"]["question"],
-                    messages_api=_build_vreasoner_style_export_messages(agent_data.messages),
+                    messages_api=[],
                     raw_prompt=kwargs["raw_prompt"],
                     original_images=original_images,
                     presented_image_refs=agent_data.extra_fields.get("insight_presented_image_refs", []),
@@ -931,19 +947,25 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                         "max_parallel_calls": self.max_parallel_calls,
                     },
                     loop_params={
-                        "presented_initial_rescale": self.presented_initial_rescale,
-                        "presented_max_area": self.presented_max_area,
+                        "initial_rescale": actual_initial_rescale,
+                        "configured_initial_rescale": self.initial_rescale,
+                        "initial_input_pixels_lower_bound": self.initial_input_pixels_lower_bound,
+                        "gpt_image_max_area": self.gpt_image_max_area,
                         "region_zoom_in_factor": self.region_zoom_in_factor,
                         "agent_name": "insight_qwen_agent",
                     },
                     sampling_params=dict(sampling_params),
                     tools_kwargs=kwargs["tools_kwargs"],
-                    extra_info=kwargs["extra_info"],
-                    failure_events=[],
-                    critical_failure=False,
+                    extra_info=extra_info,
+                    failure_events=agent_data.extra_fields.get("export_failure_events", []),
+                    critical_failure=bool(agent_data.extra_fields.get("failure_reasons")),
                     final_failure_reasons=agent_data.extra_fields.get("failure_reasons"),
                 )
                 record["agent_name"] = "insight_qwen_agent"
+                record["conversation"] = _build_insight_export_conversation(
+                    agent_data.messages,
+                    initial_question=kwargs["extra_info"]["question"],
+                )
                 conversation_export_json_path = export_conversation(
                     self.conversation_export_dir,
                     record,
@@ -955,6 +977,14 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         if conversation_export_json_path:
             agent_data.extra_fields["conversation_export_json_path"] = conversation_export_json_path
             agent_data.extra_fields["extra_info"]["conversation_export_json_path"] = conversation_export_json_path
+
+        # These fields are only needed while the loop is still running. Keeping them in the
+        # returned DataProto multiplies CPU memory use across repeated samples and Ray workers.
+        agent_data.extra_fields.pop("insight_original_images", None)
+        agent_data.extra_fields.pop("insight_presented_images", None)
+        if not self.conversation_export_dir:
+            agent_data.extra_fields.pop("insight_presented_image_refs", None)
+            agent_data.extra_fields.pop("export_failure_events", None)
 
         multi_modal_output = {}
         if agent_data.image_data:
@@ -979,14 +1009,14 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         self,
         messages: list[dict[str, Any]],
         images_are_presented: bool = False,
-    ) -> tuple[list[dict[str, Any]], list[Image.Image], list[PresentedImageState]]:
+    ) -> tuple[list[dict[str, Any]], list[Image.Image], list[PresentedImageState], float]:
         original_images: list[Image.Image] = []
-        presented_images: list[PresentedImageState] = []
+        staged_messages: list[tuple[dict[str, Any], list[Any], list[str], bool]] = []
         for message in messages:
             content = message.get("content")
             if not isinstance(content, list):
                 continue
-            new_content: list[dict[str, Any]] = []
+            staged_items: list[Any] = []
             saw_image = False
             trailing_text_parts: list[str] = []
             for item in content:
@@ -1008,36 +1038,55 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                 image = self._load_prompt_image(image_value)
                 if image is None:
                     continue
-                source_original_img_idx = len(original_images)
                 original_images.append(image)
-                presented_image = image.copy() if images_are_presented else self._build_presented_image(image)
+                staged_items.append(image)
+                saw_image = True
+            if not saw_image:
+                message["content"] = [copy.deepcopy(item) for item in content if isinstance(item, dict)]
+            staged_messages.append((message, staged_items, trailing_text_parts, saw_image))
+
+        actual_initial_rescale = self.initial_rescale if images_are_presented else resolve_dynamic_initial_rescale(
+            image_sizes=[image.size for image in original_images],
+            configured_initial_rescale=self.initial_rescale,
+            total_pixels_lower_bound=self.initial_input_pixels_lower_bound,
+            per_image_max_area=self.gpt_image_max_area,
+        )
+
+        presented_images: list[PresentedImageState] = []
+        original_image_idx = 0
+        for message, staged_items, trailing_text_parts, saw_image in staged_messages:
+            if not saw_image:
+                continue
+            new_content: list[dict[str, Any]] = []
+            for image in staged_items:
+                presented_image = image.copy() if images_are_presented else self._build_presented_image(
+                    image,
+                    actual_initial_rescale,
+                )
                 presented_img_idx = len(presented_images)
                 presented_images.append(
                     PresentedImageState(
                         image=presented_image,
-                        source_original_img_idx=source_original_img_idx,
+                        source_original_img_idx=original_image_idx,
                         bbox_on_original=(0, 0, image.size[0], image.size[1]),
                         display_size=presented_image.size,
                     )
                 )
-                if saw_image:
+                original_image_idx += 1
+                if new_content:
                     new_content.append({"type": "text", "text": "\n---\n"})
                 new_content.append({"type": "text", "text": f"Image {presented_img_idx}:"})
                 new_content.append({"type": "image", "image": presented_image})
-                saw_image = True
-            if saw_image and trailing_text_parts:
+            if trailing_text_parts:
                 new_content.append({"type": "text", "text": "".join(trailing_text_parts)})
-            elif saw_image:
-                pass
-            else:
-                new_content = [copy.deepcopy(item) for item in content if isinstance(item, dict)]
             message["content"] = new_content
-        return messages, original_images, presented_images
 
-    def _build_presented_image(self, image: Image.Image) -> Image.Image:
+        return messages, original_images, presented_images, actual_initial_rescale
+
+    def _build_presented_image(self, image: Image.Image, initial_rescale: float) -> Image.Image:
         target_size = _cap_size_by_area(
-            _resize_dims_by_factor(image.size, self.presented_initial_rescale),
-            self.presented_max_area,
+            _resize_dims_by_factor(image.size, initial_rescale),
+            self.gpt_image_max_area,
         )
         if image.size == target_size:
             return image.copy()
@@ -1088,6 +1137,14 @@ class InSightQwenAgentLoop(QwenAgentLoop):
 
             if isinstance(response, Exception):
                 logger.warning(f"Tool call {tool_call.name} failed: {response}")
+                agent_data.extra_fields.setdefault("export_failure_events", []).append(
+                    {
+                        "kind": "tool_execution",
+                        "status": "exception",
+                        "tool_name": tool_call.name,
+                        "error_message": str(response),
+                    }
+                )
                 message = {"role": "tool", "content": f"Error executing tool: {response}"}
             else:
                 tool_result, new_images, new_presented, new_presented_refs = response
@@ -1105,6 +1162,15 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                     new_presented_refs_this_turn.extend(new_presented_refs)
                     message = {"role": "tool", "content": content}
                 else:
+                    if tool_result:
+                        agent_data.extra_fields.setdefault("export_failure_events", []).append(
+                            {
+                                "kind": "tool_execution",
+                                "status": "error",
+                                "tool_name": tool_call.name,
+                                "error_message": tool_result,
+                            }
+                        )
                     message = {"role": "tool", "content": tool_result or ""}
 
             add_messages.append(message)
@@ -1188,7 +1254,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         region_display_size = (max(1, x2 - x1), max(1, y2 - y1))
         target_display_size = _cap_size_by_area(
             _resize_dims_by_factor(region_display_size, self.region_zoom_in_factor),
-            self.presented_max_area,
+            self.gpt_image_max_area,
         )
         aspect_ratio_error = _validate_qwen_image_aspect_ratio(target_display_size)
         if aspect_ratio_error is not None:
@@ -1215,5 +1281,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             parent_presented_img_idx=img_idx,
             region_description=label,
             bbox_on_presented=bbox_on_presented,
+            zoom_in_factor=self.region_zoom_in_factor,
+            region_display_size_before_zoom=region_display_size,
         )
         return "", [crop], [presented], [export_ref]

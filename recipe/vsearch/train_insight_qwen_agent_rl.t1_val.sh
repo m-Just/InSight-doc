@@ -48,4 +48,5 @@ run_experiment \
     actor_rollout_ref.model.custom_chat_template=null \
     algorithm.subagent_advantage_estimator=null \
     trainer.test_freq=15 \
+    trainer.total_training_steps=500 \
     "$@"

@@ -283,7 +283,11 @@ def run_inference_smoke(
         non_tensor_batch={
             "raw_prompt": np.array([raw_prompt], dtype=object),
             "agent_name": np.array([agent_loop_name], dtype=object),
-            "insight_images_are_presented": np.array([agent_loop_name == "insight_qwen_agent"], dtype=object),
+            # Smoke-test-only compatibility flag:
+            # this inference sample is reconstructed from a converted SFT row, so the input images for
+            # InSightQwenAgentLoop are already in the presented form and must not be rescaled again.
+            # Normal eval/training flow should not set this field.
+            "initial_images_already_presented": np.array([agent_loop_name == "insight_qwen_agent"], dtype=object),
             "data_source": np.array(["qwen3_vl_zoom_smoke"], dtype=object),
             "reward_model": np.array([{"style": "rule", "ground_truth": "1.0"}], dtype=object),
         }

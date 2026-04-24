@@ -56,6 +56,22 @@ def _extract_tag_counts(text: str, tag: str) -> dict[str, int]:
     }
 
 
+def _extract_unwrapped_prefix_as_think(text: str, terminal_tag: str) -> str | None:
+    start_tag = f"<{terminal_tag}>"
+    if start_tag not in text:
+        return None
+    prefix = text.split(start_tag, 1)[0].strip()
+    if not prefix:
+        return None
+    # Only synthesize think when the prefix contains no think tags at all.
+    # If there are any <think> / </think> markers here, they must have been
+    # parsed explicitly; otherwise the message is malformed and should stay
+    # as "others" rather than being normalized silently.
+    if "<think>" in prefix or "</think>" in prefix:
+        return None
+    return prefix
+
+
 def parse_assistant_message(text: str) -> dict[str, Any]:
     think = _extract_tag_content(text, "think")
     tool_call = _extract_tag_content(text, "tool_call")
@@ -74,16 +90,23 @@ def parse_assistant_message(text: str) -> dict[str, Any]:
         except json.JSONDecodeError as exc:
             tool_call_parse_error = str(exc)
 
-    if think is not None and tool_call is not None and answer is None:
+    synthesized_think = think
+    if synthesized_think is None:
+        if tool_call is not None and answer is None:
+            synthesized_think = _extract_unwrapped_prefix_as_think(text, "tool_call")
+        elif answer is not None and tool_call is None:
+            synthesized_think = _extract_unwrapped_prefix_as_think(text, "answer")
+
+    if synthesized_think is not None and tool_call is not None and answer is None:
         message_type = "tool_call"
         content = {
-            "think": think,
+            "think": synthesized_think,
             "tool_call": parsed_tool_call if parsed_tool_call is not None else tool_call,
         }
-    elif think is not None and answer is not None and tool_call is None:
+    elif synthesized_think is not None and answer is not None and tool_call is None:
         message_type = "answer"
         content = {
-            "think": think,
+            "think": synthesized_think,
             "answer": answer,
         }
     else:

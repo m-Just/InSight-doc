@@ -346,6 +346,7 @@ class InSightDoc(VerlFormatDataset):
 
     DATA_SOURCE = "insight_doc"
     SPLITS = ["all"]
+    DEFAULT_PROMPT_TEMPLATE = "<image>{question}"
 
     def _load_raw_data(self, split_name):
         jsonl_path = Path(self.data_root) / "qa_samples.jsonl"
@@ -473,6 +474,7 @@ class InSightDoc0352(VerlFormatDataset):
 
     DATA_SOURCE = "insight_doc_0352"
     SPLITS = ["all"]
+    DEFAULT_PROMPT_TEMPLATE = "<image>{question}"
 
     def __init__(self, data_root, **extra_options):
         super().__init__(data_root, **extra_options)
@@ -576,18 +578,24 @@ def make_map_fn(dataset, split_name, prompt_style, agent_name=None, validate_ima
         for reserved_key in ("split", "index", "prompt_style"):
             assert reserved_key not in extra_info
 
-        data = {
-            "data_source": example.get("data_source", dataset.DATA_SOURCE),
-            "prompt": [
+        prompt_messages = []
+        if prompts.get("system") is not None:
+            prompt_messages.append(
                 {
                     "role": "system",
                     "content": prompts["system"],
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
-            ],
+                }
+            )
+        prompt_messages.append(
+            {
+                "role": "user",
+                "content": user_prompt,
+            }
+        )
+
+        data = {
+            "data_source": example.get("data_source", dataset.DATA_SOURCE),
+            "prompt": prompt_messages,
             "images": [{"image": img} for img in image_objs_or_urls],
             "reward_model": {
                 "style": "rule",
@@ -820,7 +828,7 @@ if __name__ == "__main__":
 
     if dataset.DEFAULT_PROMPT_TEMPLATE:
         PROMPTS["default"] = {
-            "system": "You are a helpful assistant.",
+            "system": None,
             "user_template": dataset.DEFAULT_PROMPT_TEMPLATE,
         }
 

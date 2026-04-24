@@ -22,9 +22,21 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopMetrics,
     DictConfigWrap,
     register,
+    resolve_dynamic_initial_rescale,
 )
 from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.qwen_agent_loop import QwenAgentLoop
+from verl.experimental.agent_loop.presented_images import (
+    PresentedImageState as PresentedImage,
+    build_processed_child_image as _build_processed_child_image,
+    cap_size_by_area as _cap_size_by_area,
+    clamp_bbox_to_image as _clamp_bbox_to_image,
+    resample_original_region as _resample_original_region,
+    resize_bbox_by_rounding as _resize_bbox_by_rounding,
+    resize_dims_by_factor as _resize_dims_by_factor,
+    translate_bbox_to_original as _translate_bbox_to_original,
+    translate_processed_bbox_to_original as _translate_processed_bbox_to_original,
+)
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.profiler import simple_timer
@@ -61,14 +73,6 @@ class ExtraFields:
     multi_modal_data: dict[str, Any] | None = None
     failure_reasons: list[str] | None = None
     conversation_export_json_path: str | None = None
-
-
-@dataclass
-class PresentedImage:
-    image: Image.Image
-    source_original_img_idx: int
-    bbox_on_original: BBox
-    display_size: tuple[int, int]
 
 
 @runtime_checkable
@@ -108,124 +112,11 @@ def reconstruct_messages(text: str) -> ReconstructedMessages:
     return messages
 
 
-def _clamp_bbox_to_image(bbox: BBox, image_size: tuple[int, int]) -> BBox | None:
-    x1, y1, x2, y2 = bbox
-    width, height = image_size
-    clamped = (
-        max(0, min(width, int(x1))),
-        max(0, min(height, int(y1))),
-        max(0, min(width, int(x2))),
-        max(0, min(height, int(y2))),
-    )
-    if clamped[0] >= clamped[2] or clamped[1] >= clamped[3]:
-        return None
-    return clamped
-
-
-def _translate_bbox_to_original(parent: PresentedImage, bbox_on_presented: BBox) -> BBox | None:
-    presented_w, presented_h = parent.display_size
-    if presented_w <= 0 or presented_h <= 0:
-        return None
-    original_w = parent.bbox_on_original[2] - parent.bbox_on_original[0]
-    original_h = parent.bbox_on_original[3] - parent.bbox_on_original[1]
-    translated = (
-        parent.bbox_on_original[0] + round(bbox_on_presented[0] * original_w / presented_w),
-        parent.bbox_on_original[1] + round(bbox_on_presented[1] * original_h / presented_h),
-        parent.bbox_on_original[0] + round(bbox_on_presented[2] * original_w / presented_w),
-        parent.bbox_on_original[1] + round(bbox_on_presented[3] * original_h / presented_h),
-    )
-    return translated
-
-
-def _translate_processed_bbox_to_original(
-    parent: PresentedImage,
-    bbox_on_processed: BBox,
-    processed_size: tuple[int, int],
-) -> BBox | None:
-    processed_w, processed_h = processed_size
-    if processed_w <= 0 or processed_h <= 0:
-        return None
-    original_w = parent.bbox_on_original[2] - parent.bbox_on_original[0]
-    original_h = parent.bbox_on_original[3] - parent.bbox_on_original[1]
-    translated = (
-        parent.bbox_on_original[0] + round(bbox_on_processed[0] * original_w / processed_w),
-        parent.bbox_on_original[1] + round(bbox_on_processed[1] * original_h / processed_h),
-        parent.bbox_on_original[0] + round(bbox_on_processed[2] * original_w / processed_w),
-        parent.bbox_on_original[1] + round(bbox_on_processed[3] * original_h / processed_h),
-    )
-    return translated
-
-
-def _resize_bbox_by_rounding(
-    bbox: BBox,
-    source_wh: tuple[int, int],
-    target_wh: tuple[int, int],
-) -> BBox | None:
-    source_w, source_h = source_wh
-    target_w, target_h = target_wh
-    if source_w <= 0 or source_h <= 0:
-        return None
-    resized = (
-        max(0, min(target_w, round(bbox[0] * target_w / source_w))),
-        max(0, min(target_h, round(bbox[1] * target_h / source_h))),
-        max(0, min(target_w, round(bbox[2] * target_w / source_w))),
-        max(0, min(target_h, round(bbox[3] * target_h / source_h))),
-    )
-    return resized
-
-
-def _crop_original_image(image: Image.Image, bbox: BBox) -> Image.Image | None:
-    clamped = _clamp_bbox_to_image(bbox, image.size)
-    if clamped is None:
-        return None
-    return image.crop(clamped)
-
-
 def _process_presented_image(image: Image.Image, max_pixels: int | None) -> Image.Image:
     fetch_kwargs: dict[str, Any] = {"image": image}
     if max_pixels is not None:
         fetch_kwargs["max_pixels"] = max_pixels
     return fetch_image(fetch_kwargs)
-
-
-def _build_processed_child_image(
-    source_original: Image.Image,
-    bbox_on_original: BBox,
-    max_pixels: int | None,
-) -> tuple[Image.Image, Image.Image] | None:
-    child_image = _crop_original_image(source_original, bbox_on_original)
-    if child_image is None:
-        return None
-    return child_image, _process_presented_image(child_image, max_pixels)
-
-
-def _resize_dims_by_factor(size: tuple[int, int], factor: float) -> tuple[int, int]:
-    width, height = size
-    return (max(1, round(width * factor)), max(1, round(height * factor)))
-
-
-def _cap_size_by_area(size: tuple[int, int], max_area: int) -> tuple[int, int]:
-    width, height = size
-    area = width * height
-    if area <= max_area or max_area <= 0:
-        return size
-    ratio = (max_area / float(area)) ** 0.5
-    return (max(1, int(width * ratio)), max(1, int(height * ratio)))
-
-
-def _resample_original_region(
-    original: Image.Image,
-    bbox_on_original: BBox,
-    target_display_size: tuple[int, int],
-    max_area: int,
-) -> tuple[Image.Image, tuple[int, int]] | None:
-    crop = _crop_original_image(original, bbox_on_original)
-    if crop is None:
-        return None
-    capped_size = _cap_size_by_area(target_display_size, max_area)
-    if crop.size != capped_size:
-        crop = crop.resize(capped_size, Image.LANCZOS)
-    return crop, capped_size
 
 
 class VSearcherMixin:
@@ -1097,6 +988,8 @@ To finish, bring everything together in a clear, synthesized answer that fully r
 
 @register("vreasoner_v2")
 class VReasonerLoopV2(VReasonerLoop):
+    DEFAULT_INITIAL_INPUT_PIXELS_LOWER_BOUND = 0
+
     def __init__(
         self,
         trainer_config: DictConfigWrap,
@@ -1106,6 +999,7 @@ class VReasonerLoopV2(VReasonerLoop):
         dataset_cls: type[RLHFDataset],
         dataset_config: DictConfig,
         initial_rescale: float = 0.25,
+        initial_input_pixels_lower_bound: int = DEFAULT_INITIAL_INPUT_PIXELS_LOWER_BOUND,
         region_zoom_in_factor: float = 4.0,
         png_max_area: int = 1280 * 1280,
         enable_stop: bool = False,
@@ -1122,11 +1016,16 @@ class VReasonerLoopV2(VReasonerLoop):
         )
         if initial_rescale <= 0:
             raise ValueError(f"initial_rescale must be positive, got {initial_rescale}")
+        if initial_input_pixels_lower_bound < 0:
+            raise ValueError(
+                f"initial_input_pixels_lower_bound must be non-negative, got {initial_input_pixels_lower_bound}"
+            )
         if region_zoom_in_factor <= 0:
             raise ValueError(f"region_zoom_in_factor must be positive, got {region_zoom_in_factor}")
         if png_max_area <= 0:
             raise ValueError(f"png_max_area must be positive, got {png_max_area}")
         self.initial_rescale = initial_rescale
+        self.initial_input_pixels_lower_bound = initial_input_pixels_lower_bound
         self.region_zoom_in_factor = region_zoom_in_factor
         self.png_max_area = png_max_area
         self.enable_stop = enable_stop
@@ -1135,12 +1034,21 @@ class VReasonerLoopV2(VReasonerLoop):
             None,
         )
 
-    def _build_initial_presented_images(self, original_images: list[Image.Image]) -> list[PresentedImage]:
+    def _build_initial_presented_images(
+        self,
+        original_images: list[Image.Image],
+    ) -> tuple[list[PresentedImage], float]:
+        actual_initial_rescale = resolve_dynamic_initial_rescale(
+            image_sizes=[image.size for image in original_images],
+            configured_initial_rescale=self.initial_rescale,
+            total_pixels_lower_bound=self.initial_input_pixels_lower_bound,
+            per_image_max_area=self.gpt_image_max_area,
+        )
         presented_images: list[PresentedImage] = []
         for img_idx, image in enumerate(original_images):
             bbox_on_original = (0, 0, image.size[0], image.size[1])
             target_display_size = _cap_size_by_area(
-                _resize_dims_by_factor(image.size, self.initial_rescale),
+                _resize_dims_by_factor(image.size, actual_initial_rescale),
                 self.gpt_image_max_area,
             )
             displayed = image.resize(target_display_size, Image.LANCZOS) if image.size != target_display_size else image.copy()
@@ -1152,7 +1060,7 @@ class VReasonerLoopV2(VReasonerLoop):
                     display_size=target_display_size,
                 )
             )
-        return presented_images
+        return presented_images, actual_initial_rescale
 
     def _append_presented_image(
         self,
@@ -1202,7 +1110,7 @@ class VReasonerLoopV2(VReasonerLoop):
         profile = {}
 
         original_images = kwargs["extra_info"]["image_ori"]
-        presented_images = self._build_initial_presented_images(original_images)
+        presented_images, actual_initial_rescale = self._build_initial_presented_images(original_images)
         presented_image_refs = [
             {
                 "presented_img_idx": img_idx,
@@ -1211,7 +1119,7 @@ class VReasonerLoopV2(VReasonerLoop):
                 "bbox_on_original": list(presented.bbox_on_original),
                 "display_size": list(presented.display_size),
                 "original_size": list(original_images[presented.source_original_img_idx].size),
-                "initial_rescale": self.initial_rescale,
+                "initial_rescale": actual_initial_rescale,
             }
             for img_idx, presented in enumerate(presented_images)
         ]
@@ -1688,7 +1596,9 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                         "enable_stop": self.enable_stop,
                     },
                     loop_params={
-                        "initial_rescale": self.initial_rescale,
+                        "initial_rescale": actual_initial_rescale,
+                        "configured_initial_rescale": self.initial_rescale,
+                        "initial_input_pixels_lower_bound": self.initial_input_pixels_lower_bound,
                         "region_zoom_in_factor": self.region_zoom_in_factor,
                         "png_max_area": self.png_max_area,
                         "model": self.model,

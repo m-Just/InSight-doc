@@ -55,6 +55,64 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _resize_dims_by_factor_for_rescaling(size: tuple[int, int], factor: float) -> tuple[int, int]:
+    width, height = size
+    return (max(1, round(width * factor)), max(1, round(height * factor)))
+
+
+def _cap_size_by_area_for_rescaling(size: tuple[int, int], max_area: int) -> tuple[int, int]:
+    width, height = size
+    area = width * height
+    if area <= max_area or max_area <= 0:
+        return size
+    ratio = (max_area / float(area)) ** 0.5
+    return (max(1, int(width * ratio)), max(1, int(height * ratio)))
+
+
+def resolve_dynamic_initial_rescale(
+    image_sizes: list[tuple[int, int]],
+    configured_initial_rescale: float,
+    total_pixels_lower_bound: int,
+    per_image_max_area: int,
+) -> float:
+    """Increase initial downscale ratio when the configured rescale is unnecessarily aggressive.
+
+    The returned factor is never smaller than ``configured_initial_rescale`` and never larger than ``1.0``.
+    Per-image max-area capping is included in the total-pixel computation so the lower-bound check matches the
+    actual displayed initial images.
+    """
+    if configured_initial_rescale <= 0:
+        raise ValueError(f"configured_initial_rescale must be positive, got {configured_initial_rescale}")
+    if total_pixels_lower_bound <= 0 or not image_sizes:
+        return min(configured_initial_rescale, 1.0)
+
+    base_rescale = min(configured_initial_rescale, 1.0)
+
+    def total_pixels_after_rescale(factor: float) -> int:
+        total = 0
+        for size in image_sizes:
+            resized = _resize_dims_by_factor_for_rescaling(size, factor)
+            capped = _cap_size_by_area_for_rescaling(resized, per_image_max_area)
+            total += capped[0] * capped[1]
+        return total
+
+    if total_pixels_after_rescale(base_rescale) >= total_pixels_lower_bound:
+        return base_rescale
+
+    if total_pixels_after_rescale(1.0) <= total_pixels_lower_bound:
+        return 1.0
+
+    lo = base_rescale
+    hi = 1.0
+    for _ in range(24):
+        mid = (lo + hi) / 2.0
+        if total_pixels_after_rescale(mid) >= total_pixels_lower_bound:
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
 class AsyncLLMServerManager:
     """
     A class to manage multiple OpenAI compatible LLM servers. This class provides
