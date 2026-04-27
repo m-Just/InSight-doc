@@ -74,6 +74,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.vreasoner_v2_conversation_export import build_repeated_conversation_export_id
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
@@ -436,7 +437,9 @@ class RayPPOTrainer:
 
             collate_fn = default_collate_fn
 
+        self._collate_fn = collate_fn
         num_workers = self.config.data["dataloader_num_workers"]
+        self._dataloader_num_workers = num_workers
 
         # Skip training dataset/dataloader creation if val_only is enabled
         if val_only:
@@ -476,14 +479,7 @@ class RayPPOTrainer:
             assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
 
         if val_dataset is None:
-            val_dataset = create_rl_dataset(
-                self.config.data.val_files,
-                self.config.data,
-                self.tokenizer,
-                self.processor,
-                is_train=False,
-                max_samples=self.config.data.get("val_max_samples", -1),
-            )
+            val_dataset = self._create_val_dataset_for_trial(0)
         self.val_dataset = val_dataset
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
@@ -498,8 +494,7 @@ class RayPPOTrainer:
             drop_last=False,
             collate_fn=collate_fn,
         )
-
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        self._current_val_trial_idx = 0
 
         if val_only:
             self.total_training_steps = 0
@@ -529,6 +524,43 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _create_val_dataset_for_trial(self, val_trial_idx: int):
+        from verl.trainer.main_ppo import create_rl_dataset
+
+        return create_rl_dataset(
+            self.config.data.val_files,
+            self.config.data,
+            self.tokenizer,
+            self.processor,
+            is_train=False,
+            max_samples=self.config.data.get("val_max_samples", -1),
+            conversation_export_dir=self.config.actor_rollout_ref.rollout.agent.get(
+                "vreasoner_v2_conversation_export_dir",
+                None,
+            ),
+            conversation_export_resume_mode=self.config.actor_rollout_ref.rollout.agent.get(
+                "vreasoner_v2_conversation_export_resume_mode",
+                "off",
+            ),
+            conversation_export_val_trial_idx=val_trial_idx,
+            conversation_export_repeat_count=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+        )
+
+    def _rebuild_val_dataloader_for_trial(self, val_trial_idx: int) -> None:
+        self.val_dataset = self._create_val_dataset_for_trial(val_trial_idx)
+        val_batch_size = self.config.data.val_batch_size
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=self._dataloader_num_workers,
+            shuffle=self.config.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=self._collate_fn,
+        )
+        self._current_val_trial_idx = val_trial_idx
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -751,7 +783,44 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _assign_conversation_export_ids(self, batch: DataProto) -> None:
+        extra_infos = batch.non_tensor_batch.get("extra_info")
+        if extra_infos is None:
+            return
+
+        occurrence_by_base_id: dict[str, int] = defaultdict(int)
+        updated_extra_infos = []
+        changed = False
+        for extra_info in extra_infos:
+            if not isinstance(extra_info, dict):
+                updated_extra_infos.append(extra_info)
+                continue
+            base_export_id = extra_info.get("conversation_export_base_id")
+            if not base_export_id:
+                updated_extra_infos.append(extra_info)
+                continue
+            repeat_idx = occurrence_by_base_id[base_export_id]
+            occurrence_by_base_id[base_export_id] += 1
+            export_id = build_repeated_conversation_export_id(base_export_id, repeat_idx)
+            new_extra_info = dict(extra_info)
+            new_extra_info["conversation_export_id"] = export_id
+            new_extra_info["conversation_export_repeat_idx"] = repeat_idx
+            updated_extra_infos.append(new_extra_info)
+            changed = True
+
+        if changed:
+            batch.non_tensor_batch["extra_info"] = np.array(updated_extra_infos, dtype=object)
+
     def _validate(self, merged: bool = False, val_trial_idx: int = 0):
+        resume_mode = self.config.actor_rollout_ref.rollout.agent.get("vreasoner_v2_conversation_export_resume_mode", "off")
+        if resume_mode != "off" and getattr(self, "_current_val_trial_idx", None) != val_trial_idx:
+            self._rebuild_val_dataloader_for_trial(val_trial_idx)
+        if len(self.val_dataset) == 0:
+            return {
+                "resume/remaining_validation_samples": 0.0,
+                "resume/validation_trial_idx": float(val_trial_idx),
+            }
+
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -779,6 +848,7 @@ class RayPPOTrainer:
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
+            self._assign_conversation_export_ids(test_batch)
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":

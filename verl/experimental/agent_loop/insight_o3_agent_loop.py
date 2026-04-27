@@ -43,7 +43,11 @@ from verl.utils.profiler import simple_timer
 from verl.utils.vsearch import BBox, parse_bbox, resize_bbox, extract_bbox_from_tool_call
 from verl.utils.vsearch_gpt_async import get_gpt_visual_search_request
 from verl.utils.vsearch_gpt_async_v2 import ToolResult, get_gpt_visual_search_request_v2
-from verl.utils.vreasoner_v2_conversation_export import build_export_record, export_conversation
+from verl.utils.vreasoner_v2_conversation_export import (
+    build_child_conversation_export_id,
+    build_export_record,
+    export_conversation,
+)
 
 # Qwen3-VL uses relative coordinates in the range [0, 1000) for bounding boxes
 # This is different from Qwen2.5-VL which uses absolute pixel coordinates
@@ -666,6 +670,10 @@ class VReasonerLoop(AgentLoopBase):
     ) -> AgentLoopOutput:
         job_id = uuid4().hex
         root_job_id = kwargs.get("root_job_id", job_id)
+        conversation_export_id = kwargs.get(
+            "conversation_export_id",
+            kwargs.get("extra_info", {}).get("conversation_export_id", job_id),
+        )
 
         validate = kwargs["_validate"]
 
@@ -799,6 +807,10 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                 "extra_info": extra_info_for_vsearcher,
                 "parent_job_id": job_id,
                 "root_job_id": root_job_id,
+                "conversation_export_id": build_child_conversation_export_id(
+                    conversation_export_id,
+                    len(vsearcher_outputs),
+                ),
                 "_validate": validate,
             }
 
@@ -1097,6 +1109,10 @@ class VReasonerLoopV2(VReasonerLoop):
     ) -> AgentLoopOutput:
         job_id = uuid4().hex
         root_job_id = kwargs.get("root_job_id", job_id)
+        conversation_export_id = kwargs.get(
+            "conversation_export_id",
+            kwargs.get("extra_info", {}).get("conversation_export_id", job_id),
+        )
 
         validate = kwargs["_validate"]
 
@@ -1621,6 +1637,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     self.conversation_export_dir,
                     record,
                     job_id=job_id,
+                    export_id=conversation_export_id,
                 )
             except Exception as exc:
                 logger.warning("failed to export vreasoner_v2 conversation for %s: %s", job_id, exc)

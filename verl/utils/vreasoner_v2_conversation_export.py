@@ -1,6 +1,8 @@
 import base64
+import hashlib
 import json
 import os
+import re
 import tempfile
 from io import BytesIO
 from collections.abc import Mapping, Sequence
@@ -10,6 +12,67 @@ from urllib.request import urlopen
 from PIL import Image
 
 import verl.utils.vreasoner_v2_prompt as prompts
+
+
+_EXPORT_ID_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _slugify_export_component(value: Any, *, fallback: str) -> str:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return fallback
+    text = _EXPORT_ID_SLUG_RE.sub("-", text).strip("._-")
+    return text[:96] or fallback
+
+
+def build_root_conversation_export_id(
+    *,
+    extra_info: Mapping[str, Any] | None,
+    data_source: Any = None,
+    validate: bool,
+    val_trial_idx: int | None = None,
+) -> str:
+    extra_info = extra_info or {}
+    question_id = extra_info.get("question_id")
+    if question_id is None or not str(question_id).strip():
+        raise ValueError("conversation export resume requires extra_info['question_id']")
+    identity_payload = _json_safe(
+        {
+            "question_id": question_id,
+            "data_source": data_source,
+            "validate": validate,
+            "val_trial_idx": val_trial_idx if validate else None,
+        }
+    )
+    digest = hashlib.sha1(
+        json.dumps(identity_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+    parts = [
+        _slugify_export_component(data_source, fallback="unknown"),
+        "val" if validate else "train",
+    ]
+    if validate and val_trial_idx is not None:
+        parts.append(f"trial{int(val_trial_idx)}")
+    parts.append(_slugify_export_component(question_id, fallback="question"))
+    return "-".join(parts + [digest])
+
+
+def build_repeated_conversation_export_id(base_export_id: str, repeat_idx: int) -> str:
+    if repeat_idx < 0:
+        raise ValueError(f"repeat_idx must be non-negative, got {repeat_idx}")
+    if repeat_idx == 0:
+        return base_export_id
+    return f"{base_export_id}--repeat{repeat_idx}"
+
+
+def build_child_conversation_export_id(parent_export_id: str, child_idx: int) -> str:
+    if child_idx < 0:
+        raise ValueError(f"child_idx must be non-negative, got {child_idx}")
+    return f"{parent_export_id}--child{child_idx}"
+
+
+def build_conversation_export_path(export_dir: str, export_id: str) -> str:
+    return os.path.join(export_dir, f"{export_id}.json")
 
 
 def _json_safe(value: Any) -> Any:
@@ -390,8 +453,33 @@ def write_json_atomic(path: str, data: dict[str, Any]) -> None:
             os.unlink(tmp_path)
 
 
-def export_conversation(export_dir: str, record: dict[str, Any], *, job_id: str) -> str:
-    path = os.path.join(export_dir, f"{job_id}.json")
+def is_conversation_export_complete(export_path: str) -> bool:
+    if not export_path or not os.path.exists(export_path):
+        return False
+    try:
+        with open(export_path, encoding="utf-8") as f:
+            record = json.load(f)
+    except Exception:
+        return False
+    reward = record.get("reward")
+    if reward is None:
+        return False
+    if reward.get("compute_score_success") is True:
+        return True
+    score = reward.get("score")
+    if isinstance(score, dict) and score.get("compute_score_success") is True:
+        return True
+    return False
+
+
+def export_conversation(
+    export_dir: str,
+    record: dict[str, Any],
+    *,
+    job_id: str,
+    export_id: str | None = None,
+) -> str:
+    path = build_conversation_export_path(export_dir, export_id or job_id)
     write_json_atomic(path, record)
     return path
 

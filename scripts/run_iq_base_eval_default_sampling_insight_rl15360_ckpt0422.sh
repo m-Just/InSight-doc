@@ -33,7 +33,7 @@ export LOGGER="${LOGGER:-['console','wandb']}"
 export WANDB_NAME="${WANDB_NAME:-$EXP_NAME}"
 export CUDA_VISIBLE_DEVICES="${EVAL_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-15360}"
-export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
+export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
 export CONVERSATION_EXPORT_DIR="${CONVERSATION_EXPORT_DIR:-$WORK_DIR/exported_conversations}"
 export TMPDIR="${TMPDIR:-/tmp}"
 export TMP="${TMP:-$TMPDIR}"
@@ -57,6 +57,7 @@ run_experiment \
   actor_rollout_ref.rollout.agent.default_agent_loop=insight_qwen_agent \
   actor_rollout_ref.rollout.agent.agent_loop_config_path="${AGENT_LOOP_CONFIG_PATH:-recipe/vsearch/config/agent_insight_qwen_agent.yaml}" \
   +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_dir="$CONVERSATION_EXPORT_DIR" \
+  +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_resume_mode=skip_completed \
   actor_rollout_ref.rollout.multi_turn.qwen_tool_list="${QWEN_TOOL_LIST:-[image_zoom_in_tool_qwen3vl]}" \
   actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
   actor_rollout_ref.rollout.val_kwargs.top_p=0.8 \
@@ -64,5 +65,6 @@ run_experiment \
   actor_rollout_ref.rollout.val_kwargs.presence_penalty=1.5 \
   actor_rollout_ref.rollout.val_kwargs.repetition_penalty=1.0 \
   +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len=65536 \
+  trainer.debug_skip_worker_init="${DEBUG_SKIP_WORKER_INIT:-False}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${TENSOR_MODEL_PARALLEL_SIZE:-1}"
 

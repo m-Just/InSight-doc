@@ -179,6 +179,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep only exported conversations whose accuracy_reward is exactly 1.0.",
     )
+    parser.add_argument(
+        "--wrong-question-ids-only",
+        action="store_true",
+        help=(
+            "Only write wrong_question_ids.txt and skip parquet generation. "
+            "Requires --only-correct-answers."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -673,6 +681,7 @@ def load_records(
     image_cache_dir: Path | None,
     num_workers: int,
     only_correct_answers: bool,
+    allow_empty: bool = False,
 ) -> tuple[list[dict[str, Any]], int, Counter[str], list[str]]:
     records: list[dict[str, Any]] = []
     paths = sorted(input_dir.glob("*.json"))
@@ -718,7 +727,7 @@ def load_records(
                     continue
                 assert converted is not None
                 records.append(converted)
-    if not records:
+    if not records and not allow_empty:
         raise ValueError(f"No convertible records produced from JSON files in {input_dir}")
     return records, len(paths), warning_counts, wrong_question_ids
 
@@ -741,8 +750,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     image_cache_dir = output_dir / "images" if args.image_storage_mode == "path" else None
 
+    if args.wrong_question_ids_only and not args.only_correct_answers:
+        raise ValueError("--wrong-question-ids-only requires --only-correct-answers")
     if args.output_parquet_name is not None and args.val_ratio != 0:
         raise ValueError("--val-ratio must be 0 when --output-parquet-name is specified")
+    if args.wrong_question_ids_only and args.output_parquet_name is not None:
+        raise ValueError("--output-parquet-name cannot be used with --wrong-question-ids-only")
 
     rows, total_jsons, warning_counts, wrong_question_ids = load_records(
         input_dir,
@@ -753,12 +766,15 @@ def main() -> None:
         image_cache_dir=image_cache_dir,
         num_workers=args.num_workers,
         only_correct_answers=args.only_correct_answers,
+        allow_empty=args.wrong_question_ids_only,
     )
-    df = pd.DataFrame(rows).sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+    df = pd.DataFrame(rows)
+    if len(df) > 0:
+        df = df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
 
-    dropped = total_jsons - len(df)
+    dropped = total_jsons - len(rows)
     print(f"Scanned {total_jsons} JSON files")
-    print(f"Kept {len(df)} convertible conversations")
+    print(f"Kept {len(rows)} convertible conversations")
     print(f"Dropped or filtered {dropped} conversations")
     if warning_counts:
         print("Skip reason summary:")
@@ -772,6 +788,8 @@ def main() -> None:
             encoding="utf-8",
         )
         print(f"Wrote {len(unique_wrong_question_ids)} wrong-answer question_ids to {wrong_question_ids_path}")
+    if args.wrong_question_ids_only:
+        return
 
     if args.output_parquet_name is not None:
         output_path = output_dir / args.output_parquet_name

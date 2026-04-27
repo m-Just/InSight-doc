@@ -388,6 +388,8 @@ class QwenAgentLoop(AgentLoopBase):
 
         metrics = {}
         request_id = uuid4().hex
+        extra_info = kwargs.get("extra_info") or {}
+        conversation_export_id = kwargs.get("conversation_export_id", extra_info.get("conversation_export_id", request_id))
         tools_kwargs = kwargs.get("tools_kwargs", {})
 
         # Create agent data to encapsulate state (reuses AgentData from ToolAgentLoop)
@@ -872,6 +874,10 @@ class InSightQwenAgentLoop(QwenAgentLoop):
 
         metrics = {}
         request_id = uuid4().hex
+        conversation_export_id = kwargs.get(
+            "conversation_export_id",
+            kwargs.get("extra_info", {}).get("conversation_export_id", request_id),
+        )
         tools_kwargs = kwargs.get("tools_kwargs", {})
 
         agent_data = AgentData(
@@ -970,6 +976,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                     self.conversation_export_dir,
                     record,
                     job_id=request_id,
+                    export_id=conversation_export_id,
                 )
             except Exception as exc:
                 logger.warning("failed to export insight_qwen_agent conversation for %s: %s", request_id, exc)

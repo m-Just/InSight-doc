@@ -34,6 +34,12 @@ from qwen_vl_utils import extract_vision_info, fetch_image
 
 from verl.utils.import_utils import load_extern_object
 from verl.utils.vsearch import fetch_image_wo_resize
+from verl.utils.vreasoner_v2_conversation_export import (
+    build_conversation_export_path,
+    build_repeated_conversation_export_id,
+    build_root_conversation_export_id,
+    is_conversation_export_complete,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +272,12 @@ class RLHFDataset(Dataset):
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
+        self.is_train = bool(config.get("_is_train", True))
+        self.conversation_export_dir = config.get("_conversation_export_dir")
+        self.conversation_export_resume_mode = config.get("_conversation_export_resume_mode", "off")
+        self.conversation_export_validate = bool(config.get("_conversation_export_validate", not self.is_train))
+        self.conversation_export_val_trial_idx = config.get("_conversation_export_val_trial_idx")
+        self.conversation_export_repeat_count = int(max(1, config.get("_conversation_export_repeat_count", 1)))
 
         self._download()
         self._read_files_and_tokenize()
@@ -273,6 +285,60 @@ class RLHFDataset(Dataset):
         if self.config.get("use_vsearch", False):
             # TODO: only for Qwen2VLImageProcessor or for all other processors?
             self.processor.image_processor.do_resize = False
+
+    def _build_conversation_export_base_id(self, row_dict: dict[str, Any], sample_index: int) -> str:
+        return build_root_conversation_export_id(
+            extra_info=row_dict.get("extra_info"),
+            data_source=row_dict.get("data_source"),
+            validate=self.conversation_export_validate,
+            val_trial_idx=self.conversation_export_val_trial_idx,
+        )
+
+    def _is_conversation_export_finished(self, base_export_id: str) -> bool:
+        if not self.conversation_export_dir:
+            return False
+        for repeat_idx in range(self.conversation_export_repeat_count):
+            export_id = build_repeated_conversation_export_id(base_export_id, repeat_idx)
+            export_path = build_conversation_export_path(self.conversation_export_dir, export_id)
+            if not is_conversation_export_complete(export_path):
+                return False
+        return True
+
+    def _prepare_conversation_export_resume(self, dataframe: datasets.Dataset) -> datasets.Dataset:
+        if not self.conversation_export_dir:
+            return dataframe
+
+        keep_indices: list[int] = []
+        export_ids: list[str] = []
+        skipped_completed = 0
+        for sample_index in range(len(dataframe)):
+            row_dict = dataframe[sample_index]
+            base_export_id = self._build_conversation_export_base_id(row_dict, sample_index)
+            if self.conversation_export_resume_mode == "skip_completed" and self._is_conversation_export_finished(base_export_id):
+                skipped_completed += 1
+                continue
+            keep_indices.append(sample_index)
+            export_ids.append(base_export_id)
+
+        if len(keep_indices) != len(dataframe):
+            dataframe = dataframe.select(keep_indices)
+
+        def attach_export_id(example, idx):
+            extra_info = dict(example.get("extra_info") or {})
+            base_export_id = export_ids[idx]
+            extra_info["conversation_export_base_id"] = base_export_id
+            extra_info.setdefault("conversation_export_id", base_export_id)
+            example["extra_info"] = extra_info
+            return example
+
+        dataframe = dataframe.map(
+            attach_export_id,
+            with_indices=True,
+            desc="Attaching deterministic conversation export ids",
+        )
+        if self.conversation_export_resume_mode == "skip_completed":
+            print(f"conversation export resume: skipped {skipped_completed} completed samples")
+        return dataframe
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -316,6 +382,11 @@ class RLHFDataset(Dataset):
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")
+
+        if self.conversation_export_resume_mode not in (None, "off"):
+            self.dataframe = self._prepare_conversation_export_resume(self.dataframe)
+            total = len(self.dataframe)
+            print(f"dataset len after conversation export resume: {total}")
 
         if self.max_samples > 0 and self.max_samples < total:
             if self.shuffle:

@@ -15,6 +15,7 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
 
+import copy
 import os
 import socket
 
@@ -330,6 +331,15 @@ class TaskRunner:
 
         from verl.utils.dataset.rl_dataset import collate_fn
 
+        conversation_export_dir = config.actor_rollout_ref.rollout.agent.get(
+            "vreasoner_v2_conversation_export_dir",
+            None,
+        )
+        conversation_export_resume_mode = config.actor_rollout_ref.rollout.agent.get(
+            "vreasoner_v2_conversation_export_resume_mode",
+            "off",
+        )
+
         # Create training and validation datasets.
         # Skip training dataset creation if val_only is enabled
         val_only = config.trainer.get("val_only", False)
@@ -353,6 +363,10 @@ class TaskRunner:
             processor,
             is_train=False,
             max_samples=config.data.get("val_max_samples", -1),
+            conversation_export_dir=conversation_export_dir,
+            conversation_export_resume_mode=conversation_export_resume_mode,
+            conversation_export_val_trial_idx=0,
+            conversation_export_repeat_count=config.actor_rollout_ref.rollout.val_kwargs.n,
         )
 
         # Initialize the PPO trainer.
@@ -370,6 +384,14 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
+        if config.trainer.get("debug_skip_worker_init", False):
+            train_size = len(train_dataset) if train_dataset is not None else 0
+            val_size = len(val_dataset) if val_dataset is not None else 0
+            print(
+                "debug_skip_worker_init=True: skipping worker initialization and model loading. "
+                f"dataset sizes: train={train_size}, val={val_size}"
+            )
+            return
         # Initialize the workers of the trainer.
         trainer.init_workers()
 
@@ -377,7 +399,19 @@ class TaskRunner:
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
+def create_rl_dataset(
+    data_paths,
+    data_config,
+    tokenizer,
+    processor,
+    is_train=True,
+    max_samples: int = -1,
+    *,
+    conversation_export_dir: str | None = None,
+    conversation_export_resume_mode: str = "off",
+    conversation_export_val_trial_idx: int | None = None,
+    conversation_export_repeat_count: int = 1,
+):
     """Create a dataset.
 
     Arguments:
@@ -392,6 +426,15 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     from verl.utils.dataset.rl_dataset import get_dataset_class
 
+    config_for_dataset = copy.deepcopy(data_config)
+    OmegaConf.set_struct(config_for_dataset, False)
+    config_for_dataset["_is_train"] = bool(is_train)
+    config_for_dataset["_conversation_export_dir"] = conversation_export_dir
+    config_for_dataset["_conversation_export_resume_mode"] = conversation_export_resume_mode
+    config_for_dataset["_conversation_export_validate"] = not is_train
+    config_for_dataset["_conversation_export_val_trial_idx"] = conversation_export_val_trial_idx
+    config_for_dataset["_conversation_export_repeat_count"] = int(max(1, conversation_export_repeat_count))
+
     # Get the dataset class
     dataset_cls = get_dataset_class(data_config)
 
@@ -400,7 +443,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
-        config=data_config,
+        config=config_for_dataset,
         max_samples=max_samples,
     )
     dataset._is_train = is_train

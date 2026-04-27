@@ -431,8 +431,7 @@ async def _extract_answer_for_insight_qwen_agent(
             max_completion_tokens=2048,
         )
     except Exception as e:
-        logger.warning("Answer extraction judge failed (%s); falling back to rule-based extraction.", e)
-        return raw_answer
+        raise JudgeError(f"answer extraction judge failed: {e}") from e
 
     content = response.choices[0].message.content
     if isinstance(content, list):
@@ -440,7 +439,7 @@ async def _extract_answer_for_insight_qwen_agent(
             item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
         )
     elif content is None:
-        return raw_answer
+        raise JudgeError("answer extraction judge returned empty content")
 
     extracted_answer = _normalize_judge_extracted_answer(str(content))
     return extracted_answer or raw_answer
@@ -609,8 +608,9 @@ async def compute_accuracy_reward(
         )
         response_text = judge_response.choices[0].message.content
     except Exception as e:
-        logger.warning("Judge query failed (%s); falling back to normalized exact/substring accuracy.", e)
-        return fallback_accuracy
+        raise JudgeError(
+            "judge query failed; normalized exact/substring fallback suppressed so batch retry can handle it"
+        ) from e
 
     return float("<correct>" in response_text)
 

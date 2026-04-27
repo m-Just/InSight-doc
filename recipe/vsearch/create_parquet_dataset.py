@@ -101,6 +101,16 @@ class VerlFormatDataset(ABC):
             "question": self.get_question(example),
         }
 
+    def get_question_id(self, example) -> str:
+        extra_info = self.get_extra_info(example)
+        question_id = extra_info.get("question_id")
+        if question_id is None:
+            raise ValueError(
+                f"{self.__class__.__name__} does not expose question_id in get_extra_info(), "
+                "so it cannot be filtered by question-id file."
+            )
+        return str(question_id)
+
 
 class O3Bench(VerlFormatDataset):
     DATA_SOURCE = "o3_bench"
@@ -455,7 +465,7 @@ class InSightDocRegionLocalization(VerlFormatDataset):
         }
 
 
-class InSightDoc0352(VerlFormatDataset):
+class InSightDocBase(VerlFormatDataset):
     """Document QA dataset from postprocess Stage-4 augmented output.
 
     Expects the directory layout produced by ``run_postprocess_stage4_png_from_json.py``::
@@ -472,7 +482,7 @@ class InSightDoc0352(VerlFormatDataset):
     (``veqa`` | ``mveqa``), and optional visual detail fields.
     """
 
-    DATA_SOURCE = "insight_doc_0352"
+    DATA_SOURCE = "insight_doc_base"
     SPLITS = ["all"]
     DEFAULT_PROMPT_TEMPLATE = "<image>{question}"
 
@@ -487,8 +497,15 @@ class InSightDoc0352(VerlFormatDataset):
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    data.append(json.loads(line))
+                if not line:
+                    continue
+                record = json.loads(line)
+                question_type = record.get("question_type")
+                if isinstance(question_type, (list, dict)):
+                    record["question_type"] = json.dumps(question_type, ensure_ascii=False)
+                elif question_type is not None:
+                    record["question_type"] = str(question_type)
+                data.append(record)
         return data
 
     def get_question(self, example):
@@ -519,7 +536,16 @@ class InSightDoc0352(VerlFormatDataset):
             "subset": example.get("subset"),
             "question_involved_visuals": example.get("question_involved_visuals"),
             "question_involved_visual_details": visual_details,
+            "question_type": example.get("question_type"),
         }
+
+
+class InSightDoc0352(InSightDocBase):
+    DATA_SOURCE = "insight_doc_0352"
+
+
+class InSightDocMixed(InSightDocBase):
+    DATA_SOURCE = "insight_doc_mixed"
 
 
 def get_image_obj(url_or_path: str | Path) -> Image.Image:
@@ -816,6 +842,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Dry run the dataset creation process. Do not save the dataset to parquet.",
     )
+    parser.add_argument(
+        "--question_id_file",
+        type=str,
+        default=None,
+        help="Optional text file with one question_id per line. Only those questions will be included.",
+    )
     args = parser.parse_args()
 
     if args.dataset not in globals():
@@ -825,6 +857,20 @@ if __name__ == "__main__":
     data_root = str(Path(args.data_root).resolve())
     dataset = dataset_class(data_root, **args.extra_options)
     hf_dataset = dataset.get_raw_hf_dataset(args.split, args.sample_size)
+
+    if args.question_id_file:
+        question_id_path = Path(args.question_id_file).expanduser().resolve()
+        assert question_id_path.exists(), f"question_id file not found: {question_id_path}"
+        with question_id_path.open("r", encoding="utf-8") as f:
+            selected_question_ids = {line.strip() for line in f if line.strip()}
+        print(f"Loaded {len(selected_question_ids)} question_ids from {question_id_path}")
+
+        hf_dataset = hf_dataset.filter(
+            lambda example: dataset.get_question_id(example) in selected_question_ids,
+            num_proc=args.num_workers,
+            desc=f"Filtering to {len(selected_question_ids)} selected question_ids",
+        )
+        print(f"Filtered dataset len: {len(hf_dataset)}")
 
     if dataset.DEFAULT_PROMPT_TEMPLATE:
         PROMPTS["default"] = {
