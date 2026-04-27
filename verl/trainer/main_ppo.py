@@ -411,6 +411,7 @@ def create_rl_dataset(
     conversation_export_resume_mode: str = "off",
     conversation_export_val_trial_idx: int | None = None,
     conversation_export_repeat_count: int = 1,
+    validation_image_token_reorder_settings: dict | None = None,
 ):
     """Create a dataset.
 
@@ -434,6 +435,7 @@ def create_rl_dataset(
     config_for_dataset["_conversation_export_validate"] = not is_train
     config_for_dataset["_conversation_export_val_trial_idx"] = conversation_export_val_trial_idx
     config_for_dataset["_conversation_export_repeat_count"] = int(max(1, conversation_export_repeat_count))
+    config_for_dataset["_validation_image_token_reorder_settings"] = validation_image_token_reorder_settings
 
     # Get the dataset class
     dataset_cls = get_dataset_class(data_config)

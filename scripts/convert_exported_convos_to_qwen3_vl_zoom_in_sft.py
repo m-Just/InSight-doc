@@ -700,7 +700,7 @@ def load_records(
             )
             if warning is not None:
                 warning_counts[warning] += 1
-                if only_correct_answers and question_id is not None and warning.startswith("filtered out by only-correct-answers"):
+                if only_correct_answers and question_id is not None:
                     wrong_question_ids.append(question_id)
                 continue
             assert converted is not None
@@ -722,7 +722,7 @@ def load_records(
             for _, converted, warning, question_id in executor.map(_convert_one_path_star, tasks, chunksize=8):
                 if warning is not None:
                     warning_counts[warning] += 1
-                    if only_correct_answers and question_id is not None and warning.startswith("filtered out by only-correct-answers"):
+                    if only_correct_answers and question_id is not None:
                         wrong_question_ids.append(question_id)
                     continue
                 assert converted is not None

@@ -79,6 +79,37 @@ from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _resolve_agent_loop_config_path(config_path: str) -> str:
+    if os.path.isabs(config_path):
+        return config_path
+
+    cwd = os.path.abspath(os.getcwd())
+    cwd_path = os.path.abspath(os.path.join(cwd, config_path))
+    if (cwd_path == cwd or cwd_path.startswith(cwd + os.sep)) and os.path.exists(cwd_path):
+        return cwd_path
+
+    try:
+        import verl
+
+        verl_package_dir = os.path.abspath(os.path.dirname(verl.__file__))
+        project_root = os.path.dirname(verl_package_dir)
+        dev_path = os.path.abspath(os.path.join(project_root, config_path))
+        if (dev_path == project_root or dev_path.startswith(project_root + os.sep)) and os.path.exists(dev_path):
+            return dev_path
+
+        install_path = os.path.abspath(os.path.join(verl_package_dir, config_path))
+        if (install_path == verl_package_dir or install_path.startswith(verl_package_dir + os.sep)) and os.path.exists(
+            install_path
+        ):
+            return install_path
+    except (ImportError, AttributeError):
+        pass
+
+    raise FileNotFoundError(
+        f"Agent loop configuration file not found: {config_path}. Tried current directory and verl project root."
+    )
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -420,6 +451,7 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self._validation_image_token_reorder_settings = self._get_validation_image_token_reorder_settings()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -440,6 +472,10 @@ class RayPPOTrainer:
         self._collate_fn = collate_fn
         num_workers = self.config.data["dataloader_num_workers"]
         self._dataloader_num_workers = num_workers
+        self._val_shuffle_enabled = self.config.data.get("validation_shuffle", True)
+        if self._validation_image_token_reorder_settings and self._val_shuffle_enabled:
+            print("validation image-token reordering enabled: overriding validation_shuffle=True to False")
+            self._val_shuffle_enabled = False
 
         # Skip training dataset/dataloader creation if val_only is enabled
         if val_only:
@@ -478,7 +514,7 @@ class RayPPOTrainer:
                 )
             assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
 
-        if val_dataset is None:
+        if val_dataset is None or self._validation_image_token_reorder_settings:
             val_dataset = self._create_val_dataset_for_trial(0)
         self.val_dataset = val_dataset
 
@@ -490,7 +526,7 @@ class RayPPOTrainer:
             dataset=self.val_dataset,
             batch_size=val_batch_size,
             num_workers=num_workers,
-            shuffle=self.config.data.get("validation_shuffle", True),
+            shuffle=self._val_shuffle_enabled,
             drop_last=False,
             collate_fn=collate_fn,
         )
@@ -545,6 +581,7 @@ class RayPPOTrainer:
             ),
             conversation_export_val_trial_idx=val_trial_idx,
             conversation_export_repeat_count=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+            validation_image_token_reorder_settings=self._validation_image_token_reorder_settings,
         )
 
     def _rebuild_val_dataloader_for_trial(self, val_trial_idx: int) -> None:
@@ -556,11 +593,52 @@ class RayPPOTrainer:
             dataset=self.val_dataset,
             batch_size=val_batch_size,
             num_workers=self._dataloader_num_workers,
-            shuffle=self.config.data.get("validation_shuffle", True),
+            shuffle=self._val_shuffle_enabled,
             drop_last=False,
             collate_fn=self._collate_fn,
         )
         self._current_val_trial_idx = val_trial_idx
+
+    def _get_validation_image_token_reorder_settings(self) -> dict[str, Any] | None:
+        agent_loop_config_path = self.config.actor_rollout_ref.rollout.agent.get("agent_loop_config_path")
+        if not agent_loop_config_path:
+            return None
+
+        resolved_path = _resolve_agent_loop_config_path(agent_loop_config_path)
+        loaded_configs = OmegaConf.load(resolved_path)
+        agent_loop_configs = list(loaded_configs) if OmegaConf.is_list(loaded_configs) else [loaded_configs]
+        agent_settings_by_name: dict[str, dict[str, Any]] = {}
+        for agent_loop_config in agent_loop_configs:
+            agent_name = OmegaConf.select(agent_loop_config, "name")
+            if agent_name not in {"insight_qwen_agent", "vreasoner_v2"}:
+                continue
+            agent_settings_by_name[agent_name] = {
+                "initial_rescale": float(OmegaConf.select(agent_loop_config, "initial_rescale", default=0.25)),
+                "gpt_image_max_area": int(
+                    OmegaConf.select(agent_loop_config, "gpt_image_max_area", default=1280 * 1280)
+                ),
+            }
+
+        if not agent_settings_by_name:
+            return None
+
+        default_agent_loop = self.config.actor_rollout_ref.rollout.agent.get("default_agent_loop")
+        settings = {
+            "enabled": True,
+            "agent_settings_by_name": agent_settings_by_name,
+            "num_workers": int(self.config.actor_rollout_ref.rollout.agent.num_workers),
+            "batch_size": self.config.data.val_batch_size,
+            "default_agent_loop": default_agent_loop,
+        }
+        print(
+            "validation image-token reordering configured: "
+            f"default_agent_loop={default_agent_loop} "
+            f"agent_names={sorted(agent_settings_by_name.keys())} "
+            f"agent_settings={agent_settings_by_name} "
+            f"num_workers={settings['num_workers']} "
+            f"batch_size={settings['batch_size']}"
+        )
+        return settings
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""

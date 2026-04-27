@@ -16,6 +16,7 @@
 
 import copy
 import logging
+import math
 import os
 import re
 import traceback
@@ -42,6 +43,20 @@ from verl.utils.vreasoner_v2_conversation_export import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _resize_dims_by_factor(size: tuple[int, int], factor: float) -> tuple[int, int]:
+    width, height = size
+    return (max(1, round(width * factor)), max(1, round(height * factor)))
+
+
+def _cap_size_by_area(size: tuple[int, int], max_area: int) -> tuple[int, int]:
+    width, height = size
+    area = width * height
+    if area <= max_area or max_area <= 0:
+        return size
+    ratio = (max_area / float(area)) ** 0.5
+    return (max(1, int(width * ratio)), max(1, int(height * ratio)))
 
 
 def collate_fn(data_list: list[dict]) -> dict:
@@ -278,6 +293,7 @@ class RLHFDataset(Dataset):
         self.conversation_export_validate = bool(config.get("_conversation_export_validate", not self.is_train))
         self.conversation_export_val_trial_idx = config.get("_conversation_export_val_trial_idx")
         self.conversation_export_repeat_count = int(max(1, config.get("_conversation_export_repeat_count", 1)))
+        self.validation_image_token_reorder_settings = config.get("_validation_image_token_reorder_settings")
 
         self._download()
         self._read_files_and_tokenize()
@@ -340,6 +356,215 @@ class RLHFDataset(Dataset):
             print(f"conversation export resume: skipped {skipped_completed} completed samples")
         return dataframe
 
+    def _get_image_size_for_token_estimate(self, image_value: Any) -> tuple[int, int] | None:
+        if isinstance(image_value, Image.Image):
+            return image_value.size
+
+        if isinstance(image_value, dict):
+            if "bytes" in image_value:
+                try:
+                    with Image.open(BytesIO(image_value["bytes"])) as image:
+                        return image.size
+                except Exception:
+                    return None
+            if "image" in image_value:
+                return self._get_image_size_for_token_estimate(image_value["image"])
+            if "image_url" in image_value:
+                image_url = image_value["image_url"]
+                if isinstance(image_url, dict):
+                    return self._get_image_size_for_token_estimate(image_url.get("url"))
+                return self._get_image_size_for_token_estimate(image_url)
+            return None
+
+        if isinstance(image_value, str):
+            if image_value.startswith("file://"):
+                image_value = image_value[7:]
+            if image_value.startswith(("http://", "https://", "data:image")):
+                return None
+            try:
+                with Image.open(image_value) as image:
+                    return image.size
+            except Exception:
+                return None
+
+        return None
+
+    def _get_validation_image_reorder_agent_settings(self, row_dict: dict[str, Any]) -> dict[str, Any] | None:
+        settings = self.validation_image_token_reorder_settings or {}
+        agent_settings_by_name = settings.get("agent_settings_by_name") or {}
+        if not agent_settings_by_name:
+            return None
+
+        agent_name = row_dict.get("agent_name")
+        if agent_name in agent_settings_by_name:
+            return agent_settings_by_name[agent_name]
+
+        default_agent_loop = settings.get("default_agent_loop")
+        if default_agent_loop in agent_settings_by_name:
+            return agent_settings_by_name[default_agent_loop]
+
+        if len(agent_settings_by_name) == 1:
+            return next(iter(agent_settings_by_name.values()))
+
+        return None
+
+    def _estimate_image_token_cost(self, row_dict: dict[str, Any]) -> int:
+        agent_settings = self._get_validation_image_reorder_agent_settings(row_dict)
+        if agent_settings is None:
+            return 0
+
+        initial_rescale = float(agent_settings.get("initial_rescale", 1.0))
+        gpt_image_max_area = int(agent_settings.get("gpt_image_max_area", 0))
+
+        total_tokens = 0
+        for image_value in row_dict.get(self.image_key, None) or []:
+            original_size = self._get_image_size_for_token_estimate(image_value)
+            if original_size is None:
+                continue
+            presented_size = _cap_size_by_area(
+                _resize_dims_by_factor(original_size, initial_rescale),
+                gpt_image_max_area,
+            )
+            total_tokens += max(1, math.ceil(presented_size[0] / 32.0) * math.ceil(presented_size[1] / 32.0))
+        return total_tokens
+
+    @staticmethod
+    def _split_group_sizes(total_items: int, num_groups: int) -> list[int]:
+        if total_items <= 0 or num_groups <= 0:
+            return []
+        base = total_items // num_groups
+        remainder = total_items % num_groups
+        return [base + (1 if i < remainder else 0) for i in range(num_groups)]
+
+    def _build_balanced_batch_order(
+        self,
+        batch_indices: list[int],
+        batch_costs: list[int],
+        num_groups: int,
+    ) -> tuple[list[int], list[list[int]], list[int]]:
+        if not batch_indices:
+            return [], [], []
+
+        num_groups = max(1, min(num_groups, len(batch_indices)))
+        target_sizes = self._split_group_sizes(len(batch_indices), num_groups)
+        groups: list[list[int]] = [[] for _ in range(num_groups)]
+        group_costs = [0 for _ in range(num_groups)]
+
+        for local_idx in sorted(range(len(batch_indices)), key=lambda idx: batch_costs[idx], reverse=True):
+            candidate_group_idxs = [
+                group_idx for group_idx, target_size in enumerate(target_sizes) if len(groups[group_idx]) < target_size
+            ]
+            chosen_group_idx = min(candidate_group_idxs, key=lambda group_idx: (group_costs[group_idx], len(groups[group_idx])))
+            groups[chosen_group_idx].append(batch_indices[local_idx])
+            group_costs[chosen_group_idx] += batch_costs[local_idx]
+
+        ordered_indices = [idx for group in groups for idx in group]
+        return ordered_indices, groups, group_costs
+
+    def _reorder_validation_by_image_tokens(self, dataframe: datasets.Dataset) -> datasets.Dataset:
+        settings = self.validation_image_token_reorder_settings or {}
+        if self.is_train or not settings or not settings.get("enabled", False):
+            return dataframe
+        if len(dataframe) == 0:
+            return dataframe
+
+        batch_size = settings.get("batch_size")
+        if batch_size is None or int(batch_size) <= 0:
+            batch_size = len(dataframe)
+        batch_size = min(int(batch_size), len(dataframe))
+        num_groups = max(1, int(settings.get("num_workers", 1)))
+        num_batches = math.ceil(len(dataframe) / batch_size)
+
+        costs = [self._estimate_image_token_cost(dataframe[idx]) for idx in range(len(dataframe))]
+        batch_target_sizes = self._split_group_sizes(len(dataframe), num_batches)
+        balanced_batches: list[list[int]] = [[] for _ in range(num_batches)]
+        balanced_batch_costs = [0 for _ in range(num_batches)]
+
+        for sample_idx in sorted(range(len(dataframe)), key=lambda idx: costs[idx], reverse=True):
+            candidate_batch_idxs = [
+                batch_idx
+                for batch_idx, target_size in enumerate(batch_target_sizes)
+                if len(balanced_batches[batch_idx]) < target_size
+            ]
+            chosen_batch_idx = min(
+                candidate_batch_idxs,
+                key=lambda batch_idx: (balanced_batch_costs[batch_idx], len(balanced_batches[batch_idx]), batch_idx),
+            )
+            balanced_batches[chosen_batch_idx].append(sample_idx)
+            balanced_batch_costs[chosen_batch_idx] += costs[sample_idx]
+
+        naive_batch_costs = []
+        for batch_start in range(0, len(dataframe), batch_size):
+            batch_indices = list(range(batch_start, min(batch_start + batch_size, len(dataframe))))
+            naive_batch_costs.append(sum(costs[idx] for idx in batch_indices))
+
+        reordered_indices: list[int] = []
+        naive_group_gap_values: list[int] = []
+        balanced_group_gap_values: list[int] = []
+        naive_group_max_values: list[int] = []
+        balanced_group_max_values: list[int] = []
+        example_batch_summaries: list[str] = []
+
+        for batch_idx, batch_indices in enumerate(balanced_batches):
+            batch_costs = [costs[idx] for idx in batch_indices]
+            effective_groups = max(1, min(num_groups, len(batch_indices)))
+
+            naive_target_sizes = self._split_group_sizes(len(batch_indices), effective_groups)
+            naive_group_costs = []
+            cursor = 0
+            for group_size in naive_target_sizes:
+                naive_group_costs.append(sum(batch_costs[cursor : cursor + group_size]))
+                cursor += group_size
+
+            batch_reordered_indices, groups, balanced_group_costs = self._build_balanced_batch_order(
+                batch_indices=batch_indices,
+                batch_costs=batch_costs,
+                num_groups=effective_groups,
+            )
+            reordered_indices.extend(batch_reordered_indices)
+
+            naive_group_gap_values.append(max(naive_group_costs) - min(naive_group_costs))
+            balanced_group_gap_values.append(max(balanced_group_costs) - min(balanced_group_costs))
+            naive_group_max_values.append(max(naive_group_costs))
+            balanced_group_max_values.append(max(balanced_group_costs))
+
+            if len(example_batch_summaries) < 5:
+                group_sizes = [len(group) for group in groups]
+                example_batch_summaries.append(
+                    f"batch[{batch_idx}] "
+                    f"batch_total_cost={sum(batch_costs)} "
+                    f"group_sizes={group_sizes} "
+                    f"group_costs={balanced_group_costs}"
+                )
+
+        dataframe = dataframe.select(reordered_indices)
+        print(
+            "validation image-token reordering: "
+            f"samples={len(dataframe)} "
+            f"num_batches={num_batches} "
+            f"batch_size={batch_size} "
+            f"num_groups={num_groups} "
+            f"estimated_tokens_total={sum(costs)} "
+            f"estimated_tokens_avg={sum(costs) / len(costs):.1f} "
+            f"naive_batch_cost_mean={np.mean(naive_batch_costs):.1f} "
+            f"balanced_batch_cost_mean={np.mean(balanced_batch_costs):.1f} "
+            f"naive_batch_gap_mean={np.mean([abs(cost - np.mean(naive_batch_costs)) for cost in naive_batch_costs]):.1f} "
+            f"balanced_batch_gap_mean={np.mean([abs(cost - np.mean(balanced_batch_costs)) for cost in balanced_batch_costs]):.1f} "
+            f"naive_batch_min={min(naive_batch_costs)} "
+            f"naive_batch_max={max(naive_batch_costs)} "
+            f"balanced_batch_min={min(balanced_batch_costs)} "
+            f"balanced_batch_max={max(balanced_batch_costs)} "
+            f"naive_group_max_cost_mean={np.mean(naive_group_max_values):.1f} "
+            f"balanced_group_max_cost_mean={np.mean(balanced_group_max_values):.1f} "
+            f"naive_group_gap_mean={np.mean(naive_group_gap_values):.1f} "
+            f"balanced_group_gap_mean={np.mean(balanced_group_gap_values):.1f} "
+            f"naive_group_gap_max={max(naive_group_gap_values)} "
+            f"balanced_group_gap_max={max(balanced_group_gap_values)}"
+        )
+        for summary in example_batch_summaries:
+            print(f"validation image-token reordering example: {summary}")
+        return dataframe
+
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
 
@@ -399,6 +624,7 @@ class RLHFDataset(Dataset):
             print(f"selected {self.max_samples} random samples out of {total}")
 
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+        self.dataframe = self._reorder_validation_by_image_tokens(self.dataframe)
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts
