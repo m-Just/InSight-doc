@@ -15,6 +15,7 @@ class VSearchAgentLoopConfig(AgentLoopConfig):
     vsearcher_loop_cls: str = MISSING
     vreasoner_v2_conversation_export_dir: Optional[str] = None
     vreasoner_v2_conversation_export_resume_mode: str = "off"
+    vreasoner_v2_profile_dir: Optional[str] = None
 
 
 @dataclass

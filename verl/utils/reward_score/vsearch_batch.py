@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Any, Callable
 import logging
@@ -19,6 +20,7 @@ from verl.utils.vsearch import (
 )
 from verl.utils.vsearch_role_play_prompt import qa_verify as verify_prompt
 from verl.utils.vreasoner_v2_conversation_export import append_reward_info
+from verl.utils.vsearch_profile import summarize_numbers, write_profile_event
 
 from insight_o3.utils.api import create_async_openai_client, query_api  # pyright: ignore[reportMissingImports]
 from insight_o3 import prompts as insight_o3_prompts  # pyright: ignore[reportMissingImports]
@@ -67,14 +69,17 @@ class RewardComputer:
     async def _run_single(
         self,
         idx: int,
+        trial_count: int,
         compute_single_fn: Callable,
         data_source: str,
         solution_str: str,
         ground_truth: str,
         extra_info: dict,
         **reward_kwargs: dict,
-    ) -> tuple[int, Any, Exception | None]:
+    ) -> tuple[int, Any, Exception | None, float, str]:
         assert self._semaphore is not None
+        t0 = time.perf_counter()
+        fn_name = getattr(compute_single_fn, "__name__", str(compute_single_fn))
         try:
             async with self._semaphore:
                 result = await asyncio.wait_for(
@@ -87,9 +92,45 @@ class RewardComputer:
                     ),
                     timeout=self.task_timeout,
                 )
-            return idx, result, None
+            duration = time.perf_counter() - t0
+            write_profile_event(
+                "reward_task",
+                {
+                    "event": "reward_task",
+                    "idx": idx,
+                    "trial": trial_count,
+                    "data_source": data_source,
+                    "agent_name": extra_info.get("agent_name"),
+                    "job_id": extra_info.get("job_id"),
+                    "root_job_id": extra_info.get("root_job_id"),
+                    "parent_job_id": extra_info.get("parent_job_id"),
+                    "compute_fn": fn_name,
+                    "success": True,
+                    "timing_s": {"task": duration},
+                },
+            )
+            return idx, result, None, duration, fn_name
         except Exception as exc:  # bubble idx back to the collector
-            return idx, None, exc
+            duration = time.perf_counter() - t0
+            write_profile_event(
+                "reward_task",
+                {
+                    "event": "reward_task",
+                    "idx": idx,
+                    "trial": trial_count,
+                    "data_source": data_source,
+                    "agent_name": extra_info.get("agent_name"),
+                    "job_id": extra_info.get("job_id"),
+                    "root_job_id": extra_info.get("root_job_id"),
+                    "parent_job_id": extra_info.get("parent_job_id"),
+                    "compute_fn": fn_name,
+                    "success": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "timing_s": {"task": duration},
+                },
+            )
+            return idx, None, exc, duration, fn_name
 
     async def compute_batch(
         self,
@@ -113,6 +154,7 @@ class RewardComputer:
         success = [False] * total_samples
 
         while trial_count <= self.max_retries:
+            trial_start_time = time.perf_counter()
             tasks = []
             for i, (data_source, solution_str, ground_truth, extra_info) in enumerate(
                 zip(data_sources, solution_strs, ground_truths, extra_infos, strict=True)
@@ -123,6 +165,7 @@ class RewardComputer:
                 task = asyncio.create_task(
                     self._run_single(
                         i,
+                        trial_count,
                         compute_single_fn,
                         data_source,
                         solution_str,
@@ -133,13 +176,19 @@ class RewardComputer:
                 )
                 tasks.append(task)
 
+            trial_task_durations = []
+            trial_error_types = defaultdict(int)
+            trial_compute_fns = defaultdict(int)
             for task in asyncio.as_completed(tasks):
-                idx, task_result, error = await task
+                idx, task_result, error, task_duration, fn_name = await task
+                trial_task_durations.append(task_duration)
+                trial_compute_fns[fn_name] += 1
                 if error is None:
                     results[idx] = task_result
                     success[idx] = True
                     continue
 
+                trial_error_types[type(error).__name__] += 1
                 if isinstance(error, JudgeError):
                     logger.warning(f"[RewardWorker] Task {idx} failed: {error}")
                 elif isinstance(error, asyncio.TimeoutError):
@@ -150,6 +199,23 @@ class RewardComputer:
 
             task_success_rate = sum(success) / total_samples
             num_failed = total_samples - sum(success)
+            trial_duration = time.perf_counter() - trial_start_time
+            write_profile_event(
+                "reward_trial",
+                {
+                    "event": "reward_trial",
+                    "trial": trial_count,
+                    "total_samples": total_samples,
+                    "attempted_samples": len(tasks),
+                    "cumulative_successful": sum(success),
+                    "cumulative_failed": num_failed,
+                    "success_rate": task_success_rate,
+                    "error_types": dict(trial_error_types),
+                    "compute_fns": dict(trial_compute_fns),
+                    "task_duration_summary_s": summarize_numbers(trial_task_durations),
+                    "timing_s": {"trial": trial_duration},
+                },
+            )
             if task_success_rate >= self.min_success_rate:
                 logger.info(
                     f"[RewardWorker] Work finished with "
@@ -882,9 +948,32 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
         n_failed = sum(s is False for s in success)
         n_correct = sum(score.is_correct for score in scores if score is not None)
         n_wrong = sum(not score.is_correct for score in scores if score is not None)
+        elapsed = time.time() - start_time
         logger.info(
             f"[RewardWorker] Accuracy ({reward_kwargs['judge_model']}): "
             f"{n_correct} correct, {n_wrong} wrong, {n_failed} failed, {n_skipped} skipped out of {len(scores)} samples"
+        )
+        agent_names = defaultdict(int)
+        for extra_info in extra_infos:
+            agent_names[extra_info.get("agent_name")] += 1
+        write_profile_event(
+            "reward_batch",
+            {
+                "event": "reward_batch",
+                "total_samples": len(scores),
+                "agent_names": dict(agent_names),
+                "judge_model": reward_kwargs["judge_model"],
+                "num_workers": reward_kwargs["num_workers"],
+                "task_timeout": reward_kwargs["task_timeout"],
+                "min_success_rate": reward_kwargs["min_success_rate"],
+                "max_retries": reward_kwargs["max_retries"],
+                "retry_interval": reward_kwargs["retry_interval"],
+                "n_correct": n_correct,
+                "n_wrong": n_wrong,
+                "n_failed": n_failed,
+                "n_skipped": n_skipped,
+                "timing_s": {"total": elapsed},
+            },
         )
 
         score_dicts = []

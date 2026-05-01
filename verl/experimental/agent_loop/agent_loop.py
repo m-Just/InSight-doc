@@ -49,6 +49,7 @@ from verl.utils.rollout_trace import (
     rollout_trace_op,
 )
 from verl.utils.transferqueue_utils import tqbridge
+from verl.utils.vsearch_profile import summarize_numbers, write_profile_event
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
 logger = logging.getLogger(__file__)
@@ -495,6 +496,7 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        worker_t0 = time.perf_counter()
         config = self.config.actor_rollout_ref.rollout
         sampling_params = dict(
             temperature=config.temperature,
@@ -556,6 +558,28 @@ class AgentLoopWorker:
         outputs = sum(outputs, [])
 
         output = self._postprocess(outputs, batch.meta_info.get("validate", False))
+        worker_t1 = time.perf_counter()
+        metrics = output.meta_info.get("metrics", [])
+        write_profile_event(
+            "agent_worker",
+            {
+                "event": "agent_worker_batch",
+                "worker_pid": os.getpid(),
+                "global_steps": batch.meta_info.get("global_steps", -1),
+                "validate": batch.meta_info.get("validate", False),
+                "input_batch_size": len(batch),
+                "output_batch_size": len(output),
+                "timing_s": {"total": worker_t1 - worker_t0},
+                "metric_summary": {
+                    "generate_sequences": summarize_numbers([m.get("generate_sequences", 0.0) for m in metrics]),
+                    "tool_calls": summarize_numbers([m.get("tool_calls", 0.0) for m in metrics]),
+                    "conversation_wall_time": summarize_numbers(
+                        [m.get("conversation_wall_time", 0.0) for m in metrics]
+                    ),
+                },
+            },
+            config=self.config,
+        )
         return output
 
     async def _run_agent_loop(
@@ -591,12 +615,46 @@ class AgentLoopWorker:
             )
 
             kwargs["_validate"] = trajectory["validate"]
+            t_before_run = time.perf_counter()
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            t_after_run = time.perf_counter()
 
             internal_outputs = [await self._agent_loop_postprocess(output, **kwargs)]
             if output.subagent_outputs:
                 for subagent_output in output.subagent_outputs:
                     internal_outputs.append(await self._agent_loop_postprocess(subagent_output, **kwargs))
+            t_after_postprocess = time.perf_counter()
+
+            extra_fields = output.extra_fields or {}
+            write_profile_event(
+                "agent_sample",
+                {
+                    "event": "agent_sample",
+                    "worker_pid": os.getpid(),
+                    "step": trajectory["step"],
+                    "sample_index": trajectory["sample_index"],
+                    "rollout_n": trajectory["rollout_n"],
+                    "validate": trajectory["validate"],
+                    "agent_name": agent_name,
+                    "job_id": extra_fields.get("job_id"),
+                    "root_job_id": extra_fields.get("root_job_id"),
+                    "conversation_export_json_path": extra_fields.get("conversation_export_json_path"),
+                    "n_tool_calls": extra_fields.get("n_tool_calls"),
+                    "num_turns": output.num_turns,
+                    "subagent_output_count": len(output.subagent_outputs or []),
+                    "prompt_tokens": len(output.prompt_ids),
+                    "response_tokens": len(output.response_ids),
+                    "failure_reasons": extra_fields.get("failure_reasons"),
+                    "critical_failure": extra_fields.get("critical_failure"),
+                    "timing_s": {
+                        "agent_loop_run": t_after_run - t_before_run,
+                        "postprocess_all_outputs": t_after_postprocess - t_after_run,
+                        "total": t_after_postprocess - t_before_run,
+                    },
+                    "metrics": output.metrics.model_dump(),
+                },
+                config=self.config,
+            )
 
             return internal_outputs
 
@@ -1054,6 +1112,7 @@ class AgentLoopManager:
         t2 = time.perf_counter()
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
+        chunk_sizes = [len(chunk) for chunk in chunkes]
         t3 = time.perf_counter()
         outputs = ray.get(
             [
@@ -1069,6 +1128,8 @@ class AgentLoopManager:
         if self.reward_model_manager:
             self.reward_model_manager.sleep()
         t6 = time.perf_counter()
+        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+        all_metrics = [metric for chunk in metrics for metric in chunk]
 
         print(
             "AgentLoopManager.generate_sequences timing: "
@@ -1080,9 +1141,37 @@ class AgentLoopManager:
             f"sleep={t6 - t5:.2f}s "
             f"total={t6 - t0:.2f}s"
         )
+        write_profile_event(
+            "agent_manager",
+            {
+                "event": "agent_manager_generate_sequences",
+                "global_steps": prompts.meta_info.get("global_steps", -1),
+                "validate": prompts.meta_info.get("validate", False),
+                "input_batch_size": len(prompts),
+                "output_batch_size": len(output),
+                "num_workers": len(self.agent_loop_workers),
+                "chunk_sizes": chunk_sizes,
+                "timing_s": {
+                    "wake_up": t1 - t0,
+                    "reward_wake_up": t2 - t1,
+                    "chunk": t3 - t2,
+                    "ray_get": t4 - t3,
+                    "concat": t5 - t4,
+                    "sleep": t6 - t5,
+                    "total": t6 - t0,
+                },
+                "metric_summary": {
+                    "generate_sequences": summarize_numbers([m.get("generate_sequences", 0.0) for m in all_metrics]),
+                    "tool_calls": summarize_numbers([m.get("tool_calls", 0.0) for m in all_metrics]),
+                    "conversation_wall_time": summarize_numbers(
+                        [m.get("conversation_wall_time", 0.0) for m in all_metrics]
+                    ),
+                },
+            },
+            config=self.config,
+        )
 
         # calculate performance metrics
-        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}

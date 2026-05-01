@@ -56,6 +56,7 @@ if [ "$VAL_ONLY" == "True" ]; then
 else
     CONVERSATION_EXPORT_DIR="${CONVERSATION_EXPORT_DIR:-$WORK_DIR/exported_conversations/$PROJECT_NAME/$EXP_NAME}"
 fi
+export VSEARCH_PROFILE_DIR="${VSEARCH_PROFILE_DIR:-$CONVERSATION_EXPORT_DIR/_profile}"
 
 if [ "$MODEL_PATH" == "Qwen/Qwen3-VL-8B-Instruct" ]; then
         # actor_rollout_ref.rollout.agent.agent_loop_config_path="recipe/vsearch/config/agent_gemini-3-flash-preview_vr2.yaml" \
@@ -69,6 +70,7 @@ if [ "$MODEL_PATH" == "Qwen/Qwen3-VL-8B-Instruct" ]; then
         +actor_rollout_ref.rollout.agent.vsearcher_loop_cls=VSearcherLoopQwen3VL \
         +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_dir="$CONVERSATION_EXPORT_DIR" \
         +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_resume_mode=skip_completed \
+        +actor_rollout_ref.rollout.agent.vreasoner_v2_profile_dir="$VSEARCH_PROFILE_DIR" \
         actor_rollout_ref.model.custom_chat_template=null \
         actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
         actor_rollout_ref.rollout.val_kwargs.top_p=0.8 \
@@ -99,6 +101,7 @@ else
 fi
 
 echo "CONVERSATION_EXPORT_DIR: $CONVERSATION_EXPORT_DIR"
+echo "VSEARCH_PROFILE_DIR: $VSEARCH_PROFILE_DIR"
 
 
 

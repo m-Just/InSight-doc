@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import re
+import time
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from functools import partial
@@ -48,6 +49,7 @@ from verl.utils.vreasoner_v2_conversation_export import (
     build_export_record,
     export_conversation,
 )
+from verl.utils.vsearch_profile import write_profile_event
 
 # Qwen3-VL uses relative coordinates in the range [0, 1000) for bounding boxes
 # This is different from Qwen2.5-VL which uses absolute pixel coordinates
@@ -436,6 +438,7 @@ class VSearcherMixin:
         Returns:
             AgentLoopOutput with VSearcher extra fields
         """
+        t_start = time.perf_counter()
         # Store extra_info for coordinate conversion (used by subclasses)
         self._extra_info = kwargs["extra_info"]
 
@@ -444,6 +447,7 @@ class VSearcherMixin:
             self._pre_run(sampling_params, kwargs)
 
         # Run the parent agent loop
+        t_before_parent = time.perf_counter()
         try:
             output = await super().run(sampling_params, **kwargs)
         except ValueError as e:
@@ -451,6 +455,7 @@ class VSearcherMixin:
                 logger.warning(f"invalid aspect ratio: {e}")
             else:
                 raise e
+        t_after_parent = time.perf_counter()
 
         # Construct full messages from token IDs
         all_ids = output.prompt_ids + output.response_ids
@@ -485,6 +490,33 @@ class VSearcherMixin:
             messages=messages,
         )
         output.extra_fields.update(extra_fields)
+        t_end = time.perf_counter()
+        write_profile_event(
+            "vsearcher_sample",
+            {
+                "event": "vsearcher_sample",
+                "agent_name": self.AGENT_NAME,
+                "validate": validate,
+                "job_id": output.extra_fields.get("job_id"),
+                "parent_job_id": output.extra_fields.get("parent_job_id"),
+                "root_job_id": output.extra_fields.get("root_job_id"),
+                "idx_as_child": output.extra_fields.get("idx_as_child"),
+                "img_idx": output.extra_fields.get("img_idx"),
+                "final_bbox": final_bbox,
+                "tool_call_count": len(tool_call_bboxes or []),
+                "prompt_tokens": len(output.prompt_ids),
+                "response_tokens": len(output.response_ids),
+                "num_turns": output.num_turns,
+                "timing_s": {
+                    "pre_run": t_before_parent - t_start,
+                    "parent_agent_run": t_after_parent - t_before_parent,
+                    "decode_and_extract": t_end - t_after_parent,
+                    "total": t_end - t_start,
+                },
+                "metrics": output.metrics.model_dump(),
+            },
+            config=self.config,
+        )
 
         return output
 
@@ -1107,6 +1139,7 @@ class VReasonerLoopV2(VReasonerLoop):
         sampling_params: dict[str, Any],
         **kwargs,
     ) -> AgentLoopOutput:
+        t_sample_start = time.perf_counter()
         job_id = uuid4().hex
         root_job_id = kwargs.get("root_job_id", job_id)
         conversation_export_id = kwargs.get(
@@ -1145,8 +1178,12 @@ class VReasonerLoopV2(VReasonerLoop):
 
         base_zoom_create_kwargs = kwargs["tools_kwargs"].get("image_zoom_in_tool", {}).get("create_kwargs", {})
         max_pixels = base_zoom_create_kwargs.get("max_pixels")
+        api_rounds = []
+        child_runs = []
 
         while True:
+            api_round_idx = len(api_rounds)
+            t_api_start = time.perf_counter()
             with simple_timer("api_calls", profile):
                 request = await get_gpt_visual_search_request_v2(
                     initial_question=kwargs["extra_info"]["question"],
@@ -1162,6 +1199,26 @@ class VReasonerLoopV2(VReasonerLoop):
                     tool_result=tool_result,
                     enable_stop=self.enable_stop,
                 )
+            t_api_end = time.perf_counter()
+            api_round_event = {
+                "event": "vreasoner_v2_api_round",
+                "job_id": job_id,
+                "root_job_id": root_job_id,
+                "conversation_export_id": conversation_export_id,
+                "validate": validate,
+                "round_idx": api_round_idx,
+                "prior_tool_calls": n_tool_calls,
+                "presented_image_count": len(presented_images),
+                "success": request.success,
+                "is_last_round": request.is_last_round,
+                "requested_region_description": request.region_description,
+                "requested_img_idx": request.img_idx,
+                "has_answer": request.answer is not None,
+                "failure_reasons": list(request.failure_reasons or []),
+                "timing_s": {"api_round": t_api_end - t_api_start},
+            }
+            api_rounds.append(api_round_event)
+            write_profile_event("vreasoner_v2_api", api_round_event, config=self.config)
 
             if request.failure_reasons:
                 failure_events.append(
@@ -1305,10 +1362,30 @@ To finish, bring everything together in a clear, synthesized answer that fully r
             }
 
             with simple_timer("vsearcher_loop.run", profile):
+                t_child_start = time.perf_counter()
                 vsearcher_output = await self.vsearcher_loop.run(dict(sampling_params), **vsearcher_kwargs)
+                t_child_end = time.perf_counter()
                 vsearcher_output.extra_fields["idx_as_child"] = len(vsearcher_outputs)
                 vsearcher_output.extra_fields["img_idx"] = img_idx
             vsearcher_outputs.append(vsearcher_output)
+            child_event = {
+                "event": "vreasoner_v2_child_vsearcher",
+                "job_id": job_id,
+                "root_job_id": root_job_id,
+                "child_idx": len(vsearcher_outputs) - 1,
+                "child_job_id": vsearcher_output.extra_fields.get("job_id"),
+                "requested_img_idx": img_idx,
+                "requested_region_description": request.region_description,
+                "final_bbox": vsearcher_output.extra_fields.get("final_bbox"),
+                "tool_call_count": len(vsearcher_output.extra_fields.get("tool_call_bboxes") or []),
+                "prompt_tokens": len(vsearcher_output.prompt_ids),
+                "response_tokens": len(vsearcher_output.response_ids),
+                "num_turns": vsearcher_output.num_turns,
+                "timing_s": {"child_vsearcher": t_child_end - t_child_start},
+                "metrics": vsearcher_output.metrics.model_dump(),
+            }
+            child_runs.append(child_event)
+            write_profile_event("vreasoner_v2_child", child_event, config=self.config)
 
             bbox = vsearcher_output.extra_fields["final_bbox"]
             error_message_due_to_vsearcher_failure = (
@@ -1472,6 +1549,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
 
         logger.info(f"vreasoner_v2 loop completed: {profile=}")
 
+        t_post_start = time.perf_counter()
         if self.multi_image_input:
             n_images = len(kwargs["extra_info"]["image_ori"])
             vision_tokens = "".join("<|vision_start|><|vision_end|>" for _ in range(n_images))
@@ -1500,6 +1578,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
             None, partial(self.processor, text=[raw_prompt], return_tensors="pt")
         )
         prompt_ids = model_inputs.pop("input_ids").squeeze(0).tolist()
+        t_prompt_ready = time.perf_counter()
 
         def maybe_truncate(text: str, max_length_char: int = 4096) -> str:
             if len(text) > max_length_char:
@@ -1585,8 +1664,10 @@ To finish, bring everything together in a clear, synthesized answer that fully r
         response_length = self.config.actor_rollout_ref.rollout.response_length
         response_ids_shortened = response_ids_shortened[-response_length:]
         response_mask_shortened = response_mask_shortened[-response_length:]
+        t_messages_replayed = time.perf_counter()
 
         conversation_export_json_path = None
+        t_export_start = time.perf_counter()
         if self.conversation_export_dir:
             try:
                 record = build_export_record(
@@ -1648,6 +1729,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                         "error_message": str(exc),
                     }
                 )
+        t_export_end = time.perf_counter()
 
         extra_fields = ExtraFields(
             agent_name='vreasoner_v2',
@@ -1666,7 +1748,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
         extra_fields = asdict(extra_fields)
         extra_fields.update({"turn_scores": [], "tool_rewards": []})
 
-        return AgentLoopOutput(
+        output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids_shortened,
             response_mask=response_mask_shortened,
@@ -1678,6 +1760,61 @@ To finish, bring everything together in a clear, synthesized answer that fully r
             extra_fields=extra_fields,
             subagent_outputs=vsearcher_outputs,
         )
+        t_sample_end = time.perf_counter()
+        write_profile_event(
+            "vreasoner_v2_sample",
+            {
+                "event": "vreasoner_v2_sample",
+                "job_id": job_id,
+                "root_job_id": root_job_id,
+                "conversation_export_id": conversation_export_id,
+                "conversation_export_json_path": conversation_export_json_path,
+                "validate": validate,
+                "critical_failure": critical_failure,
+                "failure_reasons": (request.failure_reasons if request is not None and request.failure_reasons else None),
+                "n_tool_calls": n_tool_calls,
+                "api_round_count": len(api_rounds),
+                "child_vsearcher_count": len(child_runs),
+                "presented_image_count": len(presented_images),
+                "messages_api_count": len(messages_api),
+                "prompt_tokens": len(prompt_ids),
+                "response_tokens": len(response_ids_shortened),
+                "response_truncated": len(response_ids_shortened) >= response_length,
+                "timing_s": {
+                    "api_calls": profile.get("api_calls", 0.0),
+                    "child_vsearcher": profile.get("vsearcher_loop.run", 0.0),
+                    "build_prompt": t_prompt_ready - t_post_start,
+                    "message_replay_tokenize": t_messages_replayed - t_prompt_ready,
+                    "conversation_export": t_export_end - t_export_start,
+                    "postprocess_total": t_sample_end - t_post_start,
+                    "total": t_sample_end - t_sample_start,
+                },
+                "api_rounds": [
+                    {
+                        "round_idx": e["round_idx"],
+                        "success": e["success"],
+                        "is_last_round": e["is_last_round"],
+                        "has_answer": e["has_answer"],
+                        "requested_img_idx": e["requested_img_idx"],
+                        "failure_reasons": e["failure_reasons"],
+                        "timing_s": e["timing_s"],
+                    }
+                    for e in api_rounds
+                ],
+                "child_runs": [
+                    {
+                        "child_idx": e["child_idx"],
+                        "child_job_id": e["child_job_id"],
+                        "requested_img_idx": e["requested_img_idx"],
+                        "timing_s": e["timing_s"],
+                        "metrics": e["metrics"],
+                    }
+                    for e in child_runs
+                ],
+            },
+            config=self.config,
+        )
+        return output
 
 
 @register("vreasoner_qwen3_vl")

@@ -68,6 +68,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.vsearch_profile import get_profile_dir, write_profile_event
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
@@ -913,9 +914,20 @@ class RayPPOTrainer:
 
         packets_count_by_data_source = defaultdict(int)
 
-        for test_data in tqdm(self.val_dataloader, desc="Validation Progress"):
+        profile_dir = get_profile_dir(self.config)
+        if profile_dir:
+            print(f"Validation profiling enabled: {profile_dir}")
+        max_profile_val_batches = None
+        if os.getenv("VSEARCH_PROFILE_MAX_VAL_BATCHES"):
+            max_profile_val_batches = int(os.environ["VSEARCH_PROFILE_MAX_VAL_BATCHES"])
+            if max_profile_val_batches <= 0:
+                raise ValueError(f"VSEARCH_PROFILE_MAX_VAL_BATCHES must be positive, got {max_profile_val_batches}")
+            print(f"Validation profiling will stop after {max_profile_val_batches} batch(es).")
+
+        for val_batch_idx, test_data in enumerate(tqdm(self.val_dataloader, desc="Validation Progress")):
             t_batch_start = time.perf_counter()
             test_batch = DataProto.from_single_dict(test_data)
+            raw_batch_size = len(test_batch)
 
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(
@@ -926,6 +938,7 @@ class RayPPOTrainer:
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
+            repeated_batch_size = len(test_batch)
             self._assign_conversation_export_ids(test_batch)
 
             # we only do validation on rule-based rm
@@ -953,6 +966,7 @@ class RayPPOTrainer:
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            padded_batch_size = len(test_gen_batch_padded)
             t_before_generate = time.perf_counter()
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
@@ -966,6 +980,7 @@ class RayPPOTrainer:
                 test_batch, test_output_gen_batch_padded, pad_size
             )
             t_after_reorganize = time.perf_counter()
+            reorganized_batch_size = len(test_batch)
 
             print("validation generation end")
             print(
@@ -1007,6 +1022,31 @@ class RayPPOTrainer:
                 "Validation reward timing: "
                 f"reward_compute={t_after_reward - t_after_reorganize:.2f}s "
                 f"total_batch={t_after_reward - t_batch_start:.2f}s"
+            )
+            write_profile_event(
+                "validation_batch",
+                {
+                    "event": "validation_batch",
+                    "val_trial_idx": val_trial_idx,
+                    "batch_idx": val_batch_idx,
+                    "global_steps": self.global_steps,
+                    "raw_batch_size": raw_batch_size,
+                    "repeated_batch_size": repeated_batch_size,
+                    "padded_batch_size": padded_batch_size,
+                    "reorganized_batch_size": reorganized_batch_size,
+                    "size_divisor": size_divisor,
+                    "pad_size": pad_size,
+                    "new_pad_size": new_pad_size,
+                    "timing_s": {
+                        "batch_prep": t_before_generate - t_batch_start,
+                        "generate": t_after_generate - t_before_generate,
+                        "reorganize": t_after_reorganize - t_after_generate,
+                        "reward_compute": t_after_reward - t_after_reorganize,
+                        "total_batch": t_after_reward - t_batch_start,
+                    },
+                    "reward_extra_keys": sorted(reward_extra_info.keys()),
+                },
+                config=self.config,
             )
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
@@ -1061,6 +1101,20 @@ class RayPPOTrainer:
                         packet_id=packets_count_by_data_source[data_source],
                     )
                     packets_count_by_data_source[data_source] += 1
+
+            if max_profile_val_batches is not None and val_batch_idx + 1 >= max_profile_val_batches:
+                print(f"Stopping validation after {val_batch_idx + 1} batch(es) due to VSEARCH_PROFILE_MAX_VAL_BATCHES.")
+                write_profile_event(
+                    "validation_control",
+                    {
+                        "event": "validation_profile_stop",
+                        "val_trial_idx": val_trial_idx,
+                        "completed_batches": val_batch_idx + 1,
+                        "max_profile_val_batches": max_profile_val_batches,
+                    },
+                    config=self.config,
+                )
+                break
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
