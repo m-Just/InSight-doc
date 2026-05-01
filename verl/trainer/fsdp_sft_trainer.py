@@ -135,6 +135,7 @@ class FSDPSFTTrainer:
         self._init_checkpoint_manager()
 
         self.load_checkpoint()
+        self._handle_epoch_boundary_resume()
 
         if self.device_mesh.get_rank() == 0:
             print(self.config)
@@ -203,6 +204,27 @@ class FSDPSFTTrainer:
             drop_last=True,
             pin_memory_device=device_name,
         )
+
+    def _handle_epoch_boundary_resume(self):
+        """Reset the train dataloader when resuming from an epoch-boundary checkpoint.
+
+        StatefulDataLoader restores the iterator position exactly. If a checkpoint is taken
+        right after the last batch of an epoch, restoring that exhausted iterator and then
+        starting the next epoch loop can silently skip one full epoch. Rebuild the loader so
+        the next epoch starts from a fresh iterator while preserving the resumed global step.
+        """
+        if self.resume_global_step <= 0:
+            return
+        if self.resume_global_step % self.steps_per_epoch != 0:
+            return
+
+        if self.device_mesh.get_rank() == 0:
+            print(
+                "Resume checkpoint is at an epoch boundary; rebuilding the train dataloader "
+                "to avoid skipping the next epoch."
+            )
+
+        self._build_dataloader(self.train_dataset, self.val_dataset)
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):

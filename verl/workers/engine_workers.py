@@ -263,6 +263,33 @@ class TrainingWorker(Worker, DistProfilerExtension):
         global_token_num = tu.get(data, key="global_token_num")
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
 
+        if self.rank == 3:
+            sample_info = data.get("debug_sample_info", None)
+            if sample_info is not None and hasattr(sample_info, "tolist"):
+                sample_info = sample_info.tolist()
+            if (
+                isinstance(sample_info, list)
+                and len(sample_info) == 2
+                and {sample_info[0].get("source_row"), sample_info[1].get("source_row")} == {194, 1390}
+            ):
+                try:
+                    position_shapes = [tuple(t.shape) for t in data["position_ids"].unbind()]
+                    logger.warning(
+                        "engine_worker train_batch entry probe passed rank=%s position_ids_shape=%s "
+                        "position_shapes=%s sample_info=%s",
+                        self.rank,
+                        data["position_ids"].shape,
+                        position_shapes,
+                        sample_info,
+                    )
+                except Exception:
+                    logger.exception(
+                        "engine_worker train_batch entry probe failed rank=%s position_ids_shape=%s sample_info=%s",
+                        self.rank,
+                        data["position_ids"].shape,
+                        sample_info,
+                    )
+
         # inject engineering parameters if not specified
         default_keys = dict(
             use_remove_padding=self.model_config.use_remove_padding,

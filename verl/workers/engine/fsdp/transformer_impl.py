@@ -482,16 +482,53 @@ class FSDPEngine(BaseEngine):
             return torch.distributed.group.WORLD
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+        sample_info = data.get("debug_sample_info", None)
+        if sample_info is not None and hasattr(sample_info, "tolist"):
+            sample_info = sample_info.tolist()
+        debug_target_batch = (
+            self.rank == 3
+            and isinstance(sample_info, list)
+            and len(sample_info) == 2
+            and {sample_info[0].get("source_row"), sample_info[1].get("source_row")} == {194, 1390}
+        )
+
+        def _probe(stage: str):
+            if not debug_target_batch:
+                return
+            try:
+                position_shapes = [tuple(t.shape) for t in data["position_ids"].unbind()]
+                logger.warning(
+                    "forward_backward_batch probe passed stage=%s rank=%s position_ids_shape=%s position_shapes=%s sample_info=%s",
+                    stage,
+                    self.rank,
+                    data["position_ids"].shape,
+                    position_shapes,
+                    sample_info,
+                )
+            except Exception:
+                logger.exception(
+                    "forward_backward_batch probe failed stage=%s rank=%s position_ids_shape=%s sample_info=%s",
+                    stage,
+                    self.rank,
+                    data["position_ids"].shape,
+                    sample_info,
+                )
+
+        _probe("entry")
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+        _probe("after_assign_sp_size")
 
         # compute num_tokens in global batch for loss normalization
         batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+        _probe("after_loss_mask_sum")
         torch.distributed.all_reduce(
             batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
         )
+        _probe("after_all_reduce")
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+        _probe("before_prepare_micro_batches")
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True

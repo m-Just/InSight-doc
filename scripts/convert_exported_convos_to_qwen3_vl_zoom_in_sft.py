@@ -58,20 +58,33 @@ Decision table:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import io
 import json
 import os
+import re
+import sys
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 from PIL import Image
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import verl.utils.vreasoner_v2_prompt as prompts
 from verl.utils.vreasoner_v2_conversation_export import load_exported_conversation, restore_presented_images
+from scripts.mark_bad_exported_conversations import (
+    QUALITY_FIELD,
+    Thresholds as DegenerateThresholds,
+    scan_record as scan_degenerate_record,
+)
 
 
 IMAGE_ZOOM_IN_TOOL_SCHEMA = {
@@ -108,6 +121,9 @@ IMAGE_ZOOM_IN_TOOL_SCHEMA = {
         },
     },
 }
+
+
+PLAIN_FINAL_ANSWER_POSTPROCESS_PROMPT_VERSION = "qwen32b_style_v1"
 
 
 VSEARCHER_QWEN3_VL_SYSTEM_PROMPT = """Your role is that of a research assistant specializing in visual information. Answer questions about images by looking at them closely and then using research tools. Please follow this structured thinking process and show your work.
@@ -155,6 +171,47 @@ def parse_args() -> argparse.Namespace:
         help="Whether assistant reasoning/answers keep <think>/<answer> tags or are written as plain text.",
     )
     parser.add_argument(
+        "--plain-final-answer-postprocess-mode",
+        choices=["none", "api"],
+        default="none",
+        help=(
+            "When --assistant-format-mode=plain, optionally rewrite the final assistant answer turn with an "
+            "API model so think+answer targets read as one natural plain-text response. Only rows that otherwise "
+            "convert successfully are postprocessed."
+        ),
+    )
+    parser.add_argument(
+        "--plain-final-answer-postprocess-model",
+        default="gpt-5-nano",
+        help="API model used when --plain-final-answer-postprocess-mode=api.",
+    )
+    parser.add_argument(
+        "--plain-final-answer-postprocess-cache",
+        default=None,
+        help=(
+            "Optional JSONL cache for API postprocessing results. Reusing a cache avoids repeated calls when "
+            "rerunning conversion."
+        ),
+    )
+    parser.add_argument(
+        "--plain-final-answer-postprocess-timeout",
+        type=float,
+        default=60.0,
+        help="Per-request timeout in seconds for API postprocessing.",
+    )
+    parser.add_argument(
+        "--plain-final-answer-postprocess-max-retries",
+        type=int,
+        default=2,
+        help="Retry count for transient API postprocessing failures.",
+    )
+    parser.add_argument(
+        "--plain-final-answer-postprocess-max-completion-tokens",
+        type=int,
+        default=4096,
+        help="Completion token budget for API postprocessing, including any model reasoning tokens.",
+    )
+    parser.add_argument(
         "--stitch-runtime-hints",
         action="store_true",
         help=(
@@ -180,6 +237,23 @@ def parse_args() -> argparse.Namespace:
         help="Keep only exported conversations whose accuracy_reward is exactly 1.0.",
     )
     parser.add_argument(
+        "--drop-degenerate-conversations",
+        action="store_true",
+        help=(
+            "Drop exported conversations with degenerate assistant text. "
+            "This also honors existing top-level quality_flags.bad_example=true markers."
+        ),
+    )
+    parser.add_argument("--degenerate-max-assistant-chars", type=int, default=50_000)
+    parser.add_argument("--degenerate-max-assistant-words", type=int, default=8_000)
+    parser.add_argument("--degenerate-min-unique-word-ratio", type=float, default=0.20)
+    parser.add_argument("--degenerate-min-words-for-unique-ratio", type=int, default=1_000)
+    parser.add_argument("--degenerate-max-same-word-run", type=int, default=10)
+    parser.add_argument("--degenerate-ngram-size", type=int, default=8)
+    parser.add_argument("--degenerate-max-ngram-repeats", type=int, default=50)
+    parser.add_argument("--degenerate-min-words-for-ngram", type=int, default=1_000)
+    parser.add_argument("--degenerate-preview-chars", type=int, default=240)
+    parser.add_argument(
         "--wrong-question-ids-only",
         action="store_true",
         help=(
@@ -187,7 +261,143 @@ def parse_args() -> argparse.Namespace:
             "Requires --only-correct-answers."
         ),
     )
+    parser.add_argument(
+        "--rewrite-file-uri-prefix",
+        action="append",
+        default=[],
+        metavar="OLD_ROOT=NEW_ROOT",
+        help=(
+            "Rewrite file:// input-image references inside exported conversations before reconstruction. "
+            "Repeatable. OLD_ROOT and NEW_ROOT should be filesystem path prefixes."
+        ),
+    )
     return parser.parse_args()
+
+
+def parse_file_uri_prefix_mappings(raw_mappings: list[str]) -> list[tuple[str, str]]:
+    mappings: list[tuple[str, str]] = []
+    for raw in raw_mappings:
+        if "=" not in raw:
+            raise ValueError(
+                f"Invalid --rewrite-file-uri-prefix value {raw!r}; expected OLD_ROOT=NEW_ROOT"
+            )
+        old_root, new_root = raw.split("=", 1)
+        old_root = old_root.strip()
+        new_root = new_root.strip()
+        if not old_root or not new_root:
+            raise ValueError(
+                f"Invalid --rewrite-file-uri-prefix value {raw!r}; both OLD_ROOT and NEW_ROOT are required"
+            )
+        if old_root.startswith("file://") or new_root.startswith("file://"):
+            raise ValueError(
+                "--rewrite-file-uri-prefix expects filesystem paths, not file:// URIs"
+            )
+        mappings.append((str(Path(old_root).expanduser()), str(Path(new_root).expanduser())))
+    mappings.sort(key=lambda item: len(item[0]), reverse=True)
+    return mappings
+
+
+def rewrite_file_uri_value(value: str, prefix_mappings: list[tuple[str, str]]) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme != "file":
+        return value
+    source_path = parsed.path
+    for old_root, new_root in prefix_mappings:
+        old_prefix = old_root.rstrip("/")
+        if source_path == old_prefix or source_path.startswith(old_prefix + "/"):
+            suffix = source_path[len(old_prefix) :].lstrip("/")
+            rewritten_path = (Path(new_root) / suffix if suffix else Path(new_root)).resolve()
+            if not rewritten_path.exists():
+                raise FileNotFoundError(
+                    "Rewritten file:// target does not exist: "
+                    f"{rewritten_path} (from {value!r} via {old_root!r} -> {new_root!r})"
+                )
+            return rewritten_path.as_uri()
+    return value
+
+
+def rewrite_record_file_uri_refs(
+    record: dict[str, Any],
+    prefix_mappings: list[tuple[str, str]],
+) -> dict[str, Any]:
+    if not prefix_mappings:
+        return record
+    image_references = record.get("image_references")
+    if not isinstance(image_references, dict):
+        return record
+    input_images = image_references.get("input_images")
+    if not isinstance(input_images, list):
+        return record
+
+    rewritten_refs: list[dict[str, Any]] = []
+    changed = False
+    for ref in input_images:
+        if not isinstance(ref, dict):
+            rewritten_refs.append(ref)
+            continue
+        value = ref.get("value")
+        if not isinstance(value, str) or not value.startswith("file://"):
+            rewritten_refs.append(ref)
+            continue
+        new_value = rewrite_file_uri_value(value, prefix_mappings)
+        if new_value != value:
+            changed = True
+            rewritten_refs.append({**ref, "value": new_value})
+        else:
+            rewritten_refs.append(ref)
+    if not changed:
+        return record
+    return {
+        **record,
+        "image_references": {
+            **image_references,
+            "input_images": rewritten_refs,
+        },
+    }
+
+
+def build_degenerate_thresholds(args: argparse.Namespace) -> DegenerateThresholds:
+    return DegenerateThresholds(
+        max_assistant_chars=args.degenerate_max_assistant_chars,
+        max_assistant_words=args.degenerate_max_assistant_words,
+        min_unique_word_ratio=args.degenerate_min_unique_word_ratio,
+        min_words_for_unique_ratio=args.degenerate_min_words_for_unique_ratio,
+        max_same_word_run=args.degenerate_max_same_word_run,
+        ngram_size=args.degenerate_ngram_size,
+        max_ngram_repeats=args.degenerate_max_ngram_repeats,
+        min_words_for_ngram=args.degenerate_min_words_for_ngram,
+    )
+
+
+def record_has_bad_quality_marker(record: dict[str, Any]) -> tuple[bool, str | None]:
+    marker = record.get(QUALITY_FIELD)
+    if isinstance(marker, dict) and marker.get("bad_example") is True:
+        reasons = marker.get("reasons")
+        if isinstance(reasons, list) and reasons:
+            return True, "; ".join(str(reason) for reason in reasons[:3])
+        return True, "quality_flags.bad_example=true"
+    return False, None
+
+
+def degenerate_drop_reason(
+    record: dict[str, Any],
+    thresholds: DegenerateThresholds,
+    preview_chars: int,
+) -> str | None:
+    marked_bad, marker_reason = record_has_bad_quality_marker(record)
+    if marked_bad:
+        return f"marked bad by quality_flags ({marker_reason})"
+
+    bad_example, top_level_marker, _ = scan_degenerate_record(record, thresholds, preview_chars)
+    if not bad_example:
+        return None
+    reasons = top_level_marker.get("reasons", [])
+    if isinstance(reasons, list) and reasons:
+        reason_text = "; ".join(str(reason) for reason in reasons[:3])
+        if len(reasons) > 3:
+            reason_text += f"; ... ({len(reasons)} reasons total)"
+        return reason_text
+    return "degenerate assistant text"
 
 
 def image_to_png_bytes(image: Image.Image) -> bytes:
@@ -240,6 +450,242 @@ def build_assistant_content(content: dict[str, Any], message_type: str, assistan
             return think
         return f"<think>{think}</think>"
     return ""
+
+
+def strip_xmlish_tags(text: str) -> str:
+    return re.sub(r"</?(?:think|answer)>\s*", "", text).strip()
+
+
+def postprocess_cache_key(question: str, original_message: str, reference_answer: str, model: str) -> str:
+    payload = json.dumps(
+        {
+            "model": model,
+            "prompt_version": PLAIN_FINAL_ANSWER_POSTPROCESS_PROMPT_VERSION,
+            "question": question,
+            "original_message": original_message,
+            "reference_answer": reference_answer,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def normalize_literal(text: str) -> str:
+    return (
+        text.strip()
+        .replace("\u2010", "-")
+        .replace("\u2011", "-")
+        .replace("\u2012", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace(",", "")
+        .lower()
+    )
+
+
+def extract_guard_literals(text: str) -> list[str]:
+    literals: list[str] = []
+    for pattern in (
+        r'"([^"]{2,120})"',
+        r"'([^']{2,120})'",
+        r"\$?\b\d[\d,]*(?:\.\d+)?%?",
+        r"\b[A-Z][A-Z0-9_-]{2,}\b",
+    ):
+        literals.extend(match.group(1) if match.groups() else match.group(0) for match in re.finditer(pattern, text))
+    seen: set[str] = set()
+    unique_literals: list[str] = []
+    for literal in literals:
+        normalized = normalize_literal(literal)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique_literals.append(literal)
+    return unique_literals
+
+
+def extract_part_labels(text: str) -> list[str]:
+    labels = re.findall(r"\(([a-z])\)", text, flags=re.IGNORECASE)
+    expected_ord = ord("a")
+    part_labels: list[str] = []
+    for label in labels:
+        normalized = label.lower()
+        if normalized == chr(expected_ord):
+            part_labels.append(normalized)
+            expected_ord += 1
+    return part_labels if len(part_labels) >= 2 else []
+
+
+class PlainFinalAnswerPostprocessor:
+    def __init__(
+        self,
+        *,
+        mode: str,
+        model: str,
+        cache_path: Path | None,
+        timeout: float,
+        max_retries: int,
+        max_completion_tokens: int,
+    ) -> None:
+        self.mode = mode
+        self.model = model
+        self.cache_path = cache_path
+        self.timeout = timeout
+        self.max_retries = max(0, max_retries)
+        self.max_completion_tokens = max_completion_tokens
+        self._cache: dict[str, str] = {}
+        self._cache_loaded = False
+
+    def enabled(self) -> bool:
+        return self.mode == "api"
+
+    def _load_cache(self) -> None:
+        if self._cache_loaded:
+            return
+        self._cache_loaded = True
+        if self.cache_path is None or not self.cache_path.exists():
+            return
+        with self.cache_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = item.get("key")
+                output = item.get("output")
+                if isinstance(key, str) and isinstance(output, str):
+                    self._cache[key] = output
+
+    def _append_cache(self, key: str, output: str) -> None:
+        if self.cache_path is None:
+            return
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.cache_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"key": key, "output": output}, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _load_insight_doc_api_helpers():
+        insight_doc_root = os.environ.get("INSIGHT_DOC_ROOT")
+        if insight_doc_root:
+            insight_doc_path = Path(insight_doc_root).expanduser().resolve()
+        else:
+            insight_doc_path = REPO_ROOT.parent / "InSight-doc"
+        if str(insight_doc_path) not in sys.path:
+            sys.path.insert(0, str(insight_doc_path))
+        try:
+            from insight_doc.utils.api import create_async_openai_client, query_model_with_retry
+        except ImportError as exc:
+            raise RuntimeError(
+                "insight_doc.utils.api is required for --plain-final-answer-postprocess-mode=api; "
+                "set INSIGHT_DOC_ROOT if InSight-doc is not next to this repo"
+            ) from exc
+        return create_async_openai_client, query_model_with_retry
+
+    async def _query_api(self, messages: list[dict[str, str]]) -> str:
+        create_async_openai_client, query_model_with_retry = self._load_insight_doc_api_helpers()
+        client = create_async_openai_client(timeout=self.timeout)
+        try:
+            call = await query_model_with_retry(
+                query=messages[-1]["content"],
+                model=self.model,
+                client=client,
+                context=messages[:-1],
+                max_attempts=self.max_retries + 1,
+                retry_initial_delay_sec=1.0,
+                max_completion_tokens=self.max_completion_tokens,
+            )
+        finally:
+            await client.close()
+        if not call.success or call.response is None:
+            raise RuntimeError(call.error or "API call failed without an error message")
+        content = call.response.choices[0].message.content
+        if isinstance(content, list):
+            content = "".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        if not isinstance(content, str):
+            raise RuntimeError("API response did not contain string content")
+        return content
+
+    def rewrite(self, *, question: str, original_message: str, reference_answer: str, fallback: str) -> str:
+        original_message = original_message.strip()
+        reference_answer = reference_answer.strip()
+        if not self.enabled() or not original_message:
+            return fallback
+        self._load_cache()
+        key = postprocess_cache_key(question, original_message, reference_answer, self.model)
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+
+        prompt = (
+            "Rewrite this final visual-QA assistant response so it reads like a natural plain-text "
+            "Qwen3-VL style SFT target.\n"
+            "\n"
+            "Style target, condensed from the Qwen3-VL-32B final answers in this dataset:\n"
+            "- Give a direct answer with brief visual/document evidence folded into normal prose.\n"
+            "- Prefer one coherent response over a reasoning paragraph followed by a bare answer line.\n"
+            "- Keep concrete values, names, dates, labels, routes, and measurements exact.\n"
+            "- It is fine to start with phrases like \"Based on the document/image...\" when useful.\n"
+            "- Keep the response concise, but do not remove necessary context for multi-part questions.\n"
+            "- For multi-part questions, preserve the user's part labels such as (a), (b), (c), and keep each "
+            "part's answer aligned with its label.\n"
+            "- Use light formatting only when it genuinely clarifies a multi-part or structured answer.\n"
+            "- If the original already reads naturally, return it unchanged.\n"
+            "\n"
+            "Hard constraints:\n"
+            "- Use only the information in the original response and optional reference answer.\n"
+            "- Do not add new facts, new uncertainty, citations, XML tags, or tool-call text.\n"
+            "- Do not use a detached final line that merely repeats the answer.\n"
+            "- Output only the rewritten assistant message.\n"
+            "\n"
+            f"Question:\n{question.strip()}\n\n"
+            f"Original final assistant response:\n{original_message}\n\n"
+            f"Reference final answer, if present:\n{reference_answer}\n"
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": "You rewrite existing assistant answers for supervised fine-tuning without changing facts.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            output = asyncio.run(self._query_api(messages)).strip()
+            if self._valid_output(output, fallback, reference_answer, question):
+                output = strip_xmlish_tags(output)
+                self._cache[key] = output
+                self._append_cache(key, output)
+                return output
+            raise RuntimeError("API rewrite failed validation")
+        except Exception as exc:
+            last_error = exc
+        print(
+            f"Warning: plain final-answer postprocess failed after retries; using original text ({last_error})",
+            file=sys.stderr,
+        )
+        return fallback
+
+    @staticmethod
+    def _valid_output(output: str, original_message: str, reference_answer: str, question: str) -> bool:
+        if not output:
+            return False
+        lowered = output.lower()
+        if any(tag in lowered for tag in ("<think", "</think", "<answer", "</answer", "<tool_call", "</tool_call")):
+            return False
+        original_words = max(1, len(original_message.split()))
+        if len(output.split()) > max(80, int(original_words * 1.6)):
+            return False
+        normalized_output = normalize_literal(output)
+        for literal in extract_guard_literals(reference_answer):
+            if normalize_literal(literal) not in normalized_output:
+                return False
+        for label in extract_part_labels(question):
+            if f"({label})" not in output.lower():
+                return False
+        return True
 
 
 def build_tool_calls(content: dict[str, Any]) -> list[dict[str, Any]]:
@@ -513,6 +959,7 @@ def convert_record(
     assistant_format_mode: str,
     image_storage_mode: str,
     image_cache_dir: Path | None,
+    plain_final_answer_postprocessor: PlainFinalAnswerPostprocessor | None = None,
 ) -> dict[str, Any]:
     presented_images = restore_presented_images(record)
     image_map = {item.get("presented_img_idx"): item.get("image") for item in presented_images}
@@ -520,6 +967,9 @@ def convert_record(
     messages: list[dict[str, Any]] = []
     images: list[dict[str, bytes]] = []
     message_loss_mask: list[bool] = []
+    initial_question = ""
+    last_assistant_message_index: int | None = None
+    final_answer_postprocess_payload: dict[str, Any] | None = None
 
     conversation = record.get("conversation", [])
     index = 0
@@ -542,6 +992,7 @@ def convert_record(
 
         if role == "assistant":
             if message_type == "tool_call":
+                last_assistant_message_index = len(messages)
                 if index + 1 >= len(conversation):
                     raise DropConversationError("assistant tool_call is missing a following tool result message")
                 next_message = conversation[index + 1]
@@ -557,12 +1008,22 @@ def convert_record(
                 index += 1
                 continue
             if message_type == "answer":
+                answer_text = normalize_text(content.get("answer", ""))
+                if not answer_text.strip():
+                    raise DropConversationError("assistant answer is empty")
+                message_index = len(messages)
                 messages.append(
                     {
                         "role": "assistant",
                         "content": build_assistant_content(content, message_type, assistant_format_mode),
                     }
                 )
+                last_assistant_message_index = message_index
+                final_answer_postprocess_payload = {
+                    "message_index": message_index,
+                    "think": normalize_text(content.get("think", "")),
+                    "answer": answer_text,
+                }
                 message_loss_mask.append(True)
                 index += 1
                 continue
@@ -600,6 +1061,8 @@ def convert_record(
             if converted is None:
                 continue
             converted_message, new_images = converted
+            if message_type == "query":
+                initial_question = converted_message.get("content", "")
             messages.append(converted_message)
             message_loss_mask.append(False)
             images.extend(new_images)
@@ -608,6 +1071,21 @@ def convert_record(
         messages.append({"role": role, "content": json.dumps(content, ensure_ascii=False)})
         message_loss_mask.append(False)
         index += 1
+
+    if (
+        assistant_format_mode == "plain"
+        and plain_final_answer_postprocessor is not None
+        and plain_final_answer_postprocessor.enabled()
+        and final_answer_postprocess_payload is not None
+        and last_assistant_message_index == final_answer_postprocess_payload["message_index"]
+    ):
+        message_index = final_answer_postprocess_payload["message_index"]
+        messages[message_index]["content"] = plain_final_answer_postprocessor.rewrite(
+            question=initial_question,
+            original_message=messages[message_index]["content"],
+            reference_answer=final_answer_postprocess_payload["answer"],
+            fallback=messages[message_index]["content"],
+        )
 
     return {
         "messages": messages,
@@ -626,8 +1104,14 @@ def convert_one_path(
     image_storage_mode: str,
     image_cache_dir: Path | None,
     only_correct_answers: bool,
+    rewrite_file_uri_prefixes: list[tuple[str, str]],
+    plain_final_answer_postprocessor: PlainFinalAnswerPostprocessor | None,
+    drop_degenerate_conversations: bool,
+    degenerate_thresholds: DegenerateThresholds,
+    degenerate_preview_chars: int,
 ) -> tuple[str, dict[str, Any] | None, str | None, str | None]:
     record = load_exported_conversation(str(path))
+    record = rewrite_record_file_uri_refs(record, rewrite_file_uri_prefixes)
     extra_info = record.get("extra_info")
     question_id = None
     if isinstance(extra_info, dict) and extra_info.get("question_id") is not None:
@@ -643,6 +1127,10 @@ def convert_one_path(
                 accuracy_reward = float(reward["accuracy_reward"])
         if accuracy_reward != 1.0:
             return path.name, None, f"filtered out by only-correct-answers (accuracy_reward={accuracy_reward})", question_id
+    if drop_degenerate_conversations:
+        reason = degenerate_drop_reason(record, degenerate_thresholds, degenerate_preview_chars)
+        if reason is not None:
+            return path.name, None, f"filtered out by drop-degenerate-conversations ({reason})", question_id
     try:
         converted = convert_record(
             record,
@@ -651,6 +1139,7 @@ def convert_one_path(
             assistant_format_mode=assistant_format_mode,
             image_storage_mode=image_storage_mode,
             image_cache_dir=image_cache_dir,
+            plain_final_answer_postprocessor=plain_final_answer_postprocessor,
         )
     except DropConversationError as exc:
         return path.name, None, str(exc), question_id
@@ -659,8 +1148,45 @@ def convert_one_path(
     return path.name, converted, None, question_id
 
 
-def _convert_one_path_star(args: tuple[Path, bool, str, str, str, Path | None, bool]) -> tuple[str, dict[str, Any] | None, str | None, str | None]:
-    path, stitch_runtime_hints, system_prompt_mode, assistant_format_mode, image_storage_mode, image_cache_dir, only_correct_answers = args
+def _convert_one_path_star(
+    args: tuple[
+        Path,
+        bool,
+        str,
+        str,
+        str,
+        Path | None,
+        bool,
+        list[tuple[str, str]],
+        tuple[str, str, str | None, float, int, int],
+        bool,
+        DegenerateThresholds,
+        int,
+    ]
+) -> tuple[str, dict[str, Any] | None, str | None, str | None]:
+    (
+        path,
+        stitch_runtime_hints,
+        system_prompt_mode,
+        assistant_format_mode,
+        image_storage_mode,
+        image_cache_dir,
+        only_correct_answers,
+        rewrite_file_uri_prefixes,
+        plain_final_answer_postprocess_config,
+        drop_degenerate_conversations,
+        degenerate_thresholds,
+        degenerate_preview_chars,
+    ) = args
+    mode, model, cache_path, timeout, max_retries, max_completion_tokens = plain_final_answer_postprocess_config
+    postprocessor = PlainFinalAnswerPostprocessor(
+        mode=mode,
+        model=model,
+        cache_path=Path(cache_path).expanduser().resolve() if cache_path else None,
+        timeout=timeout,
+        max_retries=max_retries,
+        max_completion_tokens=max_completion_tokens,
+    )
     return convert_one_path(
         path,
         stitch_runtime_hints=stitch_runtime_hints,
@@ -669,6 +1195,11 @@ def _convert_one_path_star(args: tuple[Path, bool, str, str, str, Path | None, b
         image_storage_mode=image_storage_mode,
         image_cache_dir=image_cache_dir,
         only_correct_answers=only_correct_answers,
+        rewrite_file_uri_prefixes=rewrite_file_uri_prefixes,
+        plain_final_answer_postprocessor=postprocessor,
+        drop_degenerate_conversations=drop_degenerate_conversations,
+        degenerate_thresholds=degenerate_thresholds,
+        degenerate_preview_chars=degenerate_preview_chars,
     )
 
 
@@ -681,12 +1212,26 @@ def load_records(
     image_cache_dir: Path | None,
     num_workers: int,
     only_correct_answers: bool,
+    rewrite_file_uri_prefixes: list[tuple[str, str]],
+    plain_final_answer_postprocess_config: tuple[str, str, str | None, float, int, int],
+    drop_degenerate_conversations: bool,
+    degenerate_thresholds: DegenerateThresholds,
+    degenerate_preview_chars: int,
     allow_empty: bool = False,
 ) -> tuple[list[dict[str, Any]], int, Counter[str], list[str]]:
     records: list[dict[str, Any]] = []
     paths = sorted(input_dir.glob("*.json"))
     warning_counts: Counter[str] = Counter()
     wrong_question_ids: list[str] = []
+    mode, model, cache_path, timeout, max_retries, max_completion_tokens = plain_final_answer_postprocess_config
+    postprocessor = PlainFinalAnswerPostprocessor(
+        mode=mode,
+        model=model,
+        cache_path=Path(cache_path).expanduser().resolve() if cache_path else None,
+        timeout=timeout,
+        max_retries=max_retries,
+        max_completion_tokens=max_completion_tokens,
+    )
     if num_workers <= 1:
         for path in paths:
             _, converted, warning, question_id = convert_one_path(
@@ -697,6 +1242,11 @@ def load_records(
                 image_storage_mode=image_storage_mode,
                 image_cache_dir=image_cache_dir,
                 only_correct_answers=only_correct_answers,
+                rewrite_file_uri_prefixes=rewrite_file_uri_prefixes,
+                plain_final_answer_postprocessor=postprocessor,
+                drop_degenerate_conversations=drop_degenerate_conversations,
+                degenerate_thresholds=degenerate_thresholds,
+                degenerate_preview_chars=degenerate_preview_chars,
             )
             if warning is not None:
                 warning_counts[warning] += 1
@@ -715,6 +1265,11 @@ def load_records(
                 image_storage_mode,
                 image_cache_dir,
                 only_correct_answers,
+                rewrite_file_uri_prefixes,
+                plain_final_answer_postprocess_config,
+                drop_degenerate_conversations,
+                degenerate_thresholds,
+                degenerate_preview_chars,
             )
             for path in paths
         ]
@@ -756,6 +1311,23 @@ def main() -> None:
         raise ValueError("--val-ratio must be 0 when --output-parquet-name is specified")
     if args.wrong_question_ids_only and args.output_parquet_name is not None:
         raise ValueError("--output-parquet-name cannot be used with --wrong-question-ids-only")
+    if args.plain_final_answer_postprocess_mode != "none" and args.assistant_format_mode != "plain":
+        raise ValueError("--plain-final-answer-postprocess-mode requires --assistant-format-mode=plain")
+    rewrite_file_uri_prefixes = parse_file_uri_prefix_mappings(args.rewrite_file_uri_prefix)
+    postprocess_cache_path = (
+        str(Path(args.plain_final_answer_postprocess_cache).expanduser().resolve())
+        if args.plain_final_answer_postprocess_cache
+        else None
+    )
+    plain_final_answer_postprocess_config = (
+        args.plain_final_answer_postprocess_mode,
+        args.plain_final_answer_postprocess_model,
+        postprocess_cache_path,
+        args.plain_final_answer_postprocess_timeout,
+        args.plain_final_answer_postprocess_max_retries,
+        args.plain_final_answer_postprocess_max_completion_tokens,
+    )
+    degenerate_thresholds = build_degenerate_thresholds(args)
 
     rows, total_jsons, warning_counts, wrong_question_ids = load_records(
         input_dir,
@@ -766,6 +1338,11 @@ def main() -> None:
         image_cache_dir=image_cache_dir,
         num_workers=args.num_workers,
         only_correct_answers=args.only_correct_answers,
+        rewrite_file_uri_prefixes=rewrite_file_uri_prefixes,
+        plain_final_answer_postprocess_config=plain_final_answer_postprocess_config,
+        drop_degenerate_conversations=args.drop_degenerate_conversations,
+        degenerate_thresholds=degenerate_thresholds,
+        degenerate_preview_chars=args.degenerate_preview_chars,
         allow_empty=args.wrong_question_ids_only,
     )
     df = pd.DataFrame(rows)

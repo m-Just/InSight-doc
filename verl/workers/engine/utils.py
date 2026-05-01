@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import random
 
@@ -24,6 +25,39 @@ from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import is_npu_available
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+
+logger = logging.getLogger(__name__)
+
+
+def _summarize_tensordict_for_debug(data: TensorDict) -> dict:
+    summary = {}
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            item = {
+                "shape": str(getattr(value, "shape", None)),
+                "dim": int(value.dim()),
+                "is_nested": bool(value.is_nested),
+                "dtype": str(value.dtype),
+            }
+            if value.is_nested:
+                try:
+                    item["nested_int_shape"] = [int(x) for x in value.shape]
+                except Exception:
+                    item["nested_int_shape"] = None
+            summary[key] = item
+        else:
+            summary[key] = {"type": type(value).__name__}
+    return summary
+
+
+def _extract_sample_info_for_debug(data: TensorDict):
+    sample_info = data.get("debug_sample_info", None)
+    if sample_info is not None and hasattr(sample_info, "tolist"):
+        try:
+            return sample_info.tolist()
+        except Exception:
+            return str(sample_info)
+    return sample_info
 
 
 def enable_full_determinism(seed: int):
@@ -85,7 +119,21 @@ def prepare_micro_batches(
         )
     else:
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
-        micro_batches = tu.chunk_tensordict(data, len(data) // micro_batch_size_per_gpu)
+        chunks = len(data) // micro_batch_size_per_gpu
+        try:
+            micro_batches = tu.chunk_tensordict(data, chunks)
+        except Exception:
+            logger.exception(
+                "prepare_micro_batches failed in fixed-size path: len(data)=%s chunks=%s micro_batch_size_per_gpu=%s "
+                "rank=%s data_summary=%s sample_info=%s",
+                len(data),
+                chunks,
+                micro_batch_size_per_gpu,
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else None,
+                _summarize_tensordict_for_debug(data),
+                _extract_sample_info_for_debug(data),
+            )
+            raise
         batch_idx_list = None
     return micro_batches, batch_idx_list
 

@@ -127,8 +127,12 @@ class MultiTurnSFTDataset(Dataset):
         dataframes = []
         for parquet_file in self.parquet_files:
             dataframe = pd.read_parquet(parquet_file)
+            dataframe = dataframe.copy()
+            dataframe["_debug_source_file"] = parquet_file
+            dataframe["_debug_source_row"] = np.arange(len(dataframe), dtype=np.int64)
             dataframes.append(dataframe)
-        self.dataframe = pd.concat(dataframes)
+        self.dataframe = pd.concat(dataframes, ignore_index=True)
+        self.dataframe["_debug_global_row"] = np.arange(len(self.dataframe), dtype=np.int64)
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")
@@ -162,6 +166,15 @@ class MultiTurnSFTDataset(Dataset):
             self.enable_thinking = self.dataframe[self.enable_thinking_key].tolist()
         else:
             self.enable_thinking = None
+
+        self.debug_sample_info = [
+            {
+                "global_row": int(row["_debug_global_row"]),
+                "source_file": row["_debug_source_file"],
+                "source_row": int(row["_debug_source_row"]),
+            }
+            for _, row in self.dataframe[["_debug_global_row", "_debug_source_file", "_debug_source_row"]].iterrows()
+        ]
 
         # system prompt: <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n
         # generation prompt: <|im_start|>assistant\n
@@ -380,6 +393,7 @@ class MultiTurnSFTDataset(Dataset):
             }
             if len(multi_modal_inputs) > 0:
                 res["multi_modal_inputs"] = multi_modal_inputs
+            res["debug_sample_info"] = self.debug_sample_info[item]
             return res
         elif self.pad_mode == DatasetPadMode.NO_PADDING:
             # truncate input_ids if it is longer than max_length
@@ -396,6 +410,7 @@ class MultiTurnSFTDataset(Dataset):
             }
             if len(multi_modal_inputs) > 0:
                 res["multi_modal_inputs"] = multi_modal_inputs
+            res["debug_sample_info"] = self.debug_sample_info[item]
             return res
         else:
             raise ValueError(f"Unknown pad mode {self.pad_mode}")

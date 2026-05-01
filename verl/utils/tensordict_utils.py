@@ -19,6 +19,8 @@ import torch
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
+logger = logging.getLogger(__name__)
+
 
 def assign_non_tensor_data(tensor_dict: TensorDict, key, val):
     """Assign a single non-tensor value to a TensorDict.
@@ -305,7 +307,52 @@ def chunk_tensordict(td: TensorDict, chunks: int) -> list[TensorDict]:
 
     tds = new_td.chunk(chunks=chunks)
     for key in keys:
-        tensors = td[key].unbind(dim=0)
+        try:
+            if key == "position_ids" and "input_ids" in td.keys():
+                input_ids = td["input_ids"]
+                position_ids = td[key]
+                lengths = input_ids.offsets().diff().tolist()
+                values = position_ids.values()
+
+                if values.dim() != 2:
+                    raise RuntimeError(
+                        f"Expected position_ids.values() to be 2D for manual split, got {tuple(values.shape)}"
+                    )
+
+                if all(length == lengths[0] for length in lengths) and values.shape[0] == len(lengths) * 4:
+                    tensors = [values[i * 4 : (i + 1) * 4, : lengths[i]].clone() for i in range(len(lengths))]
+                elif values.shape[0] == 4:
+                    tensors = []
+                    start = 0
+                    for length in lengths:
+                        end = start + int(length)
+                        tensors.append(values[:, start:end].clone())
+                        start = end
+                    if start != values.shape[1]:
+                        raise RuntimeError(
+                            f"Manual split consumed {start} tokens, but position_ids.values() has {values.shape[1]} columns"
+                        )
+                else:
+                    raise RuntimeError(
+                        "Unsupported 3D jagged position_ids values layout: "
+                        f"shape={tuple(values.shape)} lengths={lengths}"
+                    )
+            else:
+                tensors = td[key].unbind(dim=0)
+        except Exception:
+            sample_info = td.get("debug_sample_info", None)
+            if sample_info is not None and hasattr(sample_info, "tolist"):
+                sample_info = sample_info.tolist()
+            logger.exception(
+                "chunk_tensordict failed while unbinding nested key=%s shape=%s dim=%s chunks=%s len(td)=%s sample_info=%s",
+                key,
+                getattr(td[key], "shape", None),
+                getattr(td[key], "dim", lambda: None)(),
+                chunks,
+                len(td),
+                sample_info,
+            )
+            raise
         for i, chunk_td in enumerate(tds):
             chunk_td[key] = torch.nested.as_nested_tensor(
                 tensors[i * chunk_size : (i + 1) * chunk_size], layout=torch.jagged
@@ -847,6 +894,9 @@ def contiguous(data: TensorDict) -> TensorDict:
 def maybe_fix_3d_position_ids(data: TensorDict):
     # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
     # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+    # This is likely a bug in tensordict. As a workaround, we manually restore the correct ragged index.
+    # For batched Qwen-VL position_ids, the per-sample tensor shape is (4, seq_len), so after batching the
+    # jagged dimension is the first non-batch dimension and the ragged index must remain 1. Setting it to 2
+    # makes nested unbind/split operate on the fixed seq_len dimension and crashes with split_sizes=[4, 4].
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        data["position_ids"]._ragged_idx = 1

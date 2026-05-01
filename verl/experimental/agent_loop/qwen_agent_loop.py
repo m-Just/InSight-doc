@@ -479,11 +479,30 @@ class QwenAgentLoop(AgentLoopBase):
             sampling_params: LLM sampling parameters.
             ignore_termination: If True, skip turn-based termination checks (for subclasses).
         """
+        remaining_response_length = self.response_length - len(agent_data.response_mask)
+        if remaining_response_length <= 0:
+            agent_data.extra_fields["response_truncated"] = True
+            return AgentState.TERMINATED
+
+        generation_sampling_params = dict(sampling_params)
+        requested_max_tokens = generation_sampling_params.pop("max_tokens", None)
+        requested_max_new_tokens = generation_sampling_params.pop("max_new_tokens", None)
+        if requested_max_tokens is None:
+            requested_max_tokens = requested_max_new_tokens
+        if requested_max_tokens is None:
+            turn_max_tokens = remaining_response_length
+        else:
+            turn_max_tokens = min(int(requested_max_tokens), remaining_response_length)
+        if turn_max_tokens <= 0:
+            agent_data.extra_fields["response_truncated"] = True
+            return AgentState.TERMINATED
+        generation_sampling_params["max_tokens"] = turn_max_tokens
+
         with simple_timer("generate_sequences", agent_data.metrics):
             output = await self.server_manager.generate(
                 request_id=agent_data.request_id,
                 prompt_ids=agent_data.prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=generation_sampling_params,
                 image_data=agent_data.image_data if agent_data.image_data else None,
                 video_data=agent_data.video_data if agent_data.video_data else None,
             )

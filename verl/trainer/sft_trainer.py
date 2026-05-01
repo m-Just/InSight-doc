@@ -67,11 +67,34 @@ class SFTTrainer:
 
         # Initialize resume-related variables
         self.resume_global_step = self.ckpt_handler.load_checkpoint()
+        self._handle_epoch_boundary_resume()
 
         self.device_name = self.config.trainer.device
 
         if self.rank == 0:
             print(self.config)
+
+    def _handle_epoch_boundary_resume(self):
+        """Reset the train dataloader when resuming from an epoch-boundary checkpoint.
+
+        StatefulDataLoader resumes the iterator position exactly. When a checkpoint is taken
+        after the last batch of an epoch, restoring that exhausted iterator and then starting
+        the next epoch loop can silently skip one full epoch. Rebuild the train dataloader so
+        the next epoch starts from a fresh iterator while preserving the resumed global step.
+        """
+        if self.resume_global_step <= 0:
+            return
+        if self.resume_global_step % self.steps_per_epoch != 0:
+            return
+
+        if self.rank == 0:
+            print(
+                "Resume checkpoint is at an epoch boundary; rebuilding the train dataloader "
+                "to avoid skipping the next epoch."
+            )
+
+        self._build_dataloader()
+        self.ckpt_handler.train_dataloader = self.train_dataloader
 
     def _build_ckpt_handler(self):
         resume_mode = getattr(self.config.trainer, "resume_mode", "auto")
@@ -316,6 +339,31 @@ class SFTTrainer:
                 batch_seqlens_ntd = NonTensorData(batch_seqlens)
 
                 tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
+
+                if self.rank == 3 and global_step == 125:
+                    sample_info = data.get("debug_sample_info", None)
+                    if sample_info is not None and hasattr(sample_info, "tolist"):
+                        sample_info = sample_info.tolist()
+                    try:
+                        position_shapes = [tuple(t.shape) for t in data["position_ids"].unbind()]
+                        logger.warning(
+                            "pre-train_batch probe passed at global_step=%s rank=%s position_ids_shape=%s "
+                            "position_shapes=%s sample_info=%s",
+                            global_step,
+                            self.rank,
+                            data["position_ids"].shape,
+                            position_shapes,
+                            sample_info,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "pre-train_batch probe failed at global_step=%s rank=%s position_ids_shape=%s "
+                            "sample_info=%s",
+                            global_step,
+                            self.rank,
+                            data["position_ids"].shape,
+                            sample_info,
+                        )
 
                 # start profile in SPMD mode
                 if global_step == self.start_profile_step:

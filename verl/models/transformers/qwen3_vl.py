@@ -337,6 +337,34 @@ def forward_with_triton_backend(
     )
 
 
+def patch_qwen3_vl_deepstack_process(*text_model_classes):
+    """Patch Qwen3-VL deepstack in-place writes for activation offload compatibility."""
+
+    def _is_view(tensor: torch.Tensor) -> bool:
+        try:
+            return bool(tensor._is_view())
+        except Exception:
+            return getattr(tensor, "_base", None) is not None
+
+    def patched_deepstack_process(
+        self,
+        hidden_states: torch.Tensor,
+        visual_pos_masks: torch.Tensor,
+        visual_embeds: torch.Tensor,
+    ):
+        visual_pos_masks = visual_pos_masks.to(hidden_states.device)
+        visual_embeds = visual_embeds.to(hidden_states.device, hidden_states.dtype)
+        local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
+        if _is_view(hidden_states):
+            hidden_states = hidden_states.clone()
+        hidden_states[visual_pos_masks, :] = local_this
+        return hidden_states
+
+    for text_model_class in text_model_classes:
+        if text_model_class is not None and hasattr(text_model_class, "_deepstack_process"):
+            text_model_class._deepstack_process = patched_deepstack_process
+
+
 def patch_qwen3_vl_moe_sparse_moe_block_forward():
     """
     Monkey patch to fix a bug in transformers 4.57.3 where Qwen3VLMoeTextSparseMoeBlock.forward
