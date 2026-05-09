@@ -80,6 +80,22 @@ from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _question_type_contains_not_answerable(question_type: Any) -> bool:
+    if question_type is None:
+        return False
+    return "not-answerable" in json.dumps(question_type, ensure_ascii=False).lower()
+
+
+def _ground_truth_is_not_answerable(ground_truth: Any) -> bool:
+    text = str(ground_truth or "").lower()
+    return (
+        "the information provided in the document cannot answer this question" in text
+        or "cannot answer this question" in text
+        or "not answerable" in text
+        or "not-answerable" in text
+    )
+
+
 def _resolve_agent_loop_config_path(config_path: str) -> str:
     if os.path.isabs(config_path):
         return config_path
@@ -910,6 +926,21 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_conversation_wall_times = []
+        sample_generate_sequences_times = []
+        sample_tool_parsing_times = []
+        sample_tool_calls_times = []
+        sample_core_inference_times = []
+        sample_initial_prompt_fit_times = []
+        sample_initial_prompt_tokens = []
+        sample_initial_prompt_tokens_before_shrink = []
+        sample_initial_prompt_tokens_after_shrink = []
+        sample_initial_prompt_shrink_counts = []
+        sample_initial_prompt_shrink_applied = []
+        sample_initial_prompt_fit_succeeded = []
+        sample_prompt_tokens = []
+        sample_response_tokens_total = []
+        sample_response_tokens_generated = []
+        sample_response_tokens_tool = []
         sample_uids = []
 
         packets_count_by_data_source = defaultdict(int)
@@ -923,6 +954,12 @@ class RayPPOTrainer:
             if max_profile_val_batches <= 0:
                 raise ValueError(f"VSEARCH_PROFILE_MAX_VAL_BATCHES must be positive, got {max_profile_val_batches}")
             print(f"Validation profiling will stop after {max_profile_val_batches} batch(es).")
+
+        def _to_optional_float_array(values) -> np.ndarray:
+            out = np.empty(len(values), dtype=np.float64)
+            for idx, value in enumerate(values):
+                out[idx] = np.nan if value is None else float(value)
+            return out
 
         for val_batch_idx, test_data in enumerate(tqdm(self.val_dataloader, desc="Validation Progress")):
             t_batch_start = time.perf_counter()
@@ -1060,6 +1097,17 @@ class RayPPOTrainer:
                 else:
                     reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
 
+            answerability_flags = []
+            extra_infos = test_batch.non_tensor_batch.get("extra_info", [None] * len(test_batch))
+            reward_models = test_batch.non_tensor_batch.get("reward_model", [None] * len(test_batch))
+            for extra_info, reward_model in zip(extra_infos, reward_models, strict=True):
+                question_type = extra_info.get("question_type") if isinstance(extra_info, dict) else None
+                ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
+                answerability_flags.append(
+                    _question_type_contains_not_answerable(question_type) or _ground_truth_is_not_answerable(ground_truth)
+                )
+            reward_extra_infos_dict["is_not_answerable"].extend(answerability_flags)
+
             overlapping_keys = {
                 key for key in reward_extra_infos_dict if key in test_batch.non_tensor_batch
             }
@@ -1081,7 +1129,67 @@ class RayPPOTrainer:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
             if "conversation_wall_time" in test_batch.non_tensor_batch:
                 sample_conversation_wall_times.append(
-                    np.asarray(test_batch.non_tensor_batch["conversation_wall_time"], dtype=np.float64)
+                    _to_optional_float_array(test_batch.non_tensor_batch["conversation_wall_time"])
+                )
+            if "generate_sequences" in test_batch.non_tensor_batch:
+                sample_generate_sequences_times.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["generate_sequences"])
+                )
+            if "tool_parsing" in test_batch.non_tensor_batch:
+                sample_tool_parsing_times.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["tool_parsing"])
+                )
+            if "tool_calls" in test_batch.non_tensor_batch:
+                sample_tool_calls_times.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["tool_calls"])
+                )
+            if "core_inference_time" in test_batch.non_tensor_batch:
+                sample_core_inference_times.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["core_inference_time"])
+                )
+            if "initial_prompt_fit_time" in test_batch.non_tensor_batch:
+                sample_initial_prompt_fit_times.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["initial_prompt_fit_time"])
+                )
+            if "initial_prompt_tokens" in test_batch.non_tensor_batch:
+                sample_initial_prompt_tokens.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["initial_prompt_tokens"])
+                )
+            if "initial_prompt_tokens_before_shrink" in test_batch.non_tensor_batch:
+                sample_initial_prompt_tokens_before_shrink.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["initial_prompt_tokens_before_shrink"])
+                )
+            if "initial_prompt_tokens_after_shrink" in test_batch.non_tensor_batch:
+                sample_initial_prompt_tokens_after_shrink.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["initial_prompt_tokens_after_shrink"])
+                )
+            if "initial_prompt_shrink_count" in test_batch.non_tensor_batch:
+                sample_initial_prompt_shrink_counts.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["initial_prompt_shrink_count"])
+                )
+            if "initial_prompt_shrink_applied" in test_batch.non_tensor_batch:
+                sample_initial_prompt_shrink_applied.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["initial_prompt_shrink_applied"])
+                )
+            if "initial_prompt_fit_succeeded" in test_batch.non_tensor_batch:
+                sample_initial_prompt_fit_succeeded.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["initial_prompt_fit_succeeded"])
+                )
+            if "prompt_tokens" in test_batch.non_tensor_batch:
+                sample_prompt_tokens.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["prompt_tokens"])
+                )
+            if "response_tokens_total" in test_batch.non_tensor_batch:
+                sample_response_tokens_total.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["response_tokens_total"])
+                )
+            if "response_tokens_generated" in test_batch.non_tensor_batch:
+                sample_response_tokens_generated.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["response_tokens_generated"])
+                )
+            if "response_tokens_tool" in test_batch.non_tensor_batch:
+                sample_response_tokens_tool.append(
+                    _to_optional_float_array(test_batch.non_tensor_batch["response_tokens_tool"])
                 )
 
             sample_data_sources = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
@@ -1140,6 +1248,21 @@ class RayPPOTrainer:
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
                 "sample_conversation_wall_times": sample_conversation_wall_times,
+                "sample_generate_sequences_times": sample_generate_sequences_times,
+                "sample_tool_parsing_times": sample_tool_parsing_times,
+                "sample_tool_calls_times": sample_tool_calls_times,
+                "sample_core_inference_times": sample_core_inference_times,
+                "sample_initial_prompt_fit_times": sample_initial_prompt_fit_times,
+                "sample_initial_prompt_tokens": sample_initial_prompt_tokens,
+                "sample_initial_prompt_tokens_before_shrink": sample_initial_prompt_tokens_before_shrink,
+                "sample_initial_prompt_tokens_after_shrink": sample_initial_prompt_tokens_after_shrink,
+                "sample_initial_prompt_shrink_counts": sample_initial_prompt_shrink_counts,
+                "sample_initial_prompt_shrink_applied": sample_initial_prompt_shrink_applied,
+                "sample_initial_prompt_fit_succeeded": sample_initial_prompt_fit_succeeded,
+                "sample_prompt_tokens": sample_prompt_tokens,
+                "sample_response_tokens_total": sample_response_tokens_total,
+                "sample_response_tokens_generated": sample_response_tokens_generated,
+                "sample_response_tokens_tool": sample_response_tokens_tool,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
@@ -1149,6 +1272,21 @@ class RayPPOTrainer:
             reward_extra_infos_dict,
             sample_turns,
             sample_conversation_wall_times,
+            sample_generate_sequences_times,
+            sample_tool_parsing_times,
+            sample_tool_calls_times,
+            sample_core_inference_times,
+            sample_initial_prompt_fit_times,
+            sample_initial_prompt_tokens,
+            sample_initial_prompt_tokens_before_shrink,
+            sample_initial_prompt_tokens_after_shrink,
+            sample_initial_prompt_shrink_counts,
+            sample_initial_prompt_shrink_applied,
+            sample_initial_prompt_fit_succeeded,
+            sample_prompt_tokens,
+            sample_response_tokens_total,
+            sample_response_tokens_generated,
+            sample_response_tokens_tool,
         )
 
     def _val_metrics_update(
@@ -1158,6 +1296,21 @@ class RayPPOTrainer:
         reward_extra_infos_dict,
         sample_turns,
         sample_conversation_wall_times,
+        sample_generate_sequences_times,
+        sample_tool_parsing_times,
+        sample_tool_calls_times,
+        sample_core_inference_times,
+        sample_initial_prompt_fit_times,
+        sample_initial_prompt_tokens,
+        sample_initial_prompt_tokens_before_shrink,
+        sample_initial_prompt_tokens_after_shrink,
+        sample_initial_prompt_shrink_counts,
+        sample_initial_prompt_shrink_applied,
+        sample_initial_prompt_fit_succeeded,
+        sample_prompt_tokens,
+        sample_response_tokens_total,
+        sample_response_tokens_generated,
+        sample_response_tokens_tool,
     ):
         metric_dict = {}
 
@@ -1210,6 +1363,39 @@ class RayPPOTrainer:
                     sample_conversation_wall_times[ds_mask].mean()
                 )
 
+        def _add_timing_metrics(metric_name: str, sample_values) -> None:
+            if len(sample_values) == 0:
+                return
+            sample_values = np.concatenate(sample_values)
+            valid_mask = ~np.isnan(sample_values)
+            if not valid_mask.any():
+                return
+            metric_dict[f"val-aux/{metric_name}/min"] = np.nanmin(sample_values)
+            metric_dict[f"val-aux/{metric_name}/max"] = np.nanmax(sample_values)
+            metric_dict[f"val-aux/{metric_name}/mean"] = np.nanmean(sample_values)
+            for data_source in np.unique(data_sources):
+                ds_mask = data_sources == data_source
+                ds_values = sample_values[ds_mask]
+                if np.isnan(ds_values).all():
+                    continue
+                metric_dict[f"val-aux/{data_source}/{metric_name}/mean"] = float(np.nanmean(ds_values))
+
+        _add_timing_metrics("generate_sequences_time", sample_generate_sequences_times)
+        _add_timing_metrics("tool_parsing_time", sample_tool_parsing_times)
+        _add_timing_metrics("tool_execution_time", sample_tool_calls_times)
+        _add_timing_metrics("core_inference_time", sample_core_inference_times)
+        _add_timing_metrics("initial_prompt_fit_time", sample_initial_prompt_fit_times)
+        _add_timing_metrics("initial_prompt_tokens", sample_initial_prompt_tokens)
+        _add_timing_metrics("initial_prompt_tokens_before_shrink", sample_initial_prompt_tokens_before_shrink)
+        _add_timing_metrics("initial_prompt_tokens_after_shrink", sample_initial_prompt_tokens_after_shrink)
+        _add_timing_metrics("initial_prompt_shrink_count", sample_initial_prompt_shrink_counts)
+        _add_timing_metrics("initial_prompt_shrink_applied", sample_initial_prompt_shrink_applied)
+        _add_timing_metrics("initial_prompt_fit_succeeded", sample_initial_prompt_fit_succeeded)
+        _add_timing_metrics("prompt_tokens", sample_prompt_tokens)
+        _add_timing_metrics("response_tokens_total", sample_response_tokens_total)
+        _add_timing_metrics("response_tokens_generated", sample_response_tokens_generated)
+        _add_timing_metrics("response_tokens_tool", sample_response_tokens_tool)
+
         return metric_dict
 
     def _merge_validation_results(self, result_a, result_b):
@@ -1221,6 +1407,21 @@ class RayPPOTrainer:
                 "sample_uids": [],
                 "sample_turns": [],
                 "sample_conversation_wall_times": [],
+                "sample_generate_sequences_times": [],
+                "sample_tool_parsing_times": [],
+                "sample_tool_calls_times": [],
+                "sample_core_inference_times": [],
+                "sample_initial_prompt_fit_times": [],
+                "sample_initial_prompt_tokens": [],
+                "sample_initial_prompt_tokens_before_shrink": [],
+                "sample_initial_prompt_tokens_after_shrink": [],
+                "sample_initial_prompt_shrink_counts": [],
+                "sample_initial_prompt_shrink_applied": [],
+                "sample_initial_prompt_fit_succeeded": [],
+                "sample_prompt_tokens": [],
+                "sample_response_tokens_total": [],
+                "sample_response_tokens_generated": [],
+                "sample_response_tokens_tool": [],
                 "reward_extra_infos_dict": {},
             }
         if result_b is None:
@@ -1229,6 +1430,21 @@ class RayPPOTrainer:
                 "sample_uids": [],
                 "sample_turns": [],
                 "sample_conversation_wall_times": [],
+                "sample_generate_sequences_times": [],
+                "sample_tool_parsing_times": [],
+                "sample_tool_calls_times": [],
+                "sample_core_inference_times": [],
+                "sample_initial_prompt_fit_times": [],
+                "sample_initial_prompt_tokens": [],
+                "sample_initial_prompt_tokens_before_shrink": [],
+                "sample_initial_prompt_tokens_after_shrink": [],
+                "sample_initial_prompt_shrink_counts": [],
+                "sample_initial_prompt_shrink_applied": [],
+                "sample_initial_prompt_fit_succeeded": [],
+                "sample_prompt_tokens": [],
+                "sample_response_tokens_total": [],
+                "sample_response_tokens_generated": [],
+                "sample_response_tokens_tool": [],
                 "reward_extra_infos_dict": {},
             }
 
@@ -1241,6 +1457,37 @@ class RayPPOTrainer:
         sample_conversation_wall_times = (
             result_a["sample_conversation_wall_times"] + result_b["sample_conversation_wall_times"]
         )
+        sample_generate_sequences_times = (
+            result_a["sample_generate_sequences_times"] + result_b["sample_generate_sequences_times"]
+        )
+        sample_tool_parsing_times = result_a["sample_tool_parsing_times"] + result_b["sample_tool_parsing_times"]
+        sample_tool_calls_times = result_a["sample_tool_calls_times"] + result_b["sample_tool_calls_times"]
+        sample_core_inference_times = result_a["sample_core_inference_times"] + result_b["sample_core_inference_times"]
+        sample_initial_prompt_fit_times = result_a["sample_initial_prompt_fit_times"] + result_b["sample_initial_prompt_fit_times"]
+        sample_initial_prompt_tokens = result_a["sample_initial_prompt_tokens"] + result_b["sample_initial_prompt_tokens"]
+        sample_initial_prompt_tokens_before_shrink = (
+            result_a["sample_initial_prompt_tokens_before_shrink"]
+            + result_b["sample_initial_prompt_tokens_before_shrink"]
+        )
+        sample_initial_prompt_tokens_after_shrink = (
+            result_a["sample_initial_prompt_tokens_after_shrink"]
+            + result_b["sample_initial_prompt_tokens_after_shrink"]
+        )
+        sample_initial_prompt_shrink_counts = (
+            result_a["sample_initial_prompt_shrink_counts"] + result_b["sample_initial_prompt_shrink_counts"]
+        )
+        sample_initial_prompt_shrink_applied = (
+            result_a["sample_initial_prompt_shrink_applied"] + result_b["sample_initial_prompt_shrink_applied"]
+        )
+        sample_initial_prompt_fit_succeeded = (
+            result_a["sample_initial_prompt_fit_succeeded"] + result_b["sample_initial_prompt_fit_succeeded"]
+        )
+        sample_prompt_tokens = result_a["sample_prompt_tokens"] + result_b["sample_prompt_tokens"]
+        sample_response_tokens_total = result_a["sample_response_tokens_total"] + result_b["sample_response_tokens_total"]
+        sample_response_tokens_generated = (
+            result_a["sample_response_tokens_generated"] + result_b["sample_response_tokens_generated"]
+        )
+        sample_response_tokens_tool = result_a["sample_response_tokens_tool"] + result_b["sample_response_tokens_tool"]
 
         reward_extra_infos_dict = {}
         all_keys = set(result_a["reward_extra_infos_dict"].keys()) | set(result_b["reward_extra_infos_dict"].keys())
@@ -1255,6 +1502,21 @@ class RayPPOTrainer:
             reward_extra_infos_dict,
             sample_turns,
             sample_conversation_wall_times,
+            sample_generate_sequences_times,
+            sample_tool_parsing_times,
+            sample_tool_calls_times,
+            sample_core_inference_times,
+            sample_initial_prompt_fit_times,
+            sample_initial_prompt_tokens,
+            sample_initial_prompt_tokens_before_shrink,
+            sample_initial_prompt_tokens_after_shrink,
+            sample_initial_prompt_shrink_counts,
+            sample_initial_prompt_shrink_applied,
+            sample_initial_prompt_fit_succeeded,
+            sample_prompt_tokens,
+            sample_response_tokens_total,
+            sample_response_tokens_generated,
+            sample_response_tokens_tool,
         )
 
     def init_workers(self):

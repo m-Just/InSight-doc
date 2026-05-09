@@ -159,8 +159,9 @@ class FSDPEngineConfig(EngineConfig):
         dtype (str): Mixed precision training param dtype, default "bfloat16"
     """
 
-    # ulysses_sequence_parallel_size is mutable for backward compatibility
-    _mutable_fields = EngineConfig._mutable_fields | {"ulysses_sequence_parallel_size"}
+    # ulysses_sequence_parallel_size is mutable for backward compatibility.
+    # use_orig_params may be auto-enabled when partially freezing VLM modules.
+    _mutable_fields = EngineConfig._mutable_fields | {"ulysses_sequence_parallel_size", "use_orig_params"}
 
     # fsdp specific flags
     wrap_policy: dict[str, Any] = field(default_factory=dict)

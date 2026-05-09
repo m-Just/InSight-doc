@@ -9,6 +9,7 @@ import asyncio
 import copy
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -62,6 +63,9 @@ TOOL_NAME_ALIASES = {
 }
 
 QWEN_IMAGE_MAX_ASPECT_RATIO = 200.0
+INITIAL_PROMPT_SHRINK_AREA_FACTOR = 0.5
+INITIAL_PROMPT_SHRINK_DIM_FACTOR = math.sqrt(INITIAL_PROMPT_SHRINK_AREA_FACTOR)
+INITIAL_PROMPT_MAX_SHRINK_STEPS = 4
 IMAGE_LABEL_RE = re.compile(r"^Image (\d+):$")
 
 def _image_aspect_ratio(size: tuple[int, int]) -> float:
@@ -124,6 +128,25 @@ def _record_conversation_wall_time(agent_data: AgentData, start_time: float) -> 
     conversation_wall_time = time.perf_counter() - start_time
     agent_data.metrics["conversation_wall_time"] = conversation_wall_time
     agent_data.extra_fields["conversation_wall_time"] = conversation_wall_time
+
+
+def _record_core_inference_metrics(agent_data: AgentData) -> None:
+    if "generate_sequences" not in agent_data.metrics:
+        agent_data.extra_fields["generate_sequences"] = None
+        agent_data.extra_fields["tool_parsing"] = None
+        agent_data.extra_fields["tool_calls"] = None
+        agent_data.extra_fields["core_inference_time"] = None
+        return
+
+    generate_sequences = float(agent_data.metrics.get("generate_sequences", 0.0) or 0.0)
+    tool_parsing = float(agent_data.metrics.get("tool_parsing", 0.0) or 0.0)
+    tool_calls = float(agent_data.metrics.get("tool_calls", 0.0) or 0.0)
+    core_inference_time = generate_sequences + tool_parsing + tool_calls
+    agent_data.metrics["core_inference_time"] = core_inference_time
+    agent_data.extra_fields["generate_sequences"] = generate_sequences
+    agent_data.extra_fields["tool_parsing"] = tool_parsing
+    agent_data.extra_fields["tool_calls"] = tool_calls
+    agent_data.extra_fields["core_inference_time"] = core_inference_time
 
 
 def _message_text_content(content: Any) -> str:
@@ -418,6 +441,8 @@ class QwenAgentLoop(AgentLoopBase):
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
 
+        _record_core_inference_metrics(agent_data)
+
         # Includes prompt/image preparation, tool processing, and model generation.
         # Excludes export and later postprocessing.
         _record_conversation_wall_time(agent_data, conversation_wall_time_start)
@@ -531,8 +556,10 @@ class QwenAgentLoop(AgentLoopBase):
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
             return AgentState.TERMINATED
 
-        # Extract tool calls from the response
-        _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+        # Extract tool calls from the response. This is part of core inference time,
+        # but is tracked separately from model generation and tool execution.
+        with simple_timer("tool_parsing", agent_data.metrics):
+            _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
 
         # Determine next state
         if agent_data.tool_calls:
@@ -838,8 +865,13 @@ class InSightQwenAgentLoop(QwenAgentLoop):
 
     DEFAULT_INITIAL_RESCALE = 0.25
     DEFAULT_GPT_IMAGE_MAX_AREA = 1280 * 1280
+    DEFAULT_CROP_IMAGE_MAX_AREA = 1280 * 1280
     DEFAULT_INITIAL_INPUT_PIXELS_LOWER_BOUND = 0
     DEFAULT_REGION_ZOOM_IN_FACTOR = 4.0
+    DEFAULT_TRAIN_INITIAL_RESCALE_RANDOMIZATION_PROB = 0.0
+    DEFAULT_TRAIN_INITIAL_RESCALE_RANDOMIZATION_MIN = 0.25
+    DEFAULT_TRAIN_INITIAL_RESCALE_RANDOMIZATION_MAX = 0.25
+    DEFAULT_TRAIN_INITIAL_RESCALE_RANDOMIZATION_TEXT_BUDGET = 1024
 
     def __init__(
         self,
@@ -849,8 +881,13 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         processor: AutoProcessor,
         initial_rescale: float = DEFAULT_INITIAL_RESCALE,
         gpt_image_max_area: int = DEFAULT_GPT_IMAGE_MAX_AREA,
+        crop_image_max_area: int = DEFAULT_CROP_IMAGE_MAX_AREA,
         initial_input_pixels_lower_bound: int = DEFAULT_INITIAL_INPUT_PIXELS_LOWER_BOUND,
         region_zoom_in_factor: float = DEFAULT_REGION_ZOOM_IN_FACTOR,
+        train_initial_rescale_randomization_prob: float = DEFAULT_TRAIN_INITIAL_RESCALE_RANDOMIZATION_PROB,
+        train_initial_rescale_randomization_min: float = DEFAULT_TRAIN_INITIAL_RESCALE_RANDOMIZATION_MIN,
+        train_initial_rescale_randomization_max: float = DEFAULT_TRAIN_INITIAL_RESCALE_RANDOMIZATION_MAX,
+        train_initial_rescale_randomization_text_budget: int = DEFAULT_TRAIN_INITIAL_RESCALE_RANDOMIZATION_TEXT_BUDGET,
         **kwargs,
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, **kwargs)
@@ -859,6 +896,8 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             initial_rescale = kwargs.pop("presented_initial_rescale")
         if "presented_max_area" in kwargs:
             gpt_image_max_area = kwargs.pop("presented_max_area")
+        if "crop_max_area" in kwargs:
+            crop_image_max_area = kwargs.pop("crop_max_area")
         if "presented_initial_pixels_lower_bound" in kwargs:
             initial_input_pixels_lower_bound = kwargs.pop("presented_initial_pixels_lower_bound")
 
@@ -868,8 +907,33 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             )
         self.initial_rescale = initial_rescale
         self.gpt_image_max_area = gpt_image_max_area
+        self.crop_image_max_area = crop_image_max_area
         self.initial_input_pixels_lower_bound = initial_input_pixels_lower_bound
         self.region_zoom_in_factor = region_zoom_in_factor
+        if not 0.0 <= train_initial_rescale_randomization_prob <= 1.0:
+            raise ValueError(
+                "train_initial_rescale_randomization_prob must be within [0, 1], "
+                f"got {train_initial_rescale_randomization_prob}"
+            )
+        if train_initial_rescale_randomization_min <= 0 or train_initial_rescale_randomization_max <= 0:
+            raise ValueError(
+                "train_initial_rescale_randomization_min/max must be positive, "
+                f"got {train_initial_rescale_randomization_min} and {train_initial_rescale_randomization_max}"
+            )
+        if train_initial_rescale_randomization_min > train_initial_rescale_randomization_max:
+            raise ValueError(
+                "train_initial_rescale_randomization_min must be <= max, "
+                f"got {train_initial_rescale_randomization_min} > {train_initial_rescale_randomization_max}"
+            )
+        if train_initial_rescale_randomization_text_budget < 0:
+            raise ValueError(
+                "train_initial_rescale_randomization_text_budget must be non-negative, "
+                f"got {train_initial_rescale_randomization_text_budget}"
+            )
+        self.train_initial_rescale_randomization_prob = train_initial_rescale_randomization_prob
+        self.train_initial_rescale_randomization_min = train_initial_rescale_randomization_min
+        self.train_initial_rescale_randomization_max = train_initial_rescale_randomization_max
+        self.train_initial_rescale_randomization_text_budget = train_initial_rescale_randomization_text_budget
         # Keep alias attrs so older code paths continue to work.
         self.presented_initial_rescale = self.initial_rescale
         self.presented_max_area = self.gpt_image_max_area
@@ -882,14 +946,25 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         # some synthetic inference inputs are reconstructed from converted SFT rows whose images are already
         # in the presented form expected by InSightQwenAgentLoop. Normal eval/training flow should leave this
         # unset so the loop can build presented images from the raw prompt images itself.
-        aligned_prompt, original_images, presented_images, actual_initial_rescale = self._build_presented_prompt(
+        aligned_prompt, original_images, presented_images, actual_initial_rescale, initial_rescale_metadata = (
+            self._build_presented_prompt(
             messages,
             images_are_presented=bool(kwargs.get("initial_images_already_presented", False)),
-        )
+            training_mode=not bool(kwargs.get("_validate", False)),
+        ))
 
         multi_modal_data = await self.process_vision_info(aligned_prompt)
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
+        initial_prompt_fit_start = time.perf_counter()
+        images, videos, initial_prompt_fit_metadata = await self._fit_initial_prompt_to_max_model_len(
+            aligned_prompt,
+            presented_images,
+            images,
+            videos,
+        )
+        initial_prompt_fit_time = time.perf_counter() - initial_prompt_fit_start
+        initial_rescale_metadata.update(initial_prompt_fit_metadata)
 
         metrics = {}
         request_id = uuid4().hex
@@ -910,6 +985,22 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             interaction_kwargs={},
         )
         agent_data.extra_fields["response_truncated"] = False
+        agent_data.extra_fields["initial_prompt_tokens"] = initial_prompt_fit_metadata.get("prompt_tokens_after_shrink")
+        agent_data.extra_fields["initial_prompt_tokens_before_shrink"] = initial_prompt_fit_metadata.get(
+            "prompt_tokens_before_shrink"
+        )
+        agent_data.extra_fields["initial_prompt_tokens_after_shrink"] = initial_prompt_fit_metadata.get(
+            "prompt_tokens_after_shrink"
+        )
+        agent_data.extra_fields["initial_prompt_shrink_count"] = initial_prompt_fit_metadata.get("prompt_shrink_count", 0)
+        agent_data.extra_fields["initial_prompt_shrink_applied"] = bool(
+            initial_prompt_fit_metadata.get("prompt_shrink_count", 0) > 0
+        )
+        agent_data.extra_fields["initial_prompt_fit_succeeded"] = bool(
+            initial_prompt_fit_metadata.get("fits_max_model_len", True)
+        )
+        agent_data.extra_fields["initial_prompt_shrink_warning"] = initial_prompt_fit_metadata.get("prompt_shrink_warning")
+        agent_data.extra_fields["initial_prompt_fit_time"] = initial_prompt_fit_time
         extra_info = dict(kwargs["extra_info"])
         extra_info["agent_name"] = "insight_qwen_agent"
         agent_data.extra_fields["agent_name"] = "insight_qwen_agent"
@@ -929,17 +1020,45 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                 for presented_img_idx, presented in enumerate(presented_images)
             ]
 
-        state = AgentState.PENDING
-        while state != AgentState.TERMINATED:
-            if state == AgentState.PENDING:
-                state = await self._handle_pending_state(agent_data, sampling_params)
-            elif state == AgentState.GENERATING:
-                state = await self._handle_generating_state(agent_data, sampling_params)
-            elif state == AgentState.PROCESSING_TOOLS:
-                state = await self._handle_processing_tools_state(agent_data)
-            else:
-                logger.error(f"Invalid state: {state}")
-                state = AgentState.TERMINATED
+        if agent_data.extra_fields["initial_prompt_fit_succeeded"]:
+            state = AgentState.PENDING
+            while state != AgentState.TERMINATED:
+                if state == AgentState.PENDING:
+                    state = await self._handle_pending_state(agent_data, sampling_params)
+                elif state == AgentState.GENERATING:
+                    state = await self._handle_generating_state(agent_data, sampling_params)
+                elif state == AgentState.PROCESSING_TOOLS:
+                    state = await self._handle_processing_tools_state(agent_data)
+                else:
+                    logger.error(f"Invalid state: {state}")
+                    state = AgentState.TERMINATED
+        else:
+            agent_data.prompt_ids = await self.apply_chat_template(
+                aligned_prompt,
+                tools=self.tool_schemas if self.tool_schemas else None,
+                images=images if images else None,
+                videos=videos if videos else None,
+            )
+            agent_data.messages.append({"role": "assistant", "content": ""})
+            agent_data.assistant_turns = 1
+            failure_reason = (
+                "initial_prompt_overflow_after_shrink: "
+                f"{agent_data.extra_fields['initial_prompt_tokens']} > "
+                f"{initial_prompt_fit_metadata.get('max_model_len')}"
+            )
+            agent_data.extra_fields["failure_reasons"] = [failure_reason]
+            agent_data.extra_fields.setdefault("export_failure_events", []).append(
+                {
+                    "kind": "initial_prompt_fit",
+                    "status": "overflow_after_max_shrinks",
+                    "error_message": failure_reason,
+                    "shrink_count": agent_data.extra_fields.get("initial_prompt_shrink_count", 0),
+                    "prompt_tokens": agent_data.extra_fields.get("initial_prompt_tokens"),
+                    "max_model_len": initial_prompt_fit_metadata.get("max_model_len"),
+                }
+            )
+
+        _record_core_inference_metrics(agent_data)
 
         # Includes prompt/image preparation, tool processing, and model generation.
         # Excludes export and later postprocessing.
@@ -947,6 +1066,13 @@ class InSightQwenAgentLoop(QwenAgentLoop):
 
         response_ids = agent_data.prompt_ids[-len(agent_data.response_mask):]
         prompt_ids = agent_data.prompt_ids[:len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        response_tokens_total = len(response_ids)
+        response_tokens_generated = int(sum(agent_data.response_mask))
+        response_tokens_tool = response_tokens_total - response_tokens_generated
+        agent_data.extra_fields["prompt_tokens"] = len(prompt_ids)
+        agent_data.extra_fields["response_tokens_total"] = response_tokens_total
+        agent_data.extra_fields["response_tokens_generated"] = response_tokens_generated
+        agent_data.extra_fields["response_tokens_tool"] = response_tokens_tool
         if len(response_ids) > self.response_length or len(agent_data.response_mask) > self.response_length:
             agent_data.extra_fields["response_truncated"] = True
 
@@ -974,9 +1100,36 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                     loop_params={
                         "initial_rescale": actual_initial_rescale,
                         "configured_initial_rescale": self.initial_rescale,
+                        "initial_rescale_randomization": initial_rescale_metadata,
+                        "initial_prompt_tokens": agent_data.extra_fields.get("initial_prompt_tokens"),
+                        "initial_prompt_tokens_before_shrink": agent_data.extra_fields.get(
+                            "initial_prompt_tokens_before_shrink"
+                        ),
+                        "initial_prompt_tokens_after_shrink": agent_data.extra_fields.get(
+                            "initial_prompt_tokens_after_shrink"
+                        ),
+                        "initial_prompt_shrink_count": agent_data.extra_fields.get("initial_prompt_shrink_count", 0),
+                        "initial_prompt_shrink_applied": agent_data.extra_fields.get("initial_prompt_shrink_applied", False),
+                        "initial_prompt_fit_succeeded": agent_data.extra_fields.get("initial_prompt_fit_succeeded", True),
+                        "initial_prompt_shrink_warning": agent_data.extra_fields.get("initial_prompt_shrink_warning"),
                         "initial_input_pixels_lower_bound": self.initial_input_pixels_lower_bound,
                         "gpt_image_max_area": self.gpt_image_max_area,
+                        "crop_image_max_area": self.crop_image_max_area,
                         "region_zoom_in_factor": self.region_zoom_in_factor,
+                        "lengths": {
+                            "prompt_tokens": agent_data.extra_fields.get("prompt_tokens"),
+                            "response_tokens_total": agent_data.extra_fields.get("response_tokens_total"),
+                            "response_tokens_generated": agent_data.extra_fields.get("response_tokens_generated"),
+                            "response_tokens_tool": agent_data.extra_fields.get("response_tokens_tool"),
+                        },
+                        "timing": {
+                            "initial_prompt_fit_time": agent_data.extra_fields.get("initial_prompt_fit_time", 0.0),
+                            "generate_sequences": agent_data.extra_fields.get("generate_sequences", 0.0),
+                            "tool_parsing": agent_data.extra_fields.get("tool_parsing", 0.0),
+                            "tool_calls": agent_data.extra_fields.get("tool_calls", 0.0),
+                            "core_inference_time": agent_data.extra_fields.get("core_inference_time", 0.0),
+                            "conversation_wall_time": agent_data.extra_fields.get("conversation_wall_time", 0.0),
+                        },
                         "agent_name": "insight_qwen_agent",
                     },
                     sampling_params=dict(sampling_params),
@@ -1035,7 +1188,8 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         self,
         messages: list[dict[str, Any]],
         images_are_presented: bool = False,
-    ) -> tuple[list[dict[str, Any]], list[Image.Image], list[PresentedImageState], float]:
+        training_mode: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[Image.Image], list[PresentedImageState], float, dict[str, Any]]:
         original_images: list[Image.Image] = []
         staged_messages: list[tuple[dict[str, Any], list[Any], list[str], bool]] = []
         for message in messages:
@@ -1071,11 +1225,10 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                 message["content"] = [copy.deepcopy(item) for item in content if isinstance(item, dict)]
             staged_messages.append((message, staged_items, trailing_text_parts, saw_image))
 
-        actual_initial_rescale = self.initial_rescale if images_are_presented else resolve_dynamic_initial_rescale(
+        actual_initial_rescale, initial_rescale_metadata = self._resolve_initial_rescale_for_prompt(
             image_sizes=[image.size for image in original_images],
-            configured_initial_rescale=self.initial_rescale,
-            total_pixels_lower_bound=self.initial_input_pixels_lower_bound,
-            per_image_max_area=self.gpt_image_max_area,
+            images_are_presented=images_are_presented,
+            training_mode=training_mode,
         )
 
         presented_images: list[PresentedImageState] = []
@@ -1107,7 +1260,225 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                 new_content.append({"type": "text", "text": "".join(trailing_text_parts)})
             message["content"] = new_content
 
-        return messages, original_images, presented_images, actual_initial_rescale
+        return messages, original_images, presented_images, actual_initial_rescale, initial_rescale_metadata
+
+    async def _fit_initial_prompt_to_max_model_len(
+        self,
+        messages: list[dict[str, Any]],
+        presented_images: list[PresentedImageState],
+        images: list[Any] | None,
+        videos: list[Any] | None,
+    ) -> tuple[list[Any] | None, list[Any] | None, dict[str, Any]]:
+        max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
+        if max_model_len is None:
+            return images, videos, {
+                "prompt_shrink_count": 0,
+                "prompt_tokens_before_shrink": None,
+                "prompt_tokens_after_shrink": None,
+                "fits_max_model_len": True,
+                "max_model_len": None,
+                "prompt_shrink_warning": None,
+                "prompt_shrink_area_factor": INITIAL_PROMPT_SHRINK_AREA_FACTOR,
+                "prompt_max_shrink_steps": INITIAL_PROMPT_MAX_SHRINK_STEPS,
+            }
+
+        prompt_ids = await self.apply_chat_template(
+            messages,
+            tools=self.tool_schemas if self.tool_schemas else None,
+            images=images if images else None,
+            videos=videos if videos else None,
+        )
+        prompt_tokens_before = len(prompt_ids)
+        prompt_tokens_after = prompt_tokens_before
+        shrink_count = 0
+
+        while (
+            prompt_tokens_after > max_model_len
+            and shrink_count < INITIAL_PROMPT_MAX_SHRINK_STEPS
+            and presented_images
+        ):
+            shrink_count += 1
+            self._shrink_presented_prompt_images(messages, presented_images)
+            multi_modal_data = await self.process_vision_info(messages)
+            images = multi_modal_data.get("images")
+            videos = multi_modal_data.get("videos")
+            prompt_ids = await self.apply_chat_template(
+                messages,
+                tools=self.tool_schemas if self.tool_schemas else None,
+                images=images if images else None,
+                videos=videos if videos else None,
+            )
+            prompt_tokens_after = len(prompt_ids)
+
+        fits_max_model_len = prompt_tokens_after <= max_model_len
+        warning = None
+        if shrink_count > 0:
+            warning = (
+                "initial prompt exceeded max_model_len; shrank presented image area by 50% "
+                f"{shrink_count} time(s) (max {INITIAL_PROMPT_MAX_SHRINK_STEPS}) "
+                f"from {prompt_tokens_before} to {prompt_tokens_after} tokens with max_model_len={max_model_len}"
+            )
+            logger.warning(warning)
+            print(f"[InSightQwenAgentLoop] WARNING: {warning}")
+        if not fits_max_model_len and prompt_tokens_after > max_model_len:
+            overflow_warning = (
+                f"initial prompt still exceeds max_model_len after {shrink_count} shrink step(s): "
+                f"{prompt_tokens_after} > {max_model_len}"
+            )
+            logger.warning(overflow_warning)
+            print(f"[InSightQwenAgentLoop] WARNING: {overflow_warning}")
+            if warning is None:
+                warning = overflow_warning
+            else:
+                warning = f"{warning}; {overflow_warning}"
+
+        return images, videos, {
+            "prompt_shrink_count": shrink_count,
+            "prompt_tokens_before_shrink": prompt_tokens_before,
+            "prompt_tokens_after_shrink": prompt_tokens_after,
+            "fits_max_model_len": fits_max_model_len,
+            "max_model_len": max_model_len,
+            "prompt_shrink_warning": warning,
+            "prompt_shrink_area_factor": INITIAL_PROMPT_SHRINK_AREA_FACTOR,
+            "prompt_max_shrink_steps": INITIAL_PROMPT_MAX_SHRINK_STEPS,
+        }
+
+    def _shrink_presented_prompt_images(
+        self,
+        messages: list[dict[str, Any]],
+        presented_images: list[PresentedImageState],
+    ) -> None:
+        presented_img_idx = 0
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "image":
+                    continue
+                if presented_img_idx >= len(presented_images):
+                    return
+                presented_state = presented_images[presented_img_idx]
+                target_size = _cap_size_by_area(
+                    _resize_dims_by_factor(presented_state.image.size, INITIAL_PROMPT_SHRINK_DIM_FACTOR),
+                    self.gpt_image_max_area,
+                )
+                if target_size == presented_state.image.size:
+                    shrunk_image = presented_state.image.copy()
+                else:
+                    shrunk_image = presented_state.image.resize(target_size, Image.LANCZOS)
+                presented_state.image = shrunk_image
+                presented_state.display_size = shrunk_image.size
+                item["image"] = shrunk_image
+                presented_img_idx += 1
+
+    def _resolve_initial_rescale_for_prompt(
+        self,
+        image_sizes: list[tuple[int, int]],
+        *,
+        images_are_presented: bool,
+        training_mode: bool,
+    ) -> tuple[float, dict[str, Any]]:
+        if images_are_presented:
+            return self.initial_rescale, {
+                "images_are_presented": True,
+                "randomized": False,
+                "sampled_initial_rescale": self.initial_rescale,
+                "actual_initial_rescale": self.initial_rescale,
+            }
+
+        sampled_initial_rescale = self.initial_rescale
+        randomized = False
+        max_rescale_under_budget = None
+
+        if training_mode and self._should_randomize_initial_rescale() and image_sizes:
+            randomized_rescale, max_rescale_under_budget = self._sample_training_initial_rescale(image_sizes)
+            if randomized_rescale is not None:
+                sampled_initial_rescale = randomized_rescale
+                randomized = True
+
+        actual_initial_rescale = resolve_dynamic_initial_rescale(
+            image_sizes=image_sizes,
+            configured_initial_rescale=sampled_initial_rescale,
+            total_pixels_lower_bound=self.initial_input_pixels_lower_bound,
+            per_image_max_area=self.gpt_image_max_area,
+        )
+        if randomized and max_rescale_under_budget is not None:
+            actual_initial_rescale = min(actual_initial_rescale, max_rescale_under_budget)
+        return actual_initial_rescale, {
+            "images_are_presented": False,
+            "randomized": randomized,
+            "sampled_initial_rescale": sampled_initial_rescale,
+            "actual_initial_rescale": actual_initial_rescale,
+            "configured_initial_rescale": self.initial_rescale,
+            "train_randomization_prob": self.train_initial_rescale_randomization_prob,
+            "train_randomization_min": self.train_initial_rescale_randomization_min,
+            "train_randomization_max": self.train_initial_rescale_randomization_max,
+            "train_randomization_text_budget": self.train_initial_rescale_randomization_text_budget,
+            "image_token_budget_estimate": max(self.prompt_length - self.train_initial_rescale_randomization_text_budget, 0),
+        }
+
+    def _should_randomize_initial_rescale(self) -> bool:
+        return (
+            self.train_initial_rescale_randomization_prob > 0.0
+            and self.train_initial_rescale_randomization_max > self.train_initial_rescale_randomization_min
+            and random.random() < self.train_initial_rescale_randomization_prob
+        )
+
+    def _sample_training_initial_rescale(self, image_sizes: list[tuple[int, int]]) -> tuple[float | None, float | None]:
+        image_token_budget = max(self.prompt_length - self.train_initial_rescale_randomization_text_budget, 0)
+        if image_token_budget <= 0:
+            return None, None
+
+        max_rescale_under_budget = self._max_initial_rescale_under_image_token_budget(
+            image_sizes=image_sizes,
+            image_token_budget=image_token_budget,
+        )
+        if max_rescale_under_budget is None:
+            return None, None
+
+        lo = self.train_initial_rescale_randomization_min
+        hi = min(self.train_initial_rescale_randomization_max, max_rescale_under_budget)
+        if hi < lo:
+            return None, None
+        if abs(hi - lo) < 1e-8:
+            return lo, max_rescale_under_budget
+        return random.uniform(lo, hi), max_rescale_under_budget
+
+    def _estimate_image_tokens_after_rescale(
+        self,
+        image_sizes: list[tuple[int, int]],
+        initial_rescale: float,
+    ) -> int:
+        total_tokens = 0
+        for width, height in image_sizes:
+            resized_w, resized_h = _resize_dims_by_factor((width, height), initial_rescale)
+            capped_w, capped_h = _cap_size_by_area((resized_w, resized_h), self.gpt_image_max_area)
+            total_tokens += math.ceil(capped_w / 32) * math.ceil(capped_h / 32)
+        return total_tokens
+
+    def _max_initial_rescale_under_image_token_budget(
+        self,
+        *,
+        image_sizes: list[tuple[int, int]],
+        image_token_budget: int,
+    ) -> float | None:
+        if self._estimate_image_tokens_after_rescale(image_sizes, self.train_initial_rescale_randomization_min) > image_token_budget:
+            return None
+        if self._estimate_image_tokens_after_rescale(image_sizes, self.train_initial_rescale_randomization_max) <= image_token_budget:
+            return self.train_initial_rescale_randomization_max
+
+        lo = self.train_initial_rescale_randomization_min
+        hi = self.train_initial_rescale_randomization_max
+        best = lo
+        for _ in range(24):
+            mid = (lo + hi) / 2.0
+            if self._estimate_image_tokens_after_rescale(image_sizes, mid) <= image_token_budget:
+                best = mid
+                lo = mid
+            else:
+                hi = mid
+        return best
 
     def _build_presented_image(self, image: Image.Image, initial_rescale: float) -> Image.Image:
         target_size = _cap_size_by_area(
@@ -1280,7 +1651,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         region_display_size = (max(1, x2 - x1), max(1, y2 - y1))
         target_display_size = _cap_size_by_area(
             _resize_dims_by_factor(region_display_size, self.region_zoom_in_factor),
-            self.gpt_image_max_area,
+            self.crop_image_max_area,
         )
         aspect_ratio_error = _validate_qwen_image_aspect_ratio(target_display_size)
         if aspect_ratio_error is not None:

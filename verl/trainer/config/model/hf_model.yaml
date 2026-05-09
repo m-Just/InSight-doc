@@ -36,6 +36,9 @@ enable_gradient_checkpointing: True
 # whether to enable activation offload. Only valid when we use hf model definition
 enable_activation_offload: False
 
+# whether to freeze the vision tower for VLM SFT.
+freeze_vision_tower: False
+
 # whether to use remove padding. Only valid when we use hf model definition
 use_remove_padding: True
 

@@ -74,6 +74,31 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def get_vl_model_vision_tower(vl_model_instance):
+    """
+    Extract the vision tower from common HuggingFace/PEFT VLM wrappers.
+    """
+    candidate_attr_paths = (
+        ("model", "visual"),
+        ("visual",),
+        ("base_model", "model", "model", "visual"),
+        ("base_model", "model", "visual"),
+        ("model", "vision_tower"),
+        ("vision_tower",),
+        ("model", "vision_model"),
+        ("vision_model",),
+    )
+    for attr_path in candidate_attr_paths:
+        module = vl_model_instance
+        for attr in attr_path:
+            module = getattr(module, attr, None)
+            if module is None:
+                break
+        if module is not None:
+            return module
+    return None
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -425,6 +450,16 @@ class FSDPEngine(BaseEngine):
         # Apply LoRA adapters if low-rank adaptation is enabled
         if self._is_lora:
             module = self._build_lora_module(module)
+
+        if self.model_config.freeze_vision_tower:
+            vision_tower = get_vl_model_vision_tower(module)
+            if vision_tower is not None:
+                vision_tower.requires_grad_(False)
+                self.engine_config.use_orig_params = True
+                if self.rank == 0:
+                    print("[sft model] Vision tower is set to not trainable.")
+            elif self.rank == 0:
+                print("[sft model] No vision tower found.")
 
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()

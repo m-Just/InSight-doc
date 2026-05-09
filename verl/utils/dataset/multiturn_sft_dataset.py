@@ -96,6 +96,8 @@ class MultiTurnSFTDataset(Dataset):
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
         self.max_samples = max_samples
+        self.first_4_loss_tokens = 4
+        self.first_k_loss_tokens = int(config.get("first_k_loss_tokens", os.getenv("SFT_FIRST_K_LOSS_TOKENS", 16)))
         self.ignore_input_ids_mismatch = config.get("ignore_input_ids_mismatch", False)
         assert self.truncation in ["error", "left", "right"]
 
@@ -182,6 +184,16 @@ class MultiTurnSFTDataset(Dataset):
 
     def __len__(self):
         return len(self.messages)
+
+    @staticmethod
+    def _build_first_n_loss_mask(loss_mask: torch.Tensor, n_tokens: int) -> torch.Tensor:
+        first_n_loss_mask = torch.zeros_like(loss_mask)
+        if n_tokens <= 0:
+            return first_n_loss_mask
+        loss_positions = torch.nonzero(loss_mask, as_tuple=False).reshape(-1)
+        if len(loss_positions) > 0:
+            first_n_loss_mask[loss_positions[:n_tokens]] = 1
+        return first_n_loss_mask
 
     def _process_single_message(
         self,
@@ -315,6 +327,8 @@ class MultiTurnSFTDataset(Dataset):
         input_ids = torch.cat(input_ids, dim=0)
         loss_mask = torch.cat(loss_mask, dim=0)
         attention_mask = torch.cat(attention_mask, dim=0)
+        first_4_loss_mask = self._build_first_n_loss_mask(loss_mask, self.first_4_loss_tokens)
+        first_k_loss_mask = self._build_first_n_loss_mask(loss_mask, self.first_k_loss_tokens)
         assert input_ids.shape == loss_mask.shape == attention_mask.shape, (
             f"Shape mismatch: {input_ids.shape}, {loss_mask.shape}, {attention_mask.shape}"
         )
@@ -356,6 +370,8 @@ class MultiTurnSFTDataset(Dataset):
 
         # 3. handle padding
         sequence_length = input_ids.shape[0]
+        truncated = False
+
         # Handle sequence length
         if self.pad_mode == DatasetPadMode.RIGHT:
             if sequence_length < self.max_length:
@@ -368,17 +384,25 @@ class MultiTurnSFTDataset(Dataset):
                 input_ids = torch.cat((input_ids, padded_input_ids))
                 attention_mask = torch.cat((attention_mask, padded_attention_mask))
                 loss_mask = torch.cat((loss_mask, padded_loss_mask))
+                first_4_loss_mask = torch.cat((first_4_loss_mask, padded_loss_mask))
+                first_k_loss_mask = torch.cat((first_k_loss_mask, padded_loss_mask))
                 position_ids = F.pad(position_ids, (0, self.max_length - sequence_length), value=0)
             elif sequence_length > self.max_length:
                 if self.truncation == "left":
+                    truncated = True
                     input_ids = input_ids[-self.max_length :]
                     attention_mask = attention_mask[-self.max_length :]
                     loss_mask = loss_mask[-self.max_length :]
+                    first_4_loss_mask = first_4_loss_mask[-self.max_length :]
+                    first_k_loss_mask = first_k_loss_mask[-self.max_length :]
                     position_ids = position_ids[..., -self.max_length :]
                 elif self.truncation == "right":
+                    truncated = True
                     input_ids = input_ids[: self.max_length]
                     attention_mask = attention_mask[: self.max_length]
                     loss_mask = loss_mask[: self.max_length]
+                    first_4_loss_mask = first_4_loss_mask[: self.max_length]
+                    first_k_loss_mask = first_k_loss_mask[: self.max_length]
                     position_ids = position_ids[..., : self.max_length]
                 elif self.truncation == "error":
                     raise ValueError(f"{sequence_length=} is larger than {self.max_length=}")
@@ -390,16 +414,22 @@ class MultiTurnSFTDataset(Dataset):
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
                 "loss_mask": loss_mask,
+                "first_4_loss_mask": first_4_loss_mask,
+                "first_k_loss_mask": first_k_loss_mask,
             }
             if len(multi_modal_inputs) > 0:
                 res["multi_modal_inputs"] = multi_modal_inputs
             res["debug_sample_info"] = self.debug_sample_info[item]
+            res["truncate_flag"] = bool(truncated)
             return res
         elif self.pad_mode == DatasetPadMode.NO_PADDING:
             # truncate input_ids if it is longer than max_length
             if len(input_ids) > self.max_length:
+                truncated = True
                 input_ids = input_ids[: self.max_length]
                 loss_mask = loss_mask[: self.max_length]
+                first_4_loss_mask = first_4_loss_mask[: self.max_length]
+                first_k_loss_mask = first_k_loss_mask[: self.max_length]
                 position_ids = position_ids[..., : self.max_length]
 
             # return nested tensor with out padding
@@ -407,10 +437,13 @@ class MultiTurnSFTDataset(Dataset):
                 "input_ids": input_ids,
                 "position_ids": position_ids,
                 "loss_mask": loss_mask,
+                "first_4_loss_mask": first_4_loss_mask,
+                "first_k_loss_mask": first_k_loss_mask,
             }
             if len(multi_modal_inputs) > 0:
                 res["multi_modal_inputs"] = multi_modal_inputs
             res["debug_sample_info"] = self.debug_sample_info[item]
+            res["truncate_flag"] = bool(truncated)
             return res
         else:
             raise ValueError(f"Unknown pad mode {self.pad_mode}")

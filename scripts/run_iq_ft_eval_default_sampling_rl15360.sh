@@ -4,6 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TELEGRAM_WRAPPER="$SCRIPT_DIR/run_with_telegram_notification.sh"
 
 source /home/ywxzml3j/ywxzml3juser40/miniconda3/etc/profile.d/conda.sh
 conda activate vllm-latest
@@ -29,35 +30,66 @@ export VAL_FILES="${VAL_FILES:-[/scratch/ywxzml3j/likaican/temp/arxiv_0307_sampl
 export NUM_VAL_TRIALS="${NUM_VAL_TRIALS:-1}"
 export JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-nano}"
 export MAX_VAL_SAMPLE_DUMP_PER_DATA_SOURCE="${MAX_VAL_SAMPLE_DUMP_PER_DATA_SOURCE:-0}"
-export LOGGER="${LOGGER:-['console','wandb']}"
+export LOGGER="${LOGGER:-['console']}"
 export WANDB_NAME="${WANDB_NAME:-$EXP_NAME}"
 export CUDA_VISIBLE_DEVICES="${EVAL_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-15360}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-32}"
 export CONVERSATION_EXPORT_DIR="${CONVERSATION_EXPORT_DIR:-$WORK_DIR/exported_conversations}"
+export AGENT_LOOP_CONFIG_PATH="${AGENT_LOOP_CONFIG_PATH:-recipe/vsearch/config/agent_insight_qwen_agent.yaml}"
+export TOOL_MAX_USER_TURNS="${TOOL_MAX_USER_TURNS:-6}"
+export TOOL_MAX_ASSISTANT_TURNS="${TOOL_MAX_ASSISTANT_TURNS:-7}"
+export QWEN_TOOL_LIST="${QWEN_TOOL_LIST:-[image_zoom_in_tool_qwen3vl]}"
+export DATA_MAX_PROMPT_LENGTH="${DATA_MAX_PROMPT_LENGTH:-17408}"
+export DATA_VALIDATION_MAX_PROMPT_LENGTH="${DATA_VALIDATION_MAX_PROMPT_LENGTH:-17408}"
+export ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-32768}"
+export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.75}"
+export VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.7}"
+export VAL_TOP_P="${VAL_TOP_P:-0.8}"
+export VAL_TOP_K="${VAL_TOP_K:-20}"
+export VAL_PRESENCE_PENALTY="${VAL_PRESENCE_PENALTY:-1.5}"
+export VAL_REPETITION_PENALTY="${VAL_REPETITION_PENALTY:-1.0}"
 export TMPDIR="${TMPDIR:-/tmp}"
 export TMP="${TMP:-$TMPDIR}"
 export TEMP="${TEMP:-$TMPDIR}"
 export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/rfi6}"
+export LAUNCH_LOG_PATH="${LAUNCH_LOG_PATH:-$WORK_DIR/${EXP_NAME}.launch.log}"
+export TELEGRAM_NOTIFY_ON_FINISH="${TELEGRAM_NOTIFY_ON_FINISH:-1}"
+export TELEGRAM_NOTIFY_LABEL="${TELEGRAM_NOTIFY_LABEL:-$EXP_NAME}"
 
-mkdir -p "$WORK_DIR" "$RAY_TMPDIR" "$CONVERSATION_EXPORT_DIR"
+mkdir -p "$WORK_DIR" "$RAY_TMPDIR" "$CONVERSATION_EXPORT_DIR" "$(dirname "$LAUNCH_LOG_PATH")"
+
+if [[ "${TELEGRAM_NOTIFY_ON_FINISH}" == "1" && "${TELEGRAM_WRAPPED:-0}" != "1" && -x "$TELEGRAM_WRAPPER" ]]; then
+  export TELEGRAM_WRAPPED=1
+  exec "$TELEGRAM_WRAPPER" --label "$TELEGRAM_NOTIFY_LABEL" -- "$0" "$@"
+fi
+
+exec > >(tee -a "$LAUNCH_LOG_PATH") 2>&1
 
 cd "$REPO_ROOT"
 source recipe/vsearch/_base.sh
 
-run_experiment \
-  trainer.n_gpus_per_node=4 \
-  data.max_prompt_length=17408 \
-  data.validation_max_prompt_length=17408 \
-  actor_rollout_ref.model.custom_chat_template=null \
-  actor_rollout_ref.rollout.n=1 \
-  actor_rollout_ref.rollout.agent.default_agent_loop=insight_qwen_agent \
-  actor_rollout_ref.rollout.agent.agent_loop_config_path=recipe/vsearch/config/agent_insight_qwen_agent.yaml \
-  +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_dir="$CONVERSATION_EXPORT_DIR" \
-  actor_rollout_ref.rollout.multi_turn.qwen_tool_list=[image_zoom_in_tool_qwen3vl] \
-  actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
-  actor_rollout_ref.rollout.val_kwargs.top_p=0.8 \
-  actor_rollout_ref.rollout.val_kwargs.top_k=20 \
-  actor_rollout_ref.rollout.val_kwargs.presence_penalty=1.5 \
-  actor_rollout_ref.rollout.val_kwargs.repetition_penalty=1.0 \
-  +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len=32768
+hydra_args=(
+  trainer.n_gpus_per_node=4
+  data.max_prompt_length="$DATA_MAX_PROMPT_LENGTH"
+  data.validation_max_prompt_length="$DATA_VALIDATION_MAX_PROMPT_LENGTH"
+  actor_rollout_ref.model.custom_chat_template=null
+  actor_rollout_ref.rollout.n=1
+  actor_rollout_ref.rollout.max_model_len="$ROLLOUT_MAX_MODEL_LEN"
+  actor_rollout_ref.rollout.agent.default_agent_loop=insight_qwen_agent
+  actor_rollout_ref.rollout.agent.agent_loop_config_path="$AGENT_LOOP_CONFIG_PATH"
+  +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_dir="$CONVERSATION_EXPORT_DIR"
+  actor_rollout_ref.rollout.multi_turn.max_user_turns="$TOOL_MAX_USER_TURNS"
+  actor_rollout_ref.rollout.multi_turn.max_assistant_turns="$TOOL_MAX_ASSISTANT_TURNS"
+  actor_rollout_ref.rollout.multi_turn.qwen_tool_list="$QWEN_TOOL_LIST"
+  actor_rollout_ref.rollout.val_kwargs.temperature="$VAL_TEMPERATURE"
+  actor_rollout_ref.rollout.val_kwargs.top_p="$VAL_TOP_P"
+  actor_rollout_ref.rollout.val_kwargs.top_k="$VAL_TOP_K"
+  actor_rollout_ref.rollout.val_kwargs.presence_penalty="$VAL_PRESENCE_PENALTY"
+  actor_rollout_ref.rollout.val_kwargs.repetition_penalty="$VAL_REPETITION_PENALTY"
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len="$VLLM_MAX_MODEL_LEN"
+  +actor_rollout_ref.rollout.engine_kwargs.vllm.gpu_memory_utilization="$VLLM_GPU_MEMORY_UTILIZATION"
+)
+
+run_experiment "${hydra_args[@]}"

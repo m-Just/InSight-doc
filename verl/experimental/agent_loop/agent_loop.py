@@ -186,7 +186,9 @@ class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
 
     generate_sequences: float = 0.0
+    tool_parsing: float = 0.0
     tool_calls: float = 0.0
+    core_inference_time: float = 0.0
     conversation_wall_time: float = 0.0
     num_preempted: int = -1  # -1 means not available
 

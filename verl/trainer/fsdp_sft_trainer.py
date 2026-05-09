@@ -141,6 +141,7 @@ class FSDPSFTTrainer:
             print(self.config)
 
         self.device_name = self.config.trainer.device
+        self.first_k_loss_tokens = int(os.getenv("SFT_FIRST_K_LOSS_TOKENS", self.config.trainer.get("first_k_loss_tokens", 16)))
 
     def _normalize_config_bsz(self):
         dp_size = self.device_mesh.size(0) if not self.ulysses_device_mesh else self.ulysses_device_mesh.size(0)
@@ -225,6 +226,23 @@ class FSDPSFTTrainer:
             )
 
         self._build_dataloader(self.train_dataset, self.val_dataset)
+
+    @staticmethod
+    def _extract_truncation_ratio(batch) -> float:
+        value = batch.get("truncate_flag", None)
+        if value is None:
+            return 0.0
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return 0.0
+            return value.float().mean().item()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return 0.0
+            return float(sum(bool(v) for v in value)) / float(len(value))
+        return float(bool(value))
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -391,7 +409,7 @@ class FSDPSFTTrainer:
         else:
             raise ValueError(f"Unknown lr scheduler: {self.config.optim.lr_scheduler}")
 
-    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1):
+    def _compute_loss_and_backward(self, batch, do_backward=True, n_micro_batches=1, return_loss_metrics=False):
         """Compute loss with optional sequence parallelism and remove padding features"""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
 
@@ -399,7 +417,22 @@ class FSDPSFTTrainer:
         input_ids = batch["input_ids"].to(self.device_name)
         attention_mask = batch["attention_mask"].to(self.device_name)
         position_ids = batch["position_ids"].to(self.device_name)
-        loss_mask = batch.pop("loss_mask")[:, 1:].reshape(-1).to(self.device_name)
+        loss_mask = batch["loss_mask"][:, 1:].reshape(-1).to(self.device_name)
+        first_4_loss_mask = batch.get("first_4_loss_mask", None)
+        if first_4_loss_mask is not None:
+            first_4_loss_mask = first_4_loss_mask[:, 1:].reshape(-1).to(self.device_name)
+        first_k_loss_mask = batch.get("first_k_loss_mask", None)
+        if first_k_loss_mask is not None:
+            first_k_loss_mask = first_k_loss_mask[:, 1:].reshape(-1).to(self.device_name)
+
+        def _masked_token_loss(per_token_loss: torch.Tensor, metric_loss_mask: torch.Tensor | None) -> torch.Tensor:
+            if metric_loss_mask is None:
+                return torch.tensor(0.0, device=per_token_loss.device)
+            metric_token_count = metric_loss_mask.sum()
+            if metric_token_count.item() <= 0:
+                return torch.tensor(0.0, device=per_token_loss.device)
+            return torch.sum(per_token_loss * metric_loss_mask.to(per_token_loss.device)) / metric_token_count
+
         loss_fct = nn.CrossEntropyLoss(reduction="none")
 
         # Context manager for sequence parallel if needed
@@ -420,8 +453,11 @@ class FSDPSFTTrainer:
                 shift_labels = shift_labels.view(-1)
                 # Enable model parallelism
                 shift_labels = shift_labels.to(shift_logits.device)
-                loss = loss_fct(shift_logits, shift_labels)
-                loss = loss * loss_mask.to(loss.device)
+                per_token_loss = loss_fct(shift_logits, shift_labels)
+                loss = per_token_loss * loss_mask.to(per_token_loss.device)
+                if return_loss_metrics:
+                    first_4_token_loss = _masked_token_loss(per_token_loss, first_4_loss_mask)
+                    first_k_token_loss = _masked_token_loss(per_token_loss, first_k_loss_mask)
             else:
                 # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
                 # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
@@ -475,6 +511,9 @@ class FSDPSFTTrainer:
                 full_loss = full_loss.reshape(-1)
                 loss_mask = loss_mask.to(full_loss.device)
                 loss = full_loss * loss_mask
+                if return_loss_metrics:
+                    first_4_token_loss = _masked_token_loss(full_loss, None if first_4_loss_mask is None else first_4_loss_mask.to(full_loss.device))
+                    first_k_token_loss = _masked_token_loss(full_loss, None if first_k_loss_mask is None else first_k_loss_mask.to(full_loss.device))
 
             valid_token_this_rank = torch.sum(loss_mask)
 
@@ -490,10 +529,17 @@ class FSDPSFTTrainer:
 
             if do_backward:
                 loss.backward()
+            if return_loss_metrics:
+                return {
+                    "loss": loss,
+                    "first_4_token_loss": first_4_token_loss,
+                    "first_k_token_loss": first_k_token_loss,
+                }
             return loss
 
     def training_step(self, batch: TensorDict):
         start_time = time.time()
+        truncation_ratio = self._extract_truncation_ratio(batch)
 
         self.fsdp_model.train()
 
@@ -536,6 +582,7 @@ class FSDPSFTTrainer:
         log_gpu_memory_usage("After offload weights", logger=logger)
 
         step_loss = torch.tensor(step_loss).to(self.device_name)
+        truncation_ratio_tensor = torch.tensor(truncation_ratio, device=self.device_name)
 
         # compute time spent per step
         end_time = time.time()
@@ -543,25 +590,48 @@ class FSDPSFTTrainer:
 
         if is_cuda_available:
             torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+            torch.distributed.all_reduce(truncation_ratio_tensor, op=torch.distributed.ReduceOp.AVG)
         elif is_npu_available:
             torch.distributed.all_reduce(step_loss)
             step_loss /= self.device_mesh.size(0)
+            torch.distributed.all_reduce(truncation_ratio_tensor)
+            truncation_ratio_tensor /= self.device_mesh.size(0)
         return {
             "train/loss": step_loss.detach().item(),
             "train/lr(1e-3)": lr * 1e3,
             "train/time(s)": spend_time_per_step,
+            "train/truncation_ratio": truncation_ratio_tensor.detach().item(),
         }
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
+        truncation_ratio = self._extract_truncation_ratio(batch)
         with torch.no_grad():
-            loss = self._compute_loss_and_backward(batch, do_backward=False)
+            outputs = self._compute_loss_and_backward(batch, do_backward=False, return_loss_metrics=True)
+            loss = outputs["loss"]
+            first_4_token_loss = outputs["first_4_token_loss"]
+            first_k_token_loss = outputs["first_k_token_loss"]
+            truncation_ratio_tensor = torch.tensor(truncation_ratio, device=self.device_name)
             if is_cuda_available:
                 torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
+                torch.distributed.all_reduce(first_4_token_loss, op=torch.distributed.ReduceOp.AVG)
+                torch.distributed.all_reduce(first_k_token_loss, op=torch.distributed.ReduceOp.AVG)
+                torch.distributed.all_reduce(truncation_ratio_tensor, op=torch.distributed.ReduceOp.AVG)
             elif is_npu_available:
                 torch.distributed.all_reduce(loss)
                 loss /= self.device_mesh.size(0)
-        return loss
+                torch.distributed.all_reduce(first_4_token_loss)
+                first_4_token_loss /= self.device_mesh.size(0)
+                torch.distributed.all_reduce(first_k_token_loss)
+                first_k_token_loss /= self.device_mesh.size(0)
+                torch.distributed.all_reduce(truncation_ratio_tensor)
+                truncation_ratio_tensor /= self.device_mesh.size(0)
+        return {
+            "loss": loss,
+            "truncation_ratio": truncation_ratio_tensor,
+            "first_4_token_loss": first_4_token_loss,
+            "first_k_token_loss": first_k_token_loss,
+        }
 
     def save_checkpoint(self, step):
         """Save checkpoint using FSDPCheckpointManager with improved tracking"""
@@ -802,15 +872,29 @@ class FSDPSFTTrainer:
                 if is_last_step or (self.config.trainer.test_freq > 0 and is_valid_step):
                     # Perform validation
                     val_losses = []
+                    val_truncation_ratios = []
+                    val_first_4_token_losses = []
+                    val_first_k_token_losses = []
                     for val_data in self.val_dataloader:
                         val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).to(
                             self.device_name
                         )
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
+                        val_metrics = self.validation_step(val_data)
+                        val_losses.append(val_metrics["loss"])
+                        val_truncation_ratios.append(val_metrics["truncation_ratio"])
+                        val_first_4_token_losses.append(val_metrics["first_4_token_loss"])
+                        val_first_k_token_losses.append(val_metrics["first_k_token_loss"])
                     if rank == 0:
                         val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {"val/loss": val_loss.detach().item()}
+                        val_truncation_ratio = torch.mean(torch.stack(val_truncation_ratios))
+                        val_first_4_token_loss = torch.mean(torch.stack(val_first_4_token_losses))
+                        val_first_k_token_loss = torch.mean(torch.stack(val_first_k_token_losses))
+                        metric = {
+                            "val/loss": val_loss.detach().item(),
+                            "val/truncation_ratio": val_truncation_ratio.detach().item(),
+                            "val/first_4_token_loss": val_first_4_token_loss.detach().item(),
+                            f"val/first_{self.first_k_loss_tokens}_token_loss": val_first_k_token_loss.detach().item(),
+                        }
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
                     torch.distributed.barrier()

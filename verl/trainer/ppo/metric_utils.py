@@ -726,6 +726,8 @@ def _compute_vsearch_val_metrics(var2vals: dict[str, list]) -> dict[str, dict[st
     attempts = np.array(var2vals[has_answer_key], dtype=bool)
     correct = attempts & np.array(var2vals["accuracy_reward"], dtype=bool)
     tool_use = attempts & np.array(var2vals["n_valid_tool_calls"], dtype=bool)
+    is_not_answerable = np.array(var2vals.get("is_not_answerable", [False] * len(attempts)), dtype=bool)
+    is_answerable = ~is_not_answerable
 
     def safe_ratio(num, den):
         return float(num / den) if den > 0 else float("nan")
@@ -740,6 +742,8 @@ def _compute_vsearch_val_metrics(var2vals: dict[str, list]) -> dict[str, dict[st
         "critical_failure_ratio": {"mean": failure_ratio},
         "has_answer": {"mean": float(attempts.mean())},
         "acc/answered": {"mean": safe_ratio(correct.sum(), attempts.sum())},
+        "acc/not_answerable": {"mean": safe_ratio((correct & is_not_answerable).sum(), (attempts & is_not_answerable).sum())},
+        "acc/answerable": {"mean": safe_ratio((correct & is_answerable).sum(), (attempts & is_answerable).sum())},
         "acc/direct": {"mean": safe_ratio((correct & ~tool_use).sum(), (attempts & ~tool_use).sum())},
         "acc/with_tool_use": {"mean": safe_ratio((correct & tool_use).sum(), (attempts & tool_use).sum())},
     }

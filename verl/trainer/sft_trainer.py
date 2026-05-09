@@ -13,8 +13,10 @@
 # limitations under the License.
 
 
+import json
 import os
 from functools import partial
+from pathlib import Path
 
 from tensordict.tensorclass import NonTensorData
 
@@ -70,9 +72,231 @@ class SFTTrainer:
         self._handle_epoch_boundary_resume()
 
         self.device_name = self.config.trainer.device
+        self._build_batch_snapshot_config()
 
         if self.rank == 0:
             print(self.config)
+
+    def _build_batch_snapshot_config(self):
+        def config_or_env(config_key: str, env_key: str, default=None):
+            env_value = os.getenv(env_key)
+            if env_value is not None:
+                return env_value
+            return self.config.trainer.get(config_key, default)
+
+        self.batch_snapshot_dir = config_or_env("batch_snapshot_dir", "SFT_BATCH_SNAPSHOT_DIR")
+        self.batch_snapshot_steps = self._parse_snapshot_steps(
+            config_or_env("batch_snapshot_steps", "SFT_BATCH_SNAPSHOT_STEPS", None)
+        )
+        self.batch_snapshot_ranks = self._parse_snapshot_ranks(
+            config_or_env("batch_snapshot_ranks", "SFT_BATCH_SNAPSHOT_RANKS", None)
+        )
+        self.batch_snapshot_max_samples = int(
+            config_or_env("batch_snapshot_max_samples", "SFT_BATCH_SNAPSHOT_MAX_SAMPLES", 4)
+        )
+        self.batch_snapshot_max_tokens_per_sample = int(
+            config_or_env("batch_snapshot_max_tokens_per_sample", "SFT_BATCH_SNAPSHOT_MAX_TOKENS_PER_SAMPLE", 4096)
+        )
+        self.first_k_loss_tokens = int(config_or_env("first_k_loss_tokens", "SFT_FIRST_K_LOSS_TOKENS", 16))
+        self.batch_snapshot_include_token_table = self._parse_bool(
+            config_or_env("batch_snapshot_include_token_table", "SFT_BATCH_SNAPSHOT_INCLUDE_TOKEN_TABLE", True)
+        )
+        if self.batch_snapshot_dir:
+            self.batch_snapshot_dir = Path(str(self.batch_snapshot_dir)).expanduser()
+            if self.batch_snapshot_steps == set():
+                self.batch_snapshot_steps = {1}
+
+    @staticmethod
+    def _parse_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _parse_int_set(value):
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return set()
+            if stripped.lower() in {"all", "*"}:
+                return None
+            stripped = stripped.strip("[]")
+            pieces = [piece.strip() for piece in stripped.replace(";", ",").split(",")]
+            return {int(piece) for piece in pieces if piece}
+        return {int(item) for item in value}
+
+    @classmethod
+    def _parse_snapshot_steps(cls, value):
+        return cls._parse_int_set(value)
+
+    @classmethod
+    def _parse_snapshot_ranks(cls, value):
+        return cls._parse_int_set(value)
+
+    def _should_dump_batch_snapshot(self, global_step: int) -> bool:
+        if not self.batch_snapshot_dir:
+            return False
+        if self.batch_snapshot_steps is not None and global_step not in self.batch_snapshot_steps:
+            return False
+        if self.batch_snapshot_ranks is not None and self.rank not in self.batch_snapshot_ranks:
+            return False
+        return True
+
+    @staticmethod
+    def _tensor_samples_to_lists(tensor, max_samples: int):
+        if tensor.is_nested:
+            samples = list(tensor.unbind())[:max_samples]
+        else:
+            samples = [tensor[idx] for idx in range(min(max_samples, tensor.shape[0]))]
+        return [sample.detach().cpu().reshape(-1).tolist() for sample in samples]
+
+    @staticmethod
+    def _loss_mask_spans(loss_mask: list[int]) -> list[dict[str, int]]:
+        spans = []
+        start = None
+        for idx, value in enumerate(loss_mask):
+            enabled = bool(value)
+            if enabled and start is None:
+                start = idx
+            elif not enabled and start is not None:
+                spans.append({"start": start, "end": idx, "length": idx - start})
+                start = None
+        if start is not None:
+            spans.append({"start": start, "end": len(loss_mask), "length": len(loss_mask) - start})
+        return spans
+
+    def _tokens_to_text(self, token_ids: list[int]) -> list[str]:
+        tokenizer = self.model_config.tokenizer
+        try:
+            return tokenizer.convert_ids_to_tokens(token_ids)
+        except Exception:
+            return [tokenizer.decode([token_id], skip_special_tokens=False) for token_id in token_ids]
+
+    def _dump_batch_snapshot(self, data, global_step: int, epoch: int, step_in_epoch: int):
+        if not self._should_dump_batch_snapshot(global_step):
+            return
+        try:
+            self.batch_snapshot_dir.mkdir(parents=True, exist_ok=True)
+            max_samples = max(0, self.batch_snapshot_max_samples)
+            token_id_samples = self._tensor_samples_to_lists(data["input_ids"], max_samples)
+            loss_mask_samples = self._tensor_samples_to_lists(data["loss_mask"], max_samples)
+            attention_mask_samples = None
+            if "attention_mask" in data.keys():
+                attention_mask_samples = self._tensor_samples_to_lists(data["attention_mask"], max_samples)
+            sample_info = data.get("debug_sample_info", None)
+            if sample_info is not None and hasattr(sample_info, "tolist"):
+                sample_info = sample_info.tolist()
+            if not isinstance(sample_info, list):
+                sample_info = [None] * len(token_id_samples)
+
+            samples = []
+            max_tokens = self.batch_snapshot_max_tokens_per_sample
+            for sample_idx, token_ids in enumerate(token_id_samples):
+                loss_mask = [int(value) for value in loss_mask_samples[sample_idx]]
+                if attention_mask_samples is not None and sample_idx < len(attention_mask_samples):
+                    attention_mask = [int(value) for value in attention_mask_samples[sample_idx]]
+                    sequence_len = int(sum(attention_mask)) if attention_mask else len(token_ids)
+                else:
+                    attention_mask = None
+                    sequence_len = len(token_ids)
+                if max_tokens >= 0:
+                    kept_token_ids = token_ids[:max_tokens]
+                    kept_loss_mask = loss_mask[:max_tokens]
+                    truncated = len(token_ids) > max_tokens
+                else:
+                    kept_token_ids = token_ids
+                    kept_loss_mask = loss_mask
+                    truncated = False
+
+                decoded_text = self.model_config.tokenizer.decode(kept_token_ids, skip_special_tokens=False)
+                sample = {
+                    "local_sample_idx": sample_idx,
+                    "source": sample_info[sample_idx] if sample_idx < len(sample_info) else None,
+                    "sequence_length": sequence_len,
+                    "num_loss_tokens": int(sum(loss_mask)),
+                    "loss_mask_spans": self._loss_mask_spans(loss_mask),
+                    "truncated_to_tokens": None if max_tokens < 0 else max_tokens,
+                    "is_truncated": truncated,
+                    "decoded_text": decoded_text,
+                    "token_ids": kept_token_ids,
+                    "loss_mask": kept_loss_mask,
+                }
+                if attention_mask is not None:
+                    sample["attention_mask"] = attention_mask[:max_tokens] if max_tokens >= 0 else attention_mask
+                if self.batch_snapshot_include_token_table:
+                    token_texts = self._tokens_to_text(kept_token_ids)
+                    sample["tokens"] = [
+                        {
+                            "idx": idx,
+                            "id": int(token_id),
+                            "text": token_texts[idx],
+                            "loss": bool(kept_loss_mask[idx]) if idx < len(kept_loss_mask) else False,
+                        }
+                        for idx, token_id in enumerate(kept_token_ids)
+                    ]
+                samples.append(sample)
+
+            payload = {
+                "global_step": global_step,
+                "epoch": epoch,
+                "step_in_epoch": step_in_epoch,
+                "rank": self.rank,
+                "data_parallel_rank": self.engine.get_data_parallel_rank(),
+                "data_parallel_size": self.engine.get_data_parallel_size(),
+                "pad_mode": str(self.config.data.pad_mode),
+                "max_samples": max_samples,
+                "max_tokens_per_sample": max_tokens,
+                "samples": samples,
+            }
+            output_path = self.batch_snapshot_dir / f"step_{global_step:06d}_rank_{self.rank:05d}.json"
+            output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to dump SFT batch snapshot at global_step=%s rank=%s", global_step, self.rank)
+
+    @staticmethod
+    def _extract_truncation_ratio(batch) -> float:
+        value = batch.get("truncate_flag", None)
+        if value is None:
+            return 0.0
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return 0.0
+            return value.float().mean().item()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return 0.0
+            return float(sum(bool(v) for v in value)) / float(len(value))
+        return float(bool(value))
+
+    @staticmethod
+    def _flatten_metric_values(value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            return value.detach().cpu().reshape(-1).tolist()
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            flattened = []
+            for item in value:
+                flattened.extend(SFTTrainer._flatten_metric_values(item))
+            return flattened
+        return [float(value)]
+
+    @staticmethod
+    def _mean_metric_value(value, default=0.0) -> float:
+        if value is None:
+            return default
+        flattened = SFTTrainer._flatten_metric_values(value)
+        if len(flattened) == 0:
+            return default
+        return float(sum(flattened)) / float(len(flattened))
 
     def _handle_epoch_boundary_resume(self):
         """Reset the train dataloader when resuming from an epoch-boundary checkpoint.
@@ -339,6 +563,12 @@ class SFTTrainer:
                 batch_seqlens_ntd = NonTensorData(batch_seqlens)
 
                 tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
+                self._dump_batch_snapshot(
+                    data=data,
+                    global_step=global_step,
+                    epoch=epoch,
+                    step_in_epoch=step_in_epoch,
+                )
 
                 if self.rank == 3 and global_step == 125:
                     sample_info = data.get("debug_sample_info", None)
@@ -369,6 +599,11 @@ class SFTTrainer:
                 if global_step == self.start_profile_step:
                     self.training_client.start_profile()
                 # train for on batch
+                train_truncation_ratio = self._extract_truncation_ratio(data)
+                train_truncation_ratio = torch.tensor(train_truncation_ratio, device=self.device_name)
+                torch.distributed.all_reduce(
+                    train_truncation_ratio, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
+                )
                 output = self.training_client.train_batch(data=data)
 
                 if global_step == self.end_profile_step:
@@ -382,11 +617,18 @@ class SFTTrainer:
                     metrics["train/grad_norm"] = metrics.pop("grad_norm")
                     metrics["train/lr"] = metrics.pop("lr")
                     metrics["train/mfu"] = metrics.pop("mfu")
+                    if "first_4_token_loss" in metrics:
+                        metrics["train/first_4_token_loss"] = self._mean_metric_value(metrics.pop("first_4_token_loss"))
+                    if "first_k_token_loss" in metrics:
+                        metrics[f"train/first_{self.first_k_loss_tokens}_token_loss"] = self._mean_metric_value(
+                            metrics.pop("first_k_token_loss")
+                        )
                     metrics["train/global_tokens"] = torch.sum(
                         torch.tensor(batch_seqlens, device=self.device_name)
                     ).item()
                     total_tokens += metrics["train/global_tokens"]
                     metrics["train/total_tokens(B)"] = total_tokens / 1e9
+                    metrics["train/truncation_ratio"] = train_truncation_ratio.item()
 
                     if self.engine.get_data_parallel_rank() == 0:
                         tracking.log(data=metrics, step=global_step)
@@ -399,23 +641,60 @@ class SFTTrainer:
                 if is_last_step and self.val_dataloader is not None or (self.test_freq > 0 and is_valid_step):
                     # Perform validation
                     val_losses = []
+                    val_truncation_ratios = []
+                    val_first_4_losses = []
+                    val_first_k_losses = []
                     for val_data in self.val_dataloader:
+                        val_truncation_ratios.append(self._extract_truncation_ratio(val_data))
                         val_data = tu.get_tensordict(tensor_dict=val_data, non_tensor_dict=meta_info)
                         output = self.training_client.infer_batch(val_data)
 
                         if self.engine.is_mp_src_rank_with_outputs():
                             metrics = tu.get(output, "metrics")
                             val_losses.append(metrics["loss"])
+                            if "first_4_token_loss" in metrics:
+                                val_first_4_losses.append(self._mean_metric_value(metrics["first_4_token_loss"]))
+                            if "first_k_token_loss" in metrics:
+                                val_first_k_losses.append(self._mean_metric_value(metrics["first_k_token_loss"]))
 
                     if self.engine.is_mp_src_rank_with_outputs():
                         val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
+                        val_truncation_ratio = torch.tensor(
+                            sum(val_truncation_ratios) / max(len(val_truncation_ratios), 1), device=self.device_name
+                        )
+                        val_first_4_token_loss = torch.tensor(
+                            sum(val_first_4_losses) / max(len(val_first_4_losses), 1), device=self.device_name
+                        )
+                        val_first_k_token_loss = torch.tensor(
+                            sum(val_first_k_losses) / max(len(val_first_k_losses), 1), device=self.device_name
+                        )
                         # average over data parallel group
                         torch.distributed.all_reduce(
                             val_loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
                         )
+                        torch.distributed.all_reduce(
+                            val_truncation_ratio,
+                            op=torch.distributed.ReduceOp.AVG,
+                            group=self.engine.get_data_parallel_group(),
+                        )
+                        torch.distributed.all_reduce(
+                            val_first_4_token_loss,
+                            op=torch.distributed.ReduceOp.AVG,
+                            group=self.engine.get_data_parallel_group(),
+                        )
+                        torch.distributed.all_reduce(
+                            val_first_k_token_loss,
+                            op=torch.distributed.ReduceOp.AVG,
+                            group=self.engine.get_data_parallel_group(),
+                        )
 
                     if is_logging:
-                        metric = {"val/loss": val_loss.detach().item()}
+                        metric = {
+                            "val/loss": val_loss.detach().item(),
+                            "val/truncation_ratio": val_truncation_ratio.detach().item(),
+                            "val/first_4_token_loss": val_first_4_token_loss.detach().item(),
+                            f"val/first_{self.first_k_loss_tokens}_token_loss": val_first_k_token_loss.detach().item(),
+                        }
                         tracking.log(data=metric, step=global_step)
                         last_valid_metric = metric
                     torch.distributed.barrier()

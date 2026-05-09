@@ -67,5 +67,7 @@ run_experiment \
   +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len=65536 \
   trainer.debug_skip_worker_init="${DEBUG_SKIP_WORKER_INIT:-False}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${TENSOR_MODEL_PARALLEL_SIZE:-1}" \
+  custom_reward_function.reward_kwargs.max_retries=15 \
+  custom_reward_function.reward_kwargs.retry_interval=90 \
   data.validation_shuffle=False
 

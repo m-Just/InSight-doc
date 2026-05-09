@@ -67,6 +67,24 @@ trainer:
   test_freq: -1
   max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, set to null to keep all
 
+  # Directory for optional JSON snapshots of tokenized SFT training batches.
+  batch_snapshot_dir: null
+
+  # Global training steps to snapshot. Use "all" to snapshot every step.
+  batch_snapshot_steps: null
+
+  # Ranks to snapshot. Null means all ranks.
+  batch_snapshot_ranks: null
+
+  # Maximum local samples to include per rank snapshot.
+  batch_snapshot_max_samples: 4
+
+  # Maximum tokens to include per sample in token_ids/loss_mask/token table. Use -1 for full sequences.
+  batch_snapshot_max_tokens_per_sample: 4096
+
+  # Whether to include per-token decoded strings in addition to token_ids and loss_mask.
+  batch_snapshot_include_token_table: True
+
   # Resume mode: "auto", "disable", or "resume_path"
   # "auto": resume from last checkpoint if available
   # "disable": start from scratch

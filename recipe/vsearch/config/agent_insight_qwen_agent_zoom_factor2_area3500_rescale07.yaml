@@ -1,0 +1,13 @@
+- name: qwen_agent
+  _target_: verl.experimental.agent_loop.qwen_agent_loop.QwenAgentLoop
+
+- name: insight_qwen_agent
+  _target_: verl.experimental.agent_loop.qwen_agent_loop.InSightQwenAgentLoop
+  initial_rescale: 0.7
+  gpt_image_max_area: 12250000  # 3500 * 3500
+  crop_image_max_area: 1638400  # 1280 * 1280
+  region_zoom_in_factor: 2.0
+  train_initial_rescale_randomization_prob: 0.0
+  train_initial_rescale_randomization_min: 0.7
+  train_initial_rescale_randomization_max: 0.7
+  train_initial_rescale_randomization_text_budget: 1024

@@ -62,9 +62,9 @@ if [ "$MODEL_PATH" == "Qwen/Qwen3-VL-8B-Instruct" ]; then
         # actor_rollout_ref.rollout.agent.agent_loop_config_path="recipe/vsearch/config/agent_gemini-3-flash-preview_vr2.yaml" \
     run_experiment \
         +data.batch_sampler.weights.insight_doc_region_localization=1.0 \
-        data.max_response_length=32768 \
-        data.max_prompt_length=32768 \
-        data.validation_max_prompt_length=32768 \
+        data.max_response_length=49152 \
+        data.max_prompt_length=49152 \
+        data.validation_max_prompt_length=49152 \
         actor_rollout_ref.rollout.agent.agent_loop_config_path="$AGENT_LOOP_CONFIG_PATH" \
         +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len=$(( 64 * 1024 )) \
         +actor_rollout_ref.rollout.agent.vsearcher_loop_cls=VSearcherLoopQwen3VL \
@@ -82,6 +82,8 @@ if [ "$MODEL_PATH" == "Qwen/Qwen3-VL-8B-Instruct" ]; then
         trainer.debug_skip_worker_init="${DEBUG_SKIP_WORKER_INIT:-False}" \
         data.val_batch_size=64 \
         data.validation_shuffle=False \
+        custom_reward_function.reward_kwargs.max_retries=15 \
+        custom_reward_function.reward_kwargs.retry_interval=90 \
         "$@"
 
 else

@@ -500,6 +500,12 @@ class InSightDocBase(VerlFormatDataset):
                 if not line:
                     continue
                 record = json.loads(line)
+                for key in ("question_id", "question", "answer", "document_id", "subset", "data_source"):
+                    value = record.get(key)
+                    if value is not None and not isinstance(value, str):
+                        record[key] = str(value)
+                if "images" in record and isinstance(record["images"], list):
+                    record["images"] = [str(item) for item in record["images"]]
                 question_type = record.get("question_type")
                 if isinstance(question_type, (list, dict)):
                     record["question_type"] = json.dumps(question_type, ensure_ascii=False)
@@ -532,7 +538,7 @@ class InSightDocBase(VerlFormatDataset):
         return {
             **super().get_extra_info(example),
             "question_id": str(example["question_id"]),
-            "document_id": example["document_id"],
+            "document_id": example.get("document_id"),
             "subset": example.get("subset"),
             "question_involved_visuals": example.get("question_involved_visuals"),
             "question_involved_visual_details": visual_details,
@@ -546,6 +552,42 @@ class InSightDoc0352(InSightDocBase):
 
 class InSightDocMixed(InSightDocBase):
     DATA_SOURCE = "insight_doc_mixed"
+
+
+class InSightEvalDude200(InSightDocBase):
+    DATA_SOURCE = "dude200"
+
+
+class InSightEvalLongDocURL200(InSightDocBase):
+    DATA_SOURCE = "longdocurl200"
+
+
+class InSightEvalMMLite200(InSightDocBase):
+    DATA_SOURCE = "mmlite200"
+
+    def __init__(self, data_root, **extra_options):
+        extra_options = {"manifest_file": "mme_manifest_sample200.jsonl", **extra_options}
+        super().__init__(data_root, **extra_options)
+
+
+class InSightEvalMMLongBench200(InSightDocBase):
+    DATA_SOURCE = "mmlongbench200"
+
+
+class InSightEvalMPDocVQA200(InSightDocBase):
+    DATA_SOURCE = "mpdocvqa200"
+
+
+class InSightEvalO3Bench(InSightDocBase):
+    DATA_SOURCE = "o3bench0502"
+
+    def __init__(self, data_root, **extra_options):
+        extra_options = {"manifest_file": "o3bench_manifest.json", **extra_options}
+        super().__init__(data_root, **extra_options)
+
+
+class InSightDocRL(InSightDocBase):
+    DATA_SOURCE = "insight_doc_rl"
 
 
 def get_image_obj(url_or_path: str | Path) -> Image.Image:

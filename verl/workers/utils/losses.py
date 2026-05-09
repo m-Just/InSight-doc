@@ -31,11 +31,14 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     batch_num_tokens = data["batch_num_tokens"]
 
     log_prob = model_output["log_probs"]
+    metrics = {}
 
     if pad_mode == DatasetPadMode.NO_PADDING:
         # log_prob and loss mask are nested tensors of shape [bsz, j1]
         # for each sample, loss mask shape is [1, prompt_length + response_length]
         loss_mask = data["loss_mask"]
+        first_4_loss_mask = data.get("first_4_loss_mask", None)
+        first_k_loss_mask = data.get("first_k_loss_mask", None)
 
         log_prob_flatten = log_prob.values()
         loss_mask_flatten = loss_mask.values()
@@ -47,11 +50,24 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
         # the loss should be scaled by `num_microbatches` for pp schedule.
         loss = -masked_sum(log_prob_flatten, loss_mask_flatten) / batch_num_tokens * dp_size
+
+        for metric_name, metric_loss_mask in (
+            ("first_4_token_loss", first_4_loss_mask),
+            ("first_k_token_loss", first_k_loss_mask),
+        ):
+            if metric_loss_mask is None:
+                continue
+            metric_loss_mask_flatten = metric_loss_mask.values()
+            metric_loss_mask_flatten = torch.roll(metric_loss_mask_flatten, shifts=-1, dims=0)
+            metric_token_count = metric_loss_mask_flatten.sum()
+            if metric_token_count.item() > 0:
+                metric_loss = -masked_sum(log_prob_flatten, metric_loss_mask_flatten) / metric_token_count
+                metrics[metric_name] = metric_loss.detach().item()
     else:
         response_mask = data["response_mask"].to(bool)
         loss = -masked_sum(log_prob, response_mask) / batch_num_tokens * dp_size
 
-    return loss, {}
+    return loss, metrics
 
 
 def _slice_response_from_unpad_output(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
