@@ -591,6 +591,7 @@ trainer:
   resume_from_path: null
   val_before_train: true
   val_only: false
+  val_only_hf_model_rollout: false
   debug_skip_worker_init: false
   test_freq: -1
   critic_warmup: 0

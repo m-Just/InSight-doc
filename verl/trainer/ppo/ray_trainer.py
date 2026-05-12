@@ -127,6 +127,22 @@ def _resolve_agent_loop_config_path(config_path: str) -> str:
     )
 
 
+def _parse_val_only_hf_model_rollout_setting(setting: Any) -> tuple[bool, bool]:
+    """Return (requested, force_enabled) for trainer.val_only_hf_model_rollout."""
+    if isinstance(setting, str):
+        normalized = setting.strip().lower()
+        if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False, False
+        if normalized == "auto":
+            return True, False
+        if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True, True
+        raise ValueError(f"trainer.val_only_hf_model_rollout must be one of auto/true/false, got {setting!r}")
+
+    force_enabled = bool(setting)
+    return force_enabled, force_enabled
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -450,6 +466,7 @@ class RayPPOTrainer:
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
+        self.val_only_hf_model_rollout = False
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -577,6 +594,72 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _get_global_step_folder_for_resume(self) -> Optional[str]:
+        """Return the checkpoint folder that _load_checkpoint would use, if any."""
+        if self.config.trainer.resume_mode == "disable":
+            return None
+
+        if self.config.trainer.default_hdfs_dir is not None:
+            # _load_checkpoint will raise for HDFS today. Keep this truthy so the
+            # HF-only val path is not selected when resume behavior is ambiguous.
+            return self.config.trainer.default_hdfs_dir
+
+        checkpoint_folder = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+
+        if resume_from_step := self.config.trainer.get("resume_from_step", None):
+            return os.path.join(checkpoint_folder, f"global_step_{resume_from_step}")
+
+        global_step_folder = find_latest_ckpt_path(checkpoint_folder)
+        if self.config.trainer.resume_mode == "auto":
+            return global_step_folder
+
+        if self.config.trainer.resume_mode == "resume_path":
+            global_step_folder = self.config.trainer.resume_from_path
+            if not os.path.isabs(global_step_folder):
+                global_step_folder = os.path.join(os.getcwd(), global_step_folder)
+            return global_step_folder
+
+        return global_step_folder
+
+    def _should_use_val_only_hf_model_rollout(self) -> bool:
+        """Use standalone HF vLLM rollout for eval-only runs when it is safe."""
+        requested, force_enabled = _parse_val_only_hf_model_rollout_setting(
+            self.config.trainer.get("val_only_hf_model_rollout", False)
+        )
+        if not requested:
+            return False
+
+        def reject(reason: str) -> bool:
+            if force_enabled:
+                raise ValueError(f"trainer.val_only_hf_model_rollout=True is incompatible: {reason}")
+            if self.config.trainer.get("val_only", False):
+                print(f"val_only_hf_model_rollout: not selected: {reason}")
+            return False
+
+        if not self.config.trainer.get("val_only", False):
+            return reject("trainer.val_only is not enabled")
+        if not self.config.trainer.get("val_before_train", True):
+            return reject("trainer.val_before_train is disabled")
+        if self.config.actor_rollout_ref.rollout.name != "vllm":
+            return reject("only vLLM rollout is supported")
+        if self.config.actor_rollout_ref.rollout.get("mode", "async") != "async":
+            return reject("only async rollout is supported")
+        if self._get_global_step_folder_for_resume() is not None:
+            return reject("a trainer resume checkpoint is configured or available")
+        if self.config.reward_model.get("enable", False) or self.use_rm:
+            return reject("reward-model workers are enabled")
+
+        lora_cfg = self.config.actor_rollout_ref.model.get("lora", {}) or {}
+        lora_rank = lora_cfg.get("rank", 0)
+        if lora_rank <= 0:
+            lora_rank = self.config.actor_rollout_ref.model.get("lora_rank", 0)
+        if lora_rank > 0 or self.config.actor_rollout_ref.model.get("lora_adapter_path") is not None:
+            return reject("LoRA model configs are not supported by this HF-only val path")
+
+        return True
 
     def _create_val_dataset_for_trial(self, val_trial_idx: int):
         from verl.trainer.main_ppo import create_rl_dataset
@@ -1526,13 +1609,16 @@ class RayPPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
-        self.resource_pool_manager.create_resource_pool()
+        val_only_hf_model_rollout = self._should_use_val_only_hf_model_rollout()
+        self.val_only_hf_model_rollout = val_only_hf_model_rollout
+        if not val_only_hf_model_rollout:
+            self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
-        if self.hybrid_engine:
+        if self.hybrid_engine and not val_only_hf_model_rollout:
             resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[actor_role],
@@ -1540,11 +1626,16 @@ class RayPPOTrainer:
                 role=str(actor_role),
             )
             self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
+        elif val_only_hf_model_rollout:
+            print(
+                "val_only_hf_model_rollout: skipping ActorRolloutRef/FSDP workers and "
+                "using standalone HF vLLM rollout servers"
+            )
         else:
             raise NotImplementedError
 
         # create critic
-        if self.use_critic:
+        if self.use_critic and not val_only_hf_model_rollout:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
 
             from verl.workers.config import CriticConfig
@@ -1575,7 +1666,7 @@ class RayPPOTrainer:
             self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
 
         # create reference policy if needed
-        if self.use_reference_policy and Role.RefPolicy in self.role_worker_mapping:
+        if self.use_reference_policy and Role.RefPolicy in self.role_worker_mapping and not val_only_hf_model_rollout:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.RefPolicy],
@@ -1639,6 +1730,8 @@ class RayPPOTrainer:
         wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            if not class_dict:
+                continue
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
@@ -1648,7 +1741,7 @@ class RayPPOTrainer:
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
 
-        if self.use_critic:
+        if self.use_critic and not val_only_hf_model_rollout:
             self.critic_wg = all_wg[str(Role.Critic)]
             if self.use_legacy_worker_impl == "disable":
                 self.critic_wg.reset()
@@ -1662,7 +1755,7 @@ class RayPPOTrainer:
             else:
                 self.critic_wg.init_model()
 
-        if self.use_reference_policy and not self.ref_in_actor:
+        if self.use_reference_policy and not self.ref_in_actor and not val_only_hf_model_rollout:
             if str(Role.RefPolicy) in all_wg:
                 self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
                 self.ref_policy_wg.init_model()
@@ -1678,10 +1771,15 @@ class RayPPOTrainer:
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg[str(actor_role)]
-        self.actor_rollout_wg.init_model()
+        if val_only_hf_model_rollout:
+            self.actor_rollout_wg = None
+            self.critic_wg = None
+            self.ref_policy_wg = None
+        else:
+            self.actor_rollout_wg = all_wg[str(actor_role)]
+            self.actor_rollout_wg.init_model()
 
-        if self.ref_in_actor:
+        if self.ref_in_actor and not val_only_hf_model_rollout:
             self.ref_policy_wg = self.actor_rollout_wg
 
         # create async rollout manager and request scheduler
@@ -1702,8 +1800,9 @@ class RayPPOTrainer:
 
         self.async_rollout_manager = AgentLoopManager(
             config=self.config,
-            worker_group=self.actor_rollout_wg,
+            worker_group=None if val_only_hf_model_rollout else self.actor_rollout_wg,
             rm_resource_pool=rm_resource_pool,
+            direct_standalone_rollout=val_only_hf_model_rollout,
         )
 
     def _save_checkpoint(self):

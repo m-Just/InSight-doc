@@ -178,6 +178,19 @@ class RolloutReplica(ABC):
         self.workers = worker_group.workers
         await self.launch_servers()
 
+    async def init_direct_standalone(self):
+        """Init standalone rollout server without external rollout worker actors.
+
+        This path is intended for HF-model eval-only serving, where vLLM can load
+        the checkpoint directly and should not allocate FSDP or external executor
+        worker processes.
+        """
+        if self.nnodes != 1:
+            raise NotImplementedError("direct standalone rollout currently supports single-node replicas only")
+        self.rollout_mode = RolloutMode.STANDALONE
+        self.workers = []
+        await self.launch_servers()
+
     @abstractmethod
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         """Get rollout worker actor class for colocated and standalone mode."""

@@ -180,6 +180,10 @@ trainer:
   # Whether to run validation only
   val_only: False
 
+  # Eval-only fast path: launch vLLM directly from HF weights and skip FSDP workers.
+  # Set to "auto" to enable only when compatible, or True/False to force/disable.
+  val_only_hf_model_rollout: False
+
   # Debug-only path: stop after dataset construction and skip worker/model initialization.
   debug_skip_worker_init: False
 

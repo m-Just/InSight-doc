@@ -58,49 +58,37 @@ else
 fi
 export VSEARCH_PROFILE_DIR="${VSEARCH_PROFILE_DIR:-$CONVERSATION_EXPORT_DIR/_profile}"
 
-if [ "$MODEL_PATH" == "Qwen/Qwen3-VL-8B-Instruct" ]; then
-        # actor_rollout_ref.rollout.agent.agent_loop_config_path="recipe/vsearch/config/agent_gemini-3-flash-preview_vr2.yaml" \
-    run_experiment \
-        +data.batch_sampler.weights.insight_doc_region_localization=1.0 \
-        data.max_response_length=49152 \
-        data.max_prompt_length=49152 \
-        data.validation_max_prompt_length=49152 \
-        actor_rollout_ref.rollout.agent.agent_loop_config_path="$AGENT_LOOP_CONFIG_PATH" \
-        +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len=$(( 64 * 1024 )) \
-        +actor_rollout_ref.rollout.agent.vsearcher_loop_cls=VSearcherLoopQwen3VL \
-        +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_dir="$CONVERSATION_EXPORT_DIR" \
-        +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_resume_mode=skip_completed \
-        +actor_rollout_ref.rollout.agent.vreasoner_v2_profile_dir="$VSEARCH_PROFILE_DIR" \
-        actor_rollout_ref.model.custom_chat_template=null \
-        actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
-        actor_rollout_ref.rollout.val_kwargs.top_p=0.8 \
-        actor_rollout_ref.rollout.val_kwargs.top_k=20 \
-        actor_rollout_ref.rollout.val_kwargs.presence_penalty=1.5 \
-        custom_reward_function.reward_kwargs.reward_type=basic_weighted_addition \
-        custom_reward_function.reward_kwargs.reward_weights.tool=0.0 \
-        custom_reward_function.reward_kwargs.format_reward.simple=True \
-        trainer.debug_skip_worker_init="${DEBUG_SKIP_WORKER_INIT:-False}" \
-        data.val_batch_size=64 \
-        data.validation_shuffle=False \
-        custom_reward_function.reward_kwargs.max_retries=15 \
-        custom_reward_function.reward_kwargs.retry_interval=90 \
-        "$@"
 
-else
-
-    # run_experiment \
-    #     actor_rollout_ref.rollout.agent.agent_loop_config_path="recipe/vsearch/config/agent_gpt-5-high_vr2.yaml" \
-    #     "$@"
-
-    # run_experiment \
-    #     actor_rollout_ref.rollout.agent.agent_loop_config_path="recipe/vsearch/config/agent_gemini-3-flash-preview_vr2.yaml" \
-    #     "$@"
-
-    run_experiment \
-        actor_rollout_ref.rollout.agent.agent_loop_config_path="recipe/vsearch/config/agent_gpt-5-mini_vr2.yaml" \
-        "$@"
-
-fi
+run_experiment \
+    trainer.n_gpus_per_node="${N_GPUS_PER_NODE:-8}" \
+    trainer.resume_mode="${RESUME_MODE:-auto}" \
+    actor_rollout_ref.rollout.load_format="${LOAD_FORMAT:-dummy}" \
+    trainer.val_only_hf_model_rollout="${VAL_ONLY_HF_MODEL_ROLLOUT:-false}" \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    +data.batch_sampler.weights.insight_doc_region_localization=1.0 \
+    data.max_response_length=49152 \
+    data.max_prompt_length=49152 \
+    actor_rollout_ref.rollout.max_model_len=$(( 64 * 1024 )) \
+    actor_rollout_ref.rollout.agent.agent_loop_config_path="$AGENT_LOOP_CONFIG_PATH" \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len=$(( 64 * 1024 )) \
+    +actor_rollout_ref.rollout.agent.vsearcher_loop_cls=VSearcherLoopQwen3VL \
+    +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_dir="$CONVERSATION_EXPORT_DIR" \
+    +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_resume_mode=skip_completed \
+    +actor_rollout_ref.rollout.agent.vreasoner_v2_profile_dir="$VSEARCH_PROFILE_DIR" \
+    actor_rollout_ref.model.custom_chat_template=null \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.8 \
+    actor_rollout_ref.rollout.val_kwargs.top_k=20 \
+    actor_rollout_ref.rollout.val_kwargs.presence_penalty=1.5 \
+    custom_reward_function.reward_kwargs.reward_type=basic_weighted_addition \
+    custom_reward_function.reward_kwargs.reward_weights.tool=0.0 \
+    custom_reward_function.reward_kwargs.format_reward.simple=True \
+    trainer.debug_skip_worker_init="${DEBUG_SKIP_WORKER_INIT:-False}" \
+    data.val_batch_size=64 \
+    data.validation_shuffle=False \
+    custom_reward_function.reward_kwargs.max_retries=15 \
+    custom_reward_function.reward_kwargs.retry_interval=90 \
+    "$@"
 
 echo "CONVERSATION_EXPORT_DIR: $CONVERSATION_EXPORT_DIR"
 echo "VSEARCH_PROFILE_DIR: $VSEARCH_PROFILE_DIR"

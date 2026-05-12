@@ -997,7 +997,11 @@ class AgentLoopManager:
     """Agent loop manager that manages a group of agent loop workers."""
 
     def __init__(
-        self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_resource_pool: RayResourcePool = None
+        self,
+        config: DictConfig,
+        worker_group: RayWorkerGroup = None,
+        rm_resource_pool: RayResourcePool = None,
+        direct_standalone_rollout: bool = False,
     ):
         """Initialize agent loop manager.
 
@@ -1005,9 +1009,11 @@ class AgentLoopManager:
             config (DictConfig): trainer config.
             worker_group (RayWorkerGroup): ActorRolloutRef worker group for hybrid mode; None for standalone mode.
             rm_resource_pool (RayResourcePool): Resource pool for reward model (Standalone mode).
+            direct_standalone_rollout (bool): Launch rollout server actors directly without external worker actors.
         """
         self.config = config
         self.worker_group = worker_group
+        self.direct_standalone_rollout = direct_standalone_rollout
         self.reward_model_manager = None
         self.reward_router_address = None
         if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
@@ -1064,6 +1070,8 @@ class AgentLoopManager:
         ]
         if self.worker_group:
             self._run_all([server.init_hybrid(self.worker_group) for server in self.rollout_replicas])
+        elif self.direct_standalone_rollout:
+            self._run_all([server.init_direct_standalone() for server in self.rollout_replicas])
         else:
             self._run_all([server.init_standalone() for server in self.rollout_replicas])
         self.server_handles = [server._server_handle for server in self.rollout_replicas]

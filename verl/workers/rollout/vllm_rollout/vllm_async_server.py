@@ -46,6 +46,7 @@ from vllm.v1.executor.abstract import Executor
 
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.device import get_visible_devices_keyword
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
@@ -86,6 +87,7 @@ if _VLLM_VERSION >= version.parse("0.12.0"):
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+VISIBLE_DEVICES_KEYWORD = get_visible_devices_keyword()
 
 
 class ExternalZeroMQDistributedExecutor(Executor):
@@ -204,6 +206,8 @@ class vLLMHttpServer:
         """
         super().__init__()
 
+        self._pin_visible_devices_for_direct_standalone(rollout_mode, workers)
+
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
         self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
@@ -235,6 +239,22 @@ class vLLMHttpServer:
         else:
             self._master_address = None
             self._master_port = None
+
+    @staticmethod
+    def _pin_visible_devices_for_direct_standalone(rollout_mode: RolloutMode, workers: list[ActorHandle]) -> None:
+        if rollout_mode != RolloutMode.STANDALONE or workers:
+            return
+
+        accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
+        assigned_gpu_ids = accelerator_ids.get("GPU", [])
+        if not assigned_gpu_ids:
+            return
+
+        # Direct standalone vLLM owns GPUs in the server actor itself. Pin visibility
+        # explicitly so Ray NOSET mode cannot make every actor see every GPU.
+        visible_devices = ",".join(map(str, assigned_gpu_ids))
+        os.environ[VISIBLE_DEVICES_KEYWORD] = visible_devices
+        logger.info("Direct standalone vLLM server pinned %s=%s", VISIBLE_DEVICES_KEYWORD, visible_devices)
 
     def get_master_address(self):
         """Get master address and port for data parallel."""
@@ -701,8 +721,58 @@ class vLLMReplica(RolloutReplica):
         )
         return worker_dict_cls
 
+    def _validate_direct_standalone_launch(self):
+        if self.rollout_mode != RolloutMode.STANDALONE:
+            raise ValueError("direct vLLM server launch requires standalone rollout mode")
+        if self.nnodes != 1:
+            raise NotImplementedError("direct vLLM server launch currently supports single-node replicas only")
+        if self.config.data_parallel_size != 1 or self.config.pipeline_model_parallel_size != 1:
+            raise NotImplementedError(
+                "direct vLLM server launch currently supports data_parallel_size=1 and "
+                "pipeline_model_parallel_size=1 only"
+            )
+
+    async def _launch_direct_standalone_server(self):
+        self._validate_direct_standalone_launch()
+        name_prefix = "vllm_direct_server_reward" if self.is_reward_model else "vllm_direct_server"
+        name = f"{name_prefix}_{self.replica_rank}_0_{uuid4().hex[:8]}"
+        logger.info(
+            "Launching direct standalone vLLM server: replica_rank=%s, num_gpus=%s, "
+            "tensor_parallel_size=%s, data_parallel_size=%s",
+            self.replica_rank,
+            self.world_size,
+            self.config.tensor_model_parallel_size,
+            self.config.data_parallel_size,
+        )
+        server = self.server_class.options(num_gpus=self.world_size, name=name).remote(
+            config=self.config,
+            model_config=self.model_config,
+            rollout_mode=self.rollout_mode,
+            workers=[],
+            replica_rank=self.replica_rank,
+            node_rank=0,
+            gpus_per_node=self.world_size,
+            nnodes=1,
+        )
+        self.servers.append(server)
+
+        master_address, master_port = await self.servers[0].get_master_address.remote()
+        await self.servers[0].launch_server.remote(master_address=master_address, master_port=master_port)
+
+        server_address, server_port = await self.servers[0].get_server_address.remote()
+        self._server_handle = self.servers[0]
+        self._server_address = (
+            f"[{server_address}]:{server_port}"
+            if is_valid_ipv6_address(server_address)
+            else f"{server_address}:{server_port}"
+        )
+
     async def launch_servers(self):
         """Launch http server in each node."""
+        if len(self.workers) == 0:
+            await self._launch_direct_standalone_server()
+            return
+
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
