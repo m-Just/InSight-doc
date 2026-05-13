@@ -423,14 +423,25 @@ class MultiTurnSFTDataset(Dataset):
             res["truncate_flag"] = bool(truncated)
             return res
         elif self.pad_mode == DatasetPadMode.NO_PADDING:
-            # truncate input_ids if it is longer than max_length
             if len(input_ids) > self.max_length:
-                truncated = True
-                input_ids = input_ids[: self.max_length]
-                loss_mask = loss_mask[: self.max_length]
-                first_4_loss_mask = first_4_loss_mask[: self.max_length]
-                first_k_loss_mask = first_k_loss_mask[: self.max_length]
-                position_ids = position_ids[..., : self.max_length]
+                if self.truncation == "left":
+                    truncated = True
+                    input_ids = input_ids[-self.max_length :]
+                    loss_mask = loss_mask[-self.max_length :]
+                    first_4_loss_mask = first_4_loss_mask[-self.max_length :]
+                    first_k_loss_mask = first_k_loss_mask[-self.max_length :]
+                    position_ids = position_ids[..., -self.max_length :]
+                elif self.truncation == "right":
+                    truncated = True
+                    input_ids = input_ids[: self.max_length]
+                    loss_mask = loss_mask[: self.max_length]
+                    first_4_loss_mask = first_4_loss_mask[: self.max_length]
+                    first_k_loss_mask = first_k_loss_mask[: self.max_length]
+                    position_ids = position_ids[..., : self.max_length]
+                elif self.truncation == "error":
+                    raise ValueError(f"{sequence_length=} is larger than {self.max_length=}")
+                else:
+                    raise ValueError(f"Unknown truncation method {self.truncation}")
 
             # return nested tensor with out padding
             res = {

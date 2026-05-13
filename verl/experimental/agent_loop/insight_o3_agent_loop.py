@@ -58,6 +58,17 @@ QWEN3_VL_COORD_RANGE = (1000, 1000)
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+UNANSWERABLE_ANSWER_VERIFICATION_HINT = (
+    "Verification check: make sure your answer addresses the exact target in the question.\n"
+    "If you answered a nearby related entity, field, unit, rank, year, or method instead of the exact target, "
+    "correct yourself.\n"
+    "If the document does not support the exact target as asked, say so directly in one sentence.\n"
+    "Do not provide the answer for a similar substitute target.\n"
+    "Return only a revised final answer in <answer>...</answer>."
+)
+ANSWER_VERIFICATION_HINT_EXPORT_TYPE = "answer_verification_hint"
+ANSWER_REVISION_EXPORT_TYPE = "answer_revision"
+
 
 @dataclass
 class ExtraFields:
@@ -664,6 +675,8 @@ class VReasonerLoop(AgentLoopBase):
         gpt_image_max_area: int = 1280 * 1280,     # max area for GPT image in vReasoner
         max_completion_tokens: int | None = 2048,  # max completion tokens (per turn) for vReasoner
         reasoning_effort: str | None = None,       # reasoning effort for vReasoner
+        prompt_variant: str = "default",           # system prompt variant for vReasoner
+        enable_unanswerable_answer_verification: bool = False,
         enable_tool_feedback: bool = True,         # enable tool feedback for vReasoner
         multi_image_input: bool = False,           # support multiple input images per query
         **kwargs,                                  # extra kwargs for vReasoner
@@ -676,6 +689,8 @@ class VReasonerLoop(AgentLoopBase):
         self.gpt_image_max_area = gpt_image_max_area
         self.max_completion_tokens = max_completion_tokens
         self.reasoning_effort = reasoning_effort
+        self.prompt_variant = prompt_variant
+        self.enable_unanswerable_answer_verification = enable_unanswerable_answer_verification
         self.enable_tool_feedback = enable_tool_feedback
         self.multi_image_input = multi_image_input
         vsearcher_loop_cls_name = self.config.actor_rollout_ref.rollout.agent.get("vsearcher_loop_cls", "VSearcherLoop")
@@ -1034,6 +1049,14 @@ To finish, bring everything together in a clear, synthesized answer that fully r
 class VReasonerLoopV2(VReasonerLoop):
     DEFAULT_INITIAL_INPUT_PIXELS_LOWER_BOUND = 0
 
+    @staticmethod
+    def _is_not_answerable_question_type(question_type: Any) -> bool:
+        if question_type == "not-answerable":
+            return True
+        if isinstance(question_type, (list, tuple, set)):
+            return "not-answerable" in question_type
+        return False
+
     def __init__(
         self,
         trainer_config: DictConfigWrap,
@@ -1198,6 +1221,7 @@ class VReasonerLoopV2(VReasonerLoop):
                     reasoning_effort=self.reasoning_effort,
                     tool_result=tool_result,
                     enable_stop=self.enable_stop,
+                    prompt_variant=self.prompt_variant,
                 )
             t_api_end = time.perf_counter()
             api_round_event = {
@@ -1547,6 +1571,76 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                 }
             )
 
+        if (
+            not critical_failure
+            and request is not None
+            and request.answer
+            and self.enable_unanswerable_answer_verification
+            and self._is_not_answerable_question_type(kwargs["extra_info"].get("question_type"))
+        ):
+            verification_round_idx = len(api_rounds)
+            t_verify_start = time.perf_counter()
+            verification_request = await get_gpt_visual_search_request_v2(
+                initial_question=kwargs["extra_info"]["question"],
+                presented_images=[item.image for item in presented_images],
+                messages=messages_api,
+                model=self.model,
+                max_tool_calls=self.max_tool_calls,
+                max_round_retries=self.max_round_retries if not validate else self.max_round_retries_val,
+                gpt_image_max_area=self.gpt_image_max_area,
+                png_max_area=self.png_max_area,
+                max_completion_tokens=self.max_completion_tokens,
+                reasoning_effort=self.reasoning_effort,
+                enable_stop=self.enable_stop,
+                prompt_variant=self.prompt_variant,
+                followup_user_text=UNANSWERABLE_ANSWER_VERIFICATION_HINT,
+                force_answer_only=True,
+            )
+            t_verify_end = time.perf_counter()
+            verification_event = {
+                "event": "vreasoner_v2_answer_verification",
+                "job_id": job_id,
+                "root_job_id": root_job_id,
+                "conversation_export_id": conversation_export_id,
+                "validate": validate,
+                "round_idx": verification_round_idx,
+                "prior_tool_calls": n_tool_calls,
+                "presented_image_count": len(presented_images),
+                "success": verification_request.success,
+                "is_last_round": verification_request.is_last_round,
+                "requested_region_description": verification_request.region_description,
+                "requested_img_idx": verification_request.img_idx,
+                "has_answer": verification_request.answer is not None,
+                "failure_reasons": list(verification_request.failure_reasons or []),
+                "timing_s": {"answer_verification": t_verify_end - t_verify_start},
+            }
+            api_rounds.append(verification_event)
+            write_profile_event("vreasoner_v2_api", verification_event, config=self.config)
+            if verification_request.failure_reasons:
+                failure_events.append(
+                    {
+                        "kind": "answer_verification",
+                        "request_success": verification_request.success,
+                        "failure_reasons": list(verification_request.failure_reasons),
+                    }
+                )
+            if verification_request.success and verification_request.answer:
+                messages_api = verification_request.messages
+                if len(messages_api) >= 2:
+                    verification_user_message = messages_api[-2]
+                    verification_assistant_message = messages_api[-1]
+                    if (
+                        isinstance(verification_user_message, dict)
+                        and verification_user_message.get("role") == "user"
+                    ):
+                        verification_user_message["export_type"] = ANSWER_VERIFICATION_HINT_EXPORT_TYPE
+                    if (
+                        isinstance(verification_assistant_message, dict)
+                        and verification_assistant_message.get("role") == "assistant"
+                    ):
+                        verification_assistant_message["export_type"] = ANSWER_REVISION_EXPORT_TYPE
+                request = verification_request
+
         logger.info(f"vreasoner_v2 loop completed: {profile=}")
 
         t_post_start = time.perf_counter()
@@ -1791,13 +1885,13 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                 },
                 "api_rounds": [
                     {
-                        "round_idx": e["round_idx"],
-                        "success": e["success"],
-                        "is_last_round": e["is_last_round"],
-                        "has_answer": e["has_answer"],
-                        "requested_img_idx": e["requested_img_idx"],
-                        "failure_reasons": e["failure_reasons"],
-                        "timing_s": e["timing_s"],
+                        "round_idx": e.get("round_idx"),
+                        "success": e.get("success"),
+                        "is_last_round": e.get("is_last_round", False),
+                        "has_answer": e.get("has_answer", False),
+                        "requested_img_idx": e.get("requested_img_idx"),
+                        "failure_reasons": e.get("failure_reasons"),
+                        "timing_s": e.get("timing_s"),
                     }
                     for e in api_rounds
                 ],

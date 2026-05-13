@@ -142,6 +142,9 @@ async def get_gpt_visual_search_request_v2(
     reasoning_effort: str = None,
     tool_result: ToolResult | None = None,
     enable_stop: bool = False,
+    prompt_variant: str | None = None,
+    followup_user_text: str | None = None,
+    force_answer_only: bool = False,
 ) -> GPTVisualSearchRequest:
     out_messages: list = [] if messages is None else list(messages)
     prior_tool_calls = 0
@@ -167,12 +170,14 @@ async def get_gpt_visual_search_request_v2(
             f"\n\n{initial_question}",
             image_detail,
         )
-        current_messages = [{"role": "system", "content": prompts.VSEARCH_SYS_PROMPT}]
+        current_messages = [{"role": "system", "content": prompts.get_vsearch_sys_prompt(prompt_variant)}]
     else:
         current_messages = out_messages
-        if tool_result is None:
+        if followup_user_text is not None:
+            pending_question = [{"type": "text", "text": followup_user_text}]
+        elif tool_result is None:
             raise RuntimeError("tool_result is required after the initial round")
-        if tool_result.status == "error":
+        elif tool_result.status == "error":
             hint = prompts.build_tool_result_fail_hint(tool_result.requested_img_idx)
             tool_error = tool_result.error_message or "The previous zoom request did not produce a usable result."
             pending_question = [{"type": "text", "text": f"{tool_error}\n\n{hint}"}]
@@ -192,7 +197,7 @@ async def get_gpt_visual_search_request_v2(
                 image_detail,
             )
 
-    if is_last_round:
+    if is_last_round and not force_answer_only:
         if isinstance(pending_question, list):
             pending_question = list(pending_question)
             pending_question.append({"type": "text", "text": "\n\n" + prompts.LAST_ROUND_HINT})
@@ -235,7 +240,13 @@ async def get_gpt_visual_search_request_v2(
         tool_call = _parse_tool_call(content)
         answer = _parse_answer(content)
 
-        if is_last_round:
+        if force_answer_only:
+            success = answer is not None and tool_call is None
+            if not success:
+                if tool_call is not None:
+                    failure_reasons.append("tool_call_returned_during_answer_only_turn")
+                failure_reasons.append(f"no_answer_in_answer_only_turn({finish_reason})")
+        elif is_last_round:
             success = answer is not None and tool_call is None
             if not success:
                 if tool_call is not None:

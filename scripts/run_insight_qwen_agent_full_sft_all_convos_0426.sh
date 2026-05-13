@@ -20,9 +20,16 @@ TRAIN_FILES=(
   "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/train_part2/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
   "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/train_part3/easy/processed_drop_degenerate/sft_data.parquet"
   "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/train_part3/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
+  "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/train_part4/easy/processed_drop_degenerate/sft_data.parquet"
+  "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/train_part4/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
+  "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/train_part5/easy/processed_drop_degenerate/sft_data.parquet"
+  "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/train_part5/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
   "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/spanning_train_part1/easy/processed_drop_degenerate/sft_data.parquet"
   "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/spanning_train_part1/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
 )
+
+# "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3b/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
+# "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3c/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
 
 USE_VSEARCHER_SYSTEM_FOR_EASY="${USE_VSEARCHER_SYSTEM_FOR_EASY:-0}"
 if [[ "${USE_VSEARCHER_SYSTEM_FOR_EASY}" == "1" || "${USE_VSEARCHER_SYSTEM_FOR_EASY}" == "true" || "${USE_VSEARCHER_SYSTEM_FOR_EASY}" == "yes" ]]; then

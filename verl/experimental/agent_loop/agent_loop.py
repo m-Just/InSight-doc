@@ -885,6 +885,21 @@ class AgentLoopWorker:
 
     def _postprocess(self, inputs: list[_InternalAgentLoopOutput], is_validate: bool) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        # Some early-exit / failure paths do not populate timing-related extra fields.
+        # Normalize them here so every worker shard materializes the same non_tensor_batch keys.
+        standardized_extra_field_defaults = {
+            "generate_sequences": None,
+            "tool_parsing": None,
+            "tool_calls": None,
+            "core_inference_time": None,
+            "conversation_wall_time": None,
+            "response_truncated": None,
+            "n_tool_calls": None,
+        }
+        for input_item in inputs:
+            for key, default_value in standardized_extra_field_defaults.items():
+                input_item.extra_fields.setdefault(key, default_value)
+
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)

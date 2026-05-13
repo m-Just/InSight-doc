@@ -957,7 +957,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         initial_prompt_fit_start = time.perf_counter()
-        images, videos, initial_prompt_fit_metadata = await self._fit_initial_prompt_to_max_model_len(
+        images, videos, initial_prompt_fit_metadata = await self._fit_initial_prompt_to_prompt_length(
             aligned_prompt,
             presented_images,
             images,
@@ -997,7 +997,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             initial_prompt_fit_metadata.get("prompt_shrink_count", 0) > 0
         )
         agent_data.extra_fields["initial_prompt_fit_succeeded"] = bool(
-            initial_prompt_fit_metadata.get("fits_max_model_len", True)
+            initial_prompt_fit_metadata.get("fits_prompt_length", True)
         )
         agent_data.extra_fields["initial_prompt_shrink_warning"] = initial_prompt_fit_metadata.get("prompt_shrink_warning")
         agent_data.extra_fields["initial_prompt_fit_time"] = initial_prompt_fit_time
@@ -1044,7 +1044,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             failure_reason = (
                 "initial_prompt_overflow_after_shrink: "
                 f"{agent_data.extra_fields['initial_prompt_tokens']} > "
-                f"{initial_prompt_fit_metadata.get('max_model_len')}"
+                f"{initial_prompt_fit_metadata.get('prompt_length_limit')}"
             )
             agent_data.extra_fields["failure_reasons"] = [failure_reason]
             agent_data.extra_fields.setdefault("export_failure_events", []).append(
@@ -1054,7 +1054,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                     "error_message": failure_reason,
                     "shrink_count": agent_data.extra_fields.get("initial_prompt_shrink_count", 0),
                     "prompt_tokens": agent_data.extra_fields.get("initial_prompt_tokens"),
-                    "max_model_len": initial_prompt_fit_metadata.get("max_model_len"),
+                    "prompt_length_limit": initial_prompt_fit_metadata.get("prompt_length_limit"),
                 }
             )
 
@@ -1262,21 +1262,21 @@ class InSightQwenAgentLoop(QwenAgentLoop):
 
         return messages, original_images, presented_images, actual_initial_rescale, initial_rescale_metadata
 
-    async def _fit_initial_prompt_to_max_model_len(
+    async def _fit_initial_prompt_to_prompt_length(
         self,
         messages: list[dict[str, Any]],
         presented_images: list[PresentedImageState],
         images: list[Any] | None,
         videos: list[Any] | None,
     ) -> tuple[list[Any] | None, list[Any] | None, dict[str, Any]]:
-        max_model_len = self.config.actor_rollout_ref.rollout.max_model_len
-        if max_model_len is None:
+        prompt_length_limit = self.config.actor_rollout_ref.rollout.prompt_length
+        if prompt_length_limit is None:
             return images, videos, {
                 "prompt_shrink_count": 0,
                 "prompt_tokens_before_shrink": None,
                 "prompt_tokens_after_shrink": None,
-                "fits_max_model_len": True,
-                "max_model_len": None,
+                "fits_prompt_length": True,
+                "prompt_length_limit": None,
                 "prompt_shrink_warning": None,
                 "prompt_shrink_area_factor": INITIAL_PROMPT_SHRINK_AREA_FACTOR,
                 "prompt_max_shrink_steps": INITIAL_PROMPT_MAX_SHRINK_STEPS,
@@ -1293,7 +1293,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         shrink_count = 0
 
         while (
-            prompt_tokens_after > max_model_len
+            prompt_tokens_after > prompt_length_limit
             and shrink_count < INITIAL_PROMPT_MAX_SHRINK_STEPS
             and presented_images
         ):
@@ -1310,20 +1310,20 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             )
             prompt_tokens_after = len(prompt_ids)
 
-        fits_max_model_len = prompt_tokens_after <= max_model_len
+        fits_prompt_length = prompt_tokens_after <= prompt_length_limit
         warning = None
         if shrink_count > 0:
             warning = (
-                "initial prompt exceeded max_model_len; shrank presented image area by 50% "
+                "initial prompt exceeded prompt_length; shrank presented image area by 50% "
                 f"{shrink_count} time(s) (max {INITIAL_PROMPT_MAX_SHRINK_STEPS}) "
-                f"from {prompt_tokens_before} to {prompt_tokens_after} tokens with max_model_len={max_model_len}"
+                f"from {prompt_tokens_before} to {prompt_tokens_after} tokens with prompt_length={prompt_length_limit}"
             )
             logger.warning(warning)
             print(f"[InSightQwenAgentLoop] WARNING: {warning}")
-        if not fits_max_model_len and prompt_tokens_after > max_model_len:
+        if not fits_prompt_length and prompt_tokens_after > prompt_length_limit:
             overflow_warning = (
-                f"initial prompt still exceeds max_model_len after {shrink_count} shrink step(s): "
-                f"{prompt_tokens_after} > {max_model_len}"
+                f"initial prompt still exceeds prompt_length after {shrink_count} shrink step(s): "
+                f"{prompt_tokens_after} > {prompt_length_limit}"
             )
             logger.warning(overflow_warning)
             print(f"[InSightQwenAgentLoop] WARNING: {overflow_warning}")
@@ -1336,8 +1336,8 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             "prompt_shrink_count": shrink_count,
             "prompt_tokens_before_shrink": prompt_tokens_before,
             "prompt_tokens_after_shrink": prompt_tokens_after,
-            "fits_max_model_len": fits_max_model_len,
-            "max_model_len": max_model_len,
+            "fits_prompt_length": fits_prompt_length,
+            "prompt_length_limit": prompt_length_limit,
             "prompt_shrink_warning": warning,
             "prompt_shrink_area_factor": INITIAL_PROMPT_SHRINK_AREA_FACTOR,
             "prompt_max_shrink_steps": INITIAL_PROMPT_MAX_SHRINK_STEPS,

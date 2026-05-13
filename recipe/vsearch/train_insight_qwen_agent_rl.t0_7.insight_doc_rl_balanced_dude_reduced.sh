@@ -64,7 +64,7 @@ run_experiment \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     algorithm.subagent_advantage_estimator=null \
     trainer.test_freq=25 \
-    trainer.total_training_steps=500 \
+    trainer.total_training_steps=1000 \
     custom_reward_function.reward_kwargs.max_retries=15 \
     custom_reward_function.reward_kwargs.retry_interval=90 \
     +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_dir="/scratch/ywxzml3j/likaican/mms1_rl/exported_conversations/multi_agent_vsearch/${EXP_NAME}/${EVAL_NAME}" \

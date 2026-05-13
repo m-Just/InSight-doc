@@ -195,6 +195,29 @@ def parse_assistant_message(text: str) -> dict[str, Any]:
     return out
 
 
+def parse_assistant_answer_revision_message(text: str) -> dict[str, Any]:
+    answer = _extract_tag_content(text, "answer")
+    tag_counts = {
+        "think": _extract_tag_counts(text, "think"),
+        "tool_call": _extract_tag_counts(text, "tool_call"),
+        "answer": _extract_tag_counts(text, "answer"),
+    }
+    if answer is None:
+        return {
+            "type": "others",
+            "content": {"text": text},
+            "tag_counts": tag_counts,
+        }
+    return {
+        "type": "answer_revision",
+        "content": {
+            "think": "",
+            "answer": answer,
+        },
+        "tag_counts": tag_counts,
+    }
+
+
 def parse_user_message(content: Any, *, initial_question: str) -> dict[str, Any]:
     if isinstance(content, str):
         stripped = content.strip()
@@ -215,9 +238,15 @@ def parse_user_message(content: Any, *, initial_question: str) -> dict[str, Any]
             }
         return {"type": "others", "content": {"text": content}}
 
+    if not isinstance(content, Sequence):
+        return {"type": "others", "content": {"text": content}}
+
     parts: list[dict[str, Any]] = []
     pending_label: tuple[int, str] | None = None
     for item in content:
+        if not isinstance(item, Mapping):
+            parts.append({"kind": "item", "item_type": type(item).__name__, "value": _json_safe(item)})
+            continue
         item_type = item.get("type")
         if item_type == "text":
             text = item.get("text", "")
@@ -297,6 +326,19 @@ def parse_user_message(content: Any, *, initial_question: str) -> dict[str, Any]
     return out
 
 
+def parse_answer_verification_hint_message(content: Any) -> dict[str, Any]:
+    if isinstance(content, str):
+        return {"type": "answer_verification_hint", "content": {"hint": content.strip()}}
+
+    parts: list[str] = []
+    if isinstance(content, Sequence):
+        for item in content:
+            if isinstance(item, Mapping) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+    hint = "".join(parts).strip()
+    return {"type": "answer_verification_hint", "content": {"hint": hint}}
+
+
 def build_input_image_refs(
     raw_prompt: list[dict[str, Any]],
     original_images: list[Image.Image],
@@ -352,6 +394,7 @@ def build_export_conversation(
     for idx, raw_message in enumerate(messages_api):
         message = raw_message.to_dict() if hasattr(raw_message, "to_dict") else raw_message
         role = message.get("role")
+        export_type = message.get("export_type")
         if role == "system":
             exported.append(
                 {
@@ -362,10 +405,16 @@ def build_export_conversation(
                 }
             )
         elif role == "assistant":
-            parsed = parse_assistant_message(message.get("content") or "")
+            if export_type == "answer_revision":
+                parsed = parse_assistant_answer_revision_message(message.get("content") or "")
+            else:
+                parsed = parse_assistant_message(message.get("content") or "")
             exported.append({"message_idx": idx, "role": "assistant", **parsed})
         elif role == "user":
-            parsed = parse_user_message(message.get("content"), initial_question=initial_question)
+            if export_type == "answer_verification_hint":
+                parsed = parse_answer_verification_hint_message(message.get("content"))
+            else:
+                parsed = parse_user_message(message.get("content"), initial_question=initial_question)
             exported.append({"message_idx": idx, "role": "user", **parsed})
         else:
             exported.append(
@@ -405,7 +454,7 @@ def build_export_record(
         if key != "image_ori"
     }
     return {
-        "schema_version": "vreasoner_v2_conversation_v1",
+        "schema_version": "vreasoner_v2_conversation_v2",
         "agent_name": "vreasoner_v2",
         "job": {
             "job_id": job_id,
@@ -584,7 +633,7 @@ def _assistant_message_to_text(message: dict[str, Any]) -> str:
         if not isinstance(payload, str):
             payload = json.dumps(payload, ensure_ascii=False)
         return f"<think>{content.get('think', '')}</think>\n<tool_call>{payload}</tool_call>"
-    if message.get("type") == "answer":
+    if message.get("type") in ("answer", "answer_revision"):
         return f"<think>{content.get('think', '')}</think>\n<answer>{content.get('answer', '')}</answer>"
     return content.get("text", "")
 
@@ -612,7 +661,7 @@ def _user_message_to_contents(message: dict[str, Any]) -> list[dict[str, Any]]:
         return [{"type": "text", "text": content.get("hint", "")}]
     if message.get("type") == "tool_result_fail_hint":
         return [{"type": "text", "text": f"{content.get('error_message', '')}\n\n{content.get('hint', '')}".strip()}]
-    if message.get("type") in ("format_repair_hint", "last_round_hint"):
+    if message.get("type") in ("format_repair_hint", "last_round_hint", "answer_verification_hint"):
         return [{"type": "text", "text": content.get("hint", "")}]
     return [{"type": "text", "text": content.get("text", "")}]
 

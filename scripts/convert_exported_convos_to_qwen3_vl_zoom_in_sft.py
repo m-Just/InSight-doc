@@ -140,6 +140,10 @@ class DropConversationError(RuntimeError):
     """Raised when a conversation cannot be converted conservatively."""
 
 
+ANSWER_VERIFICATION_HINT_TYPE = "answer_verification_hint"
+ANSWER_REVISION_TYPE = "answer_revision"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", required=True, help="Directory containing exported conversation JSON files.")
@@ -518,8 +522,120 @@ def materialize_image(image: Image.Image, image_storage_mode: str, image_cache_d
     raise ValueError(f"Unsupported image_storage_mode: {image_storage_mode}")
 
 
-def normalize_text(text: str) -> str:
-    return text if text is not None else ""
+def normalize_text(text: Any) -> str:
+    if text is None:
+        return ""
+    if isinstance(text, str):
+        return text
+    if isinstance(text, (list, dict)):
+        return json.dumps(text, ensure_ascii=False)
+    return str(text)
+
+
+def _text_after_last_label_parts(parts: list[dict[str, Any]]) -> str:
+    text_fragments: list[str] = []
+    for part in parts:
+        if part.get("kind") == "text":
+            text_fragments.append(str(part.get("text", "")))
+    return "".join(text_fragments).strip()
+
+
+def recover_legacy_user_message(message: dict[str, Any]) -> dict[str, Any]:
+    if message.get("role") != "user" or message.get("type") != "others":
+        return message
+    content = message.get("content", {})
+    if not isinstance(content, dict):
+        return message
+    raw_parts = content.get("text")
+    if not isinstance(raw_parts, list):
+        return message
+
+    parts: list[dict[str, Any]] = []
+    pending_label: tuple[int, str] | None = None
+    for item in raw_parts:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "text":
+            text = str(item.get("text", ""))
+            stripped = text.strip()
+            if stripped == prompts.IMAGE_SEPARATOR.strip():
+                parts.append({"kind": "separator", "text": prompts.IMAGE_SEPARATOR})
+                continue
+            if stripped.startswith("Image ") and stripped.endswith(":"):
+                idx_str = stripped[len("Image ") : -1]
+                if idx_str.isdigit():
+                    pending_label = (int(idx_str), stripped[:-1])
+                    continue
+            parts.append({"kind": "text", "text": text})
+        elif item_type == "image_url":
+            image_url = item.get("image_url", {})
+            detail = image_url.get("detail") if isinstance(image_url, dict) else None
+            if pending_label is None:
+                parts.append({"kind": "image_ref", "presented_img_idx": None, "label": None, "detail": detail})
+            else:
+                img_idx, label = pending_label
+                parts.append(
+                    {
+                        "kind": "image_ref",
+                        "presented_img_idx": img_idx,
+                        "label": label,
+                        "detail": detail,
+                    }
+                )
+                pending_label = None
+
+    image_indices = [part.get("presented_img_idx") for part in parts if part.get("kind") == "image_ref"]
+    image_indices = [idx for idx in image_indices if isinstance(idx, int)]
+    if not image_indices:
+        return message
+
+    main_text_parts = [
+        str(part.get("text", ""))
+        for part in parts
+        if part.get("kind") == "text" and str(part.get("text", "")).strip() != prompts.LAST_ROUND_HINT.strip()
+    ]
+    main_text = "".join(main_text_parts).strip()
+    secondary_types: list[str] = []
+    if any(
+        part.get("kind") == "text" and str(part.get("text", "")).strip() == prompts.LAST_ROUND_HINT.strip()
+        for part in parts
+    ):
+        secondary_types.append("last_round_hint")
+
+    recovered = {
+        "message_idx": message.get("message_idx"),
+        "role": "user",
+        "type": "tool_result",
+        "content": {
+            "hint": main_text,
+            "presented_img_indices": image_indices,
+        },
+        "parts": parts,
+    }
+    if secondary_types:
+        recovered["secondary_types"] = secondary_types
+    return recovered
+
+
+def is_answer_verification_hint(message: dict[str, Any]) -> bool:
+    return message.get("role") == "user" and message.get("type") == ANSWER_VERIFICATION_HINT_TYPE
+
+
+def get_revision_answer_content(message: dict[str, Any]) -> dict[str, Any] | None:
+    if message.get("role") != "assistant":
+        return None
+    message_type = message.get("type")
+    if message_type not in ("answer", ANSWER_REVISION_TYPE):
+        return None
+    content = message.get("content", {})
+    answer = normalize_text(content.get("answer", ""))
+    if not answer.strip():
+        return None
+    return {
+        "think": normalize_text(content.get("think", "")),
+        "answer": answer,
+    }
 
 
 def resolve_system_prompt(original_text: str, mode: str) -> str:
@@ -532,7 +648,7 @@ def resolve_system_prompt(original_text: str, mode: str) -> str:
 
 def build_assistant_content(content: dict[str, Any], message_type: str, assistant_format_mode: str) -> str:
     think = normalize_text(content.get("think", ""))
-    if message_type == "answer":
+    if message_type in ("answer", ANSWER_REVISION_TYPE):
         answer = normalize_text(content.get("answer", ""))
         if assistant_format_mode == "plain":
             if think and answer:
@@ -683,7 +799,7 @@ def convert_user_like_message(
         hint = normalize_text(content.get("hint", ""))
         text = f"{error_message}\n\n{hint}".strip()
         return {"role": "tool", "content": text}, []
-    if message_type in ("format_repair_hint", "last_round_hint"):
+    if message_type in ("format_repair_hint", "last_round_hint", ANSWER_VERIFICATION_HINT_TYPE):
         return {"role": "user", "content": normalize_text(content.get("hint", ""))}, []
     if message_type == "others":
         return {"role": "user", "content": normalize_text(content.get("text", ""))}, []
@@ -853,7 +969,7 @@ def convert_record(
 
     index = 0
     while index < len(conversation):
-        message = conversation[index]
+        message = recover_legacy_user_message(conversation[index])
         role = message.get("role")
         message_type = message.get("type")
         content = message.get("content", {})
@@ -870,10 +986,26 @@ def convert_record(
             continue
 
         if role == "assistant":
+            if (
+                message_type == "answer"
+                and index + 2 < len(conversation)
+                and is_answer_verification_hint(conversation[index + 1])
+            ):
+                revised_content = get_revision_answer_content(conversation[index + 2])
+                if revised_content is not None:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": build_assistant_content(revised_content, "answer", assistant_format_mode),
+                        }
+                    )
+                    message_loss_mask.append(True)
+                    index += 3
+                    continue
             if message_type == "tool_call":
                 if index + 1 >= len(conversation):
                     raise DropConversationError("assistant tool_call is missing a following tool result message")
-                next_message = conversation[index + 1]
+                next_message = recover_legacy_user_message(conversation[index + 1])
                 next_type = next_message.get("type")
                 if next_message.get("role") != "user":
                     raise DropConversationError("assistant tool_call is not followed by a user/tool message")
@@ -906,12 +1038,25 @@ def convert_record(
                 message_loss_mask.append(True)
                 index += 1
                 continue
+            if message_type == ANSWER_REVISION_TYPE:
+                answer_text = normalize_text(content.get("answer", ""))
+                if not answer_text.strip():
+                    raise DropConversationError("assistant answer_revision is empty")
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": build_assistant_content(content, message_type, assistant_format_mode),
+                    }
+                )
+                message_loss_mask.append(True)
+                index += 1
+                continue
             if (
                 message_type == "others"
                 and stitch_runtime_hints
                 and index + 1 < len(conversation)
-                and conversation[index + 1].get("role") == "user"
-                and conversation[index + 1].get("type") == "format_repair_hint"
+                and recover_legacy_user_message(conversation[index + 1]).get("role") == "user"
+                and recover_legacy_user_message(conversation[index + 1]).get("type") == "format_repair_hint"
             ):
                 index += 2
                 continue

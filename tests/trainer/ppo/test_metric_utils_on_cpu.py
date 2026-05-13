@@ -24,6 +24,7 @@ import torch
 from verl.trainer.ppo.metric_utils import (
     bootstrap_metric,
     calc_maj_val,
+    compute_agent_metrics,
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -290,6 +291,49 @@ class TestComputeDataMetrics(unittest.TestCase):
         self.assertIn("critic/score/mean", metrics)
         self.assertIn("critic/rewards/mean", metrics)
         self.assertIn("response_length/mean", metrics)
+
+
+class TestComputeAgentMetrics(unittest.TestCase):
+    """Tests for the compute_agent_metrics function."""
+
+    def test_compute_agent_metrics_skips_none_values(self):
+        batch = MagicMock()
+        batch.batch = {
+            "token_level_rewards": torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+        }
+        batch.non_tensor_batch = {
+            "agent_name": np.array(["vsearcher", "vsearcher_qwen3_vl", "insight_qwen_agent"], dtype=object),
+            "parent_job_id": np.array([None, "parent-1", None], dtype=object),
+            "iou_reward": np.array([None, 0.5, None], dtype=object),
+            "final_iou": np.array([None, None, None], dtype=object),
+            "tool_iou": np.array([None, 0.25, None], dtype=object),
+            "accuracy_reward": np.array([None, None, None], dtype=object),
+            "format_reward": np.array([1.0, None, 0.0], dtype=object),
+            "tool_reward": np.array([None, 2.0, None], dtype=object),
+            "n_valid_tool_calls": np.array([None, 3, None], dtype=object),
+        }
+
+        metrics = compute_agent_metrics(batch)
+
+        self.assertEqual(metrics["vsearcher/iou_reward/mean"], 0.5)
+        self.assertEqual(metrics["vsearcher/sub/iou_reward/mean"], 0.5)
+        self.assertEqual(metrics["vsearcher/tool_iou/mean"], 0.25)
+        self.assertEqual(metrics["vsearcher/main/format_reward/mean"], 1.0)
+        self.assertEqual(metrics["vreasoner/format_reward/mean"], 0.0)
+        self.assertNotIn("vsearcher/final_iou/mean", metrics)
+        self.assertNotIn("vreasoner/accuracy_reward/mean", metrics)
+
+    def test_compute_agent_metrics_ignores_unknown_agents(self):
+        batch = MagicMock()
+        batch.batch = {
+            "token_level_rewards": torch.tensor([[1.0, 2.0]]),
+        }
+        batch.non_tensor_batch = {
+            "agent_name": np.array(["single_turn_agent"], dtype=object),
+            "format_reward": np.array([1.0], dtype=object),
+        }
+
+        self.assertEqual(compute_agent_metrics(batch), {})
 
 
 class TestComputeTimingMetrics(unittest.TestCase):

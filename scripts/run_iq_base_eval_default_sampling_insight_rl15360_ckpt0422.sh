@@ -51,7 +51,7 @@ run_experiment \
   trainer.n_gpus_per_node=8 \
   actor_rollout_ref.rollout.agent.num_workers="${AGENT_NUM_WORKERS:-8}" \
   data.max_prompt_length=49152 \
-  data.validation_max_prompt_length=49152 \
+  actor_rollout_ref.rollout.max_model_len=65536 \
   actor_rollout_ref.model.custom_chat_template=null \
   actor_rollout_ref.rollout.n=1 \
   actor_rollout_ref.rollout.agent.default_agent_loop=insight_qwen_agent \
@@ -70,4 +70,3 @@ run_experiment \
   custom_reward_function.reward_kwargs.max_retries=15 \
   custom_reward_function.reward_kwargs.retry_interval=90 \
   data.validation_shuffle=False
-

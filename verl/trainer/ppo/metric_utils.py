@@ -230,6 +230,9 @@ def compute_agent_metrics(batch: DataProto) -> dict[str, Any]:
     data["rewards"] = batch.batch["token_level_rewards"].sum(-1).tolist()
     parent_job_ids = data.get("parent_job_id")
 
+    def is_valid_metric_value(value: Any) -> bool:
+        return value is not None
+
     def collect_metrics(metric_names: list[str], agent_name_displayed: str):
         for metric_name in metric_names:
             source_metric_name = metric_name
@@ -238,6 +241,8 @@ def compute_agent_metrics(batch: DataProto) -> dict[str, Any]:
             if source_metric_name not in data:
                 continue
             value = data[source_metric_name][sample_idx]
+            if not is_valid_metric_value(value):
+                continue
             agent2var2vals[agent_name_displayed][metric_name].append(value)
             if parent_job_ids is None or parent_job_ids[sample_idx] is None:
                 agent2var2vals[f"{agent_name_displayed}/main"][metric_name].append(value)
@@ -246,18 +251,20 @@ def compute_agent_metrics(batch: DataProto) -> dict[str, Any]:
 
     agent2var2vals = defaultdict(lambda: defaultdict(list))
     for sample_idx, agent_name in enumerate(batch.non_tensor_batch["agent_name"]):
+        agent_name_displayed = None
         if agent_name.startswith("vsearcher"):
             agent_name_displayed = "vsearcher"
             collect_metrics(["iou_reward", "final_iou", "tool_iou"], agent_name_displayed)
         elif agent_name.startswith("vreasoner") or agent_name == "insight_qwen_agent":
             agent_name_displayed = "vreasoner"
             collect_metrics(["accuracy_reward"], agent_name_displayed)
-        collect_metrics(["rewards", "format_reward", "tool_reward", "n_tool_calls"], agent_name_displayed)
+        if agent_name_displayed is not None:
+            collect_metrics(["rewards", "format_reward", "tool_reward", "n_tool_calls"], agent_name_displayed)
 
     metrics = {}
     for agent_name_displayed, var2vals in agent2var2vals.items():
         for var_name, var_vals in var2vals.items():
-            vals = np.array(var_vals)
+            vals = np.array(var_vals, dtype=np.float64)
             if len(vals) > 0:
                 metrics[f"{agent_name_displayed}/{var_name}/mean"] = vals.mean()
                 metrics[f"{agent_name_displayed}/{var_name}/std"] = vals.std()
