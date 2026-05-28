@@ -16,6 +16,7 @@ defaults:
 data:
   train_batch_size: 256 # global batch size
   micro_batch_size_per_gpu: 4  # this is also val batch size
+  dataloader_num_workers: 8
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: True
   train_files: ~/data/gsm8k/train.parquet
@@ -30,6 +31,7 @@ data:
   # for right padding
   max_length: 1024
   truncation: error
+  allow_overlength: False
   balance_dp_token: False # to be implement
   custom_cls:
     path: null
@@ -66,6 +68,10 @@ trainer:
   save_freq: -1
   test_freq: -1
   max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, set to null to keep all
+
+  # Debug-only: skip forward/backward for the first N train steps.
+  # This is for reproducing a later batch quickly, not for real training resume.
+  debug_skip_train_steps: 0
 
   # Directory for optional JSON snapshots of tokenized SFT training batches.
   batch_snapshot_dir: null

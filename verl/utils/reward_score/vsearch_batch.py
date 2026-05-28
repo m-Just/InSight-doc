@@ -80,6 +80,17 @@ class RewardComputer:
         assert self._semaphore is not None
         t0 = time.perf_counter()
         fn_name = getattr(compute_single_fn, "__name__", str(compute_single_fn))
+        judge_model = reward_kwargs.get("judge_model")
+        fallback_judge_model = reward_kwargs.get("fallback_judge_model")
+        use_fallback_judge = bool(fallback_judge_model) and trial_count == self.max_retries
+        active_reward_kwargs = {
+            **reward_kwargs,
+            "primary_judge_model": judge_model,
+            "judge_fallback_used": use_fallback_judge,
+        }
+        if use_fallback_judge:
+            active_reward_kwargs["judge_model"] = fallback_judge_model
+        active_judge_model = active_reward_kwargs.get("judge_model")
         try:
             async with self._semaphore:
                 result = await asyncio.wait_for(
@@ -88,7 +99,7 @@ class RewardComputer:
                         solution_str,
                         ground_truth,
                         extra_info,
-                        **reward_kwargs,
+                        **active_reward_kwargs,
                     ),
                     timeout=self.task_timeout,
                 )
@@ -106,6 +117,8 @@ class RewardComputer:
                     "parent_job_id": extra_info.get("parent_job_id"),
                     "compute_fn": fn_name,
                     "success": True,
+                    "judge_model": active_judge_model,
+                    "judge_fallback_used": use_fallback_judge,
                     "timing_s": {"task": duration},
                 },
             )
@@ -127,6 +140,8 @@ class RewardComputer:
                     "success": False,
                     "error_type": type(exc).__name__,
                     "error": str(exc),
+                    "judge_model": active_judge_model,
+                    "judge_fallback_used": use_fallback_judge,
                     "timing_s": {"task": duration},
                 },
             )
@@ -190,7 +205,16 @@ class RewardComputer:
 
                 trial_error_types[type(error).__name__] += 1
                 if isinstance(error, JudgeError):
-                    logger.warning(f"[RewardWorker] Task {idx} failed: {error}")
+                    active_judge_model = (
+                        reward_kwargs.get("fallback_judge_model")
+                        if trial_count == self.max_retries and reward_kwargs.get("fallback_judge_model")
+                        else reward_kwargs.get("judge_model")
+                    )
+                    logger.warning(
+                        f"[RewardWorker] Task {idx} failed: {error} "
+                        f"(judge_model={active_judge_model}, "
+                        f"fallback={trial_count == self.max_retries and bool(reward_kwargs.get('fallback_judge_model'))})"
+                    )
                 elif isinstance(error, asyncio.TimeoutError):
                     logger.warning(f"[RewardWorker] Task {idx} timed out after {self.task_timeout}s")
                 else:
@@ -267,6 +291,9 @@ class Score:
 
     n_valid_tool_calls: int = 0
     extracted_answer: Any = None
+    judge_model_used: str | None = None
+    judge_fallback_used: bool = False
+    primary_judge_model: str | None = None
 
     tool_iou: float = 0.0
     final_iou: float = 0.0
@@ -317,6 +344,12 @@ SCORE_CLASS_MAP = {
     "basic_weighted_addition": Score,
     "conditioned_on_tool_reward": ScoreConditionedOnToolReward,
 }
+
+
+def _record_judge_metadata(score: Score, reward_kwargs: dict) -> None:
+    score.judge_model_used = reward_kwargs.get("judge_model")
+    score.judge_fallback_used = bool(reward_kwargs.get("judge_fallback_used"))
+    score.primary_judge_model = reward_kwargs.get("primary_judge_model") or reward_kwargs.get("judge_model")
 
 
 def parse_response(
@@ -675,7 +708,8 @@ async def compute_accuracy_reward(
         response_text = judge_response.choices[0].message.content
     except Exception as e:
         raise JudgeError(
-            "judge query failed; normalized exact/substring fallback suppressed so batch retry can handle it"
+            f"judge query failed ({type(e).__name__}: {e!r}); "
+            "normalized exact/substring fallback suppressed so batch retry can handle it"
         ) from e
 
     return float("<correct>" in response_text)
@@ -711,6 +745,7 @@ async def compute_score_single_vsearch_base(
 
     # If the format is wrong, return 0.0 for all rewards
     if not score.format_reward:
+        _record_judge_metadata(score, reward_kwargs)
         return score
 
     # Compute the tool reward
@@ -726,6 +761,7 @@ async def compute_score_single_vsearch_base(
             score.tool_reward = 0.0
             break
 
+    _record_judge_metadata(score, reward_kwargs)
     return score
 
 
@@ -740,6 +776,7 @@ async def compute_score_single_vsearcher(
     if bbox_2d is not None:
         bbox_2d = tuple(bbox_2d)  # Ensure it's a tuple
     if bbox_2d is None or bbox_2d == (0, 0, 0, 0):
+        _record_judge_metadata(score, reward_kwargs)
         return score
 
     final_iou = compute_overall_iou_with_gt(
@@ -751,6 +788,7 @@ async def compute_score_single_vsearcher(
     final_iou_clipped = max(iou_low, min(iou_high, score.final_iou))
     score.iou_reward = (final_iou_clipped - iou_low) / (iou_high - iou_low)
 
+    _record_judge_metadata(score, reward_kwargs)
     return score
 
 
@@ -758,6 +796,7 @@ async def compute_score_single_vsearcher_as_subagent(
     data_source: str, solution_str: str, ground_truth: str, extra_info: dict, **reward_kwargs: dict
 ) -> Score:
     score = await compute_score_single_vsearch_base(solution_str, extra_info, **reward_kwargs)
+    _record_judge_metadata(score, reward_kwargs)
     return score
 
 
@@ -791,6 +830,7 @@ async def compute_score_single_vreasoner(
         score.accuracy_reward = 0.0
 
     score.n_valid_tool_calls = solution_str.count("<tool_response>")
+    _record_judge_metadata(score, reward_kwargs)
     return score
 
 
@@ -804,6 +844,7 @@ async def compute_score_single_insight_qwen_agent(
         score.format_reward = 0.0
         score.accuracy_reward = 0.0
         score.n_valid_tool_calls = solution_str.count("<tool_response>")
+        _record_judge_metadata(score, reward_kwargs)
         return score
 
     rule_based_answer = _extract_last_tagged_content(final_message, "answer")
@@ -835,6 +876,7 @@ async def compute_score_single_insight_qwen_agent(
         score.accuracy_reward = 0.0
 
     score.n_valid_tool_calls = solution_str.count("<tool_response>")
+    _record_judge_metadata(score, reward_kwargs)
     return score
 
 
@@ -900,7 +942,8 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
         logger.info(
             f"[RewardWorker] Computing rewards for {len(solution_strs)} samples "
             f"with {reward_kwargs['num_workers']} workers "
-            f"using {reward_kwargs['judge_model']} verification."
+            f"using {reward_kwargs['judge_model']} verification "
+            f"(fallback_judge_model={reward_kwargs.get('fallback_judge_model') or None})."
         )
         start_time = time.time()
 
@@ -963,6 +1006,7 @@ def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos,
                 "total_samples": len(scores),
                 "agent_names": dict(agent_names),
                 "judge_model": reward_kwargs["judge_model"],
+                "fallback_judge_model": reward_kwargs.get("fallback_judge_model") or None,
                 "num_workers": reward_kwargs["num_workers"],
                 "task_timeout": reward_kwargs["task_timeout"],
                 "min_success_rate": reward_kwargs["min_success_rate"],

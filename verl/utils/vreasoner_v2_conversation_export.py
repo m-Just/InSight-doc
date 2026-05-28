@@ -3,9 +3,11 @@ import hashlib
 import json
 import os
 import re
+import socket
 import tempfile
 from io import BytesIO
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 from urllib.request import urlopen
 
@@ -73,6 +75,20 @@ def build_child_conversation_export_id(parent_export_id: str, child_idx: int) ->
 
 def build_conversation_export_path(export_dir: str, export_id: str) -> str:
     return os.path.join(export_dir, f"{export_id}.json")
+
+
+def build_conversation_export_index_path(export_dir: str, *, global_step: Any, split: str) -> str:
+    step_component = f"global_step_{_slugify_export_component(global_step, fallback='unknown')}"
+    split_component = _slugify_export_component(split, fallback="unknown")
+    hostname = _slugify_export_component(socket.gethostname(), fallback="unknown-host")
+    pid = os.getpid()
+    return os.path.join(
+        export_dir,
+        "index",
+        step_component,
+        split_component,
+        f"worker_{hostname}_{pid}.jsonl",
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -502,6 +518,61 @@ def write_json_atomic(path: str, data: dict[str, Any]) -> None:
             os.unlink(tmp_path)
 
 
+def write_conversation_export_index(
+    export_dir: str,
+    *,
+    export_id: str,
+    export_path: str,
+    record: dict[str, Any],
+    index_metadata: Mapping[str, Any] | None = None,
+) -> str:
+    metadata = dict(index_metadata or {})
+    job = record.get("job") if isinstance(record, Mapping) else {}
+    if isinstance(job, Mapping):
+        metadata = {**job, **metadata}
+    extra_info = record.get("extra_info") if isinstance(record, Mapping) else {}
+    if not isinstance(extra_info, Mapping):
+        extra_info = {}
+
+    validate = bool(metadata.get("validate", False))
+    split = str(metadata.get("split") or ("val" if validate else "train"))
+    global_step = metadata.get("global_step", metadata.get("step"))
+    index_path = build_conversation_export_index_path(export_dir, global_step=global_step, split=split)
+    index_dir = os.path.dirname(index_path)
+    if index_dir:
+        os.makedirs(index_dir, exist_ok=True)
+
+    entry = {
+        "schema_version": "conversation_export_index_v1",
+        "export_id": export_id,
+        "path": os.path.abspath(export_path),
+        "relative_path": os.path.relpath(export_path, export_dir),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "global_step": _json_safe(global_step),
+        "split": split,
+        "validate": validate,
+        "worker": {
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+        },
+        "job_id": metadata.get("job_id"),
+        "parent_job_id": metadata.get("parent_job_id"),
+        "root_job_id": metadata.get("root_job_id"),
+        "trajectory_sample_index": metadata.get("trajectory_sample_index"),
+        "rollout_n": metadata.get("rollout_n"),
+        "data_source": extra_info.get("data_source"),
+        "question_id": extra_info.get("question_id"),
+        "document_id": extra_info.get("document_id"),
+        "index": extra_info.get("index"),
+        "subset": extra_info.get("subset"),
+        "conversation_export_repeat_idx": extra_info.get("conversation_export_repeat_idx"),
+    }
+    with open(index_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(_json_safe(entry), ensure_ascii=False, sort_keys=True))
+        f.write("\n")
+    return index_path
+
+
 def is_conversation_export_complete(export_path: str) -> bool:
     if not export_path or not os.path.exists(export_path):
         return False
@@ -527,9 +598,18 @@ def export_conversation(
     *,
     job_id: str,
     export_id: str | None = None,
+    index_metadata: Mapping[str, Any] | None = None,
 ) -> str:
-    path = build_conversation_export_path(export_dir, export_id or job_id)
+    actual_export_id = export_id or job_id
+    path = build_conversation_export_path(export_dir, actual_export_id)
     write_json_atomic(path, record)
+    write_conversation_export_index(
+        export_dir,
+        export_id=actual_export_id,
+        export_path=path,
+        record=record,
+        index_metadata=index_metadata,
+    )
     return path
 
 

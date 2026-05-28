@@ -84,7 +84,7 @@ run_experiment \
     custom_reward_function.reward_kwargs.reward_weights.tool=0.0 \
     custom_reward_function.reward_kwargs.format_reward.simple=True \
     trainer.debug_skip_worker_init="${DEBUG_SKIP_WORKER_INIT:-False}" \
-    data.val_batch_size=64 \
+    data.val_batch_size=16 \
     data.validation_shuffle=False \
     custom_reward_function.reward_kwargs.max_retries=15 \
     custom_reward_function.reward_kwargs.retry_interval=90 \

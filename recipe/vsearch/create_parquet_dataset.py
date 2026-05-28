@@ -535,7 +535,7 @@ class InSightDocBase(VerlFormatDataset):
         visual_details = example.get("question_involved_visual_details")
         if visual_details is not None:
             visual_details = json.dumps(visual_details, ensure_ascii=False)
-        return {
+        extra_info = {
             **super().get_extra_info(example),
             "question_id": str(example["question_id"]),
             "document_id": example.get("document_id"),
@@ -544,6 +544,13 @@ class InSightDocBase(VerlFormatDataset):
             "question_involved_visual_details": visual_details,
             "question_type": example.get("question_type"),
         }
+        optional_extra_info_keys = ("initial_rescale", "initial_rescale_source", "initial_rescale_dpi")
+        for key in optional_extra_info_keys:
+            value = example.get(key)
+            if value is None:
+                continue
+            extra_info[key] = float(value) if key == "initial_rescale" else value
+        return extra_info
 
 
 class InSightDoc0352(InSightDocBase):
@@ -552,6 +559,10 @@ class InSightDoc0352(InSightDocBase):
 
 class InSightDocMixed(InSightDocBase):
     DATA_SOURCE = "insight_doc_mixed"
+
+
+class InSightDocMixedWithArxiv(InSightDocBase):
+    DATA_SOURCE = "insight_doc_mixed_with_arxiv"
 
 
 class InSightEvalDude200(InSightDocBase):
@@ -907,10 +918,14 @@ if __name__ == "__main__":
             selected_question_ids = {line.strip() for line in f if line.strip()}
         print(f"Loaded {len(selected_question_ids)} question_ids from {question_id_path}")
 
+        filter_kwargs = {
+            "desc": f"Filtering to {len(selected_question_ids)} selected question_ids",
+        }
+        if args.num_workers > 1:
+            filter_kwargs["num_proc"] = args.num_workers
         hf_dataset = hf_dataset.filter(
             lambda example: dataset.get_question_id(example) in selected_question_ids,
-            num_proc=args.num_workers,
-            desc=f"Filtering to {len(selected_question_ids)} selected question_ids",
+            **filter_kwargs,
         )
         print(f"Filtered dataset len: {len(hf_dataset)}")
 
@@ -933,7 +948,13 @@ if __name__ == "__main__":
 
     if not args.test_size:
         map_fn = make_map_fn(dataset, args.split, args.prompt, args.agent_name, args.validate_images)
-        hf_dataset = hf_dataset.map(function=map_fn, with_indices=True, num_proc=args.num_workers)
+        map_kwargs = {
+            "function": map_fn,
+            "with_indices": True,
+        }
+        if args.num_workers > 1:
+            map_kwargs["num_proc"] = args.num_workers
+        hf_dataset = hf_dataset.map(**map_kwargs)
         if not args.dry_run:
             hf_dataset.to_parquet(args.output_path)
         show_example_data(hf_dataset)
@@ -946,9 +967,13 @@ if __name__ == "__main__":
         for split_name in hf_dataset_dict:
             print("--------------------------------")
             map_fn = make_map_fn(dataset, split_name, args.prompt, args.agent_name, args.validate_images)
-            hf_dataset_dict[split_name] = hf_dataset_dict[split_name].map(
-                function=map_fn, with_indices=True, num_proc=args.num_workers
-            )
+            split_map_kwargs = {
+                "function": map_fn,
+                "with_indices": True,
+            }
+            if args.num_workers > 1:
+                split_map_kwargs["num_proc"] = args.num_workers
+            hf_dataset_dict[split_name] = hf_dataset_dict[split_name].map(**split_map_kwargs)
             output_paths[split_name] = args.output_path.replace(".parquet", f".{split_name}.parquet")
             if not args.dry_run:
                 hf_dataset_dict[split_name].to_parquet(output_paths[split_name])

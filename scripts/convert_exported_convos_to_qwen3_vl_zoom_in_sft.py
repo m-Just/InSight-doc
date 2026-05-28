@@ -62,6 +62,7 @@ import asyncio
 import hashlib
 import io
 import json
+import math
 import os
 import sys
 import time
@@ -73,6 +74,11 @@ from urllib.parse import urlparse
 
 import pandas as pd
 from PIL import Image
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm is optional.
+    tqdm = None
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -262,10 +268,43 @@ def parse_args() -> argparse.Namespace:
         help="Store images inline as bytes or on disk as file URIs in an output-dir image cache.",
     )
     parser.add_argument(
+        "--invalid-image-aspect-policy",
+        choices=["error", "pad", "drop"],
+        default="drop",
+        help=(
+            "How to handle images whose aspect ratio exceeds Qwen-VL preprocessing limits. "
+            "error keeps fail-fast behavior, pad expands the short side with white padding, "
+            "and drop filters the whole conversation."
+        ),
+    )
+    parser.add_argument(
+        "--max-image-aspect-ratio",
+        type=float,
+        default=200.0,
+        help="Maximum allowed max(width,height)/min(width,height) before applying invalid-image-aspect-policy.",
+    )
+    parser.add_argument(
+        "--image-aspect-pad-target-ratio",
+        type=float,
+        default=198.0,
+        help="Target aspect ratio used when padding invalid images; keep this below Qwen-VL's hard limit.",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=1,
         help="Number of worker processes for per-conversation conversion.",
+    )
+    parser.add_argument(
+        "--conversion-progress-every",
+        type=int,
+        default=100,
+        help="Fallback conversion progress print interval when tqdm is unavailable or disabled.",
+    )
+    parser.add_argument(
+        "--disable-conversion-progress-bar",
+        action="store_true",
+        help="Disable tqdm progress bar and use periodic text progress instead.",
     )
     parser.add_argument(
         "--only-correct-answers",
@@ -504,7 +543,74 @@ def image_to_png_bytes(image: Image.Image) -> bytes:
     return buf.getvalue()
 
 
-def materialize_image(image: Image.Image, image_storage_mode: str, image_cache_dir: Path | None) -> dict[str, Any]:
+def image_aspect_ratio(image: Image.Image) -> float:
+    width, height = image.size
+    short_side = min(width, height)
+    if short_side <= 0:
+        return math.inf
+    return max(width, height) / short_side
+
+
+def pad_image_to_aspect_ratio(image: Image.Image, target_ratio: float) -> Image.Image:
+    if target_ratio <= 1:
+        raise ValueError(f"image_aspect_pad_target_ratio must be > 1, got {target_ratio}")
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Cannot pad image with invalid size {image.size}")
+    if image_aspect_ratio(image) <= target_ratio:
+        return image
+
+    if width > height:
+        target_width = width
+        target_height = max(height, math.ceil(width / target_ratio))
+    else:
+        target_width = max(width, math.ceil(height / target_ratio))
+        target_height = height
+
+    canvas = Image.new("RGB", (target_width, target_height), (255, 255, 255))
+    canvas.paste(image.convert("RGB"), ((target_width - width) // 2, (target_height - height) // 2))
+    return canvas
+
+
+def repair_or_validate_image_aspect(
+    image: Image.Image,
+    *,
+    invalid_image_aspect_policy: str,
+    max_image_aspect_ratio: float,
+    image_aspect_pad_target_ratio: float,
+) -> Image.Image:
+    ratio = image_aspect_ratio(image)
+    if ratio <= max_image_aspect_ratio:
+        return image
+
+    message = (
+        "image aspect ratio exceeds limit: "
+        f"size={image.size}, ratio={ratio:.3f}, limit={max_image_aspect_ratio:g}"
+    )
+    if invalid_image_aspect_policy == "drop":
+        raise DropConversationError(f"filtered out by invalid image aspect ratio ({message})")
+    if invalid_image_aspect_policy == "pad":
+        return pad_image_to_aspect_ratio(image, image_aspect_pad_target_ratio)
+    if invalid_image_aspect_policy == "error":
+        raise ValueError(message)
+    raise ValueError(f"Unsupported invalid_image_aspect_policy={invalid_image_aspect_policy!r}")
+
+
+def materialize_image(
+    image: Image.Image,
+    image_storage_mode: str,
+    image_cache_dir: Path | None,
+    *,
+    invalid_image_aspect_policy: str,
+    max_image_aspect_ratio: float,
+    image_aspect_pad_target_ratio: float,
+) -> dict[str, Any]:
+    image = repair_or_validate_image_aspect(
+        image,
+        invalid_image_aspect_policy=invalid_image_aspect_policy,
+        max_image_aspect_ratio=max_image_aspect_ratio,
+        image_aspect_pad_target_ratio=image_aspect_pad_target_ratio,
+    )
     png_bytes = image_to_png_bytes(image)
     if image_storage_mode == "bytes":
         return {"bytes": png_bytes}
@@ -714,6 +820,9 @@ def convert_parts_to_content(
     qwen_style_tool_success: bool,
     image_storage_mode: str,
     image_cache_dir: Path | None,
+    invalid_image_aspect_policy: str,
+    max_image_aspect_ratio: float,
+    image_aspect_pad_target_ratio: float,
 ) -> tuple[str, list[dict[str, Any]]]:
     text_parts: list[str] = []
     images: list[dict[str, bytes]] = []
@@ -735,7 +844,16 @@ def convert_parts_to_content(
             image = image_map.get(presented_img_idx)
             if image is None:
                 raise ValueError(f"Missing presented image for presented_img_idx={presented_img_idx}")
-            images.append(materialize_image(image, image_storage_mode, image_cache_dir))
+            images.append(
+                materialize_image(
+                    image,
+                    image_storage_mode,
+                    image_cache_dir,
+                    invalid_image_aspect_policy=invalid_image_aspect_policy,
+                    max_image_aspect_ratio=max_image_aspect_ratio,
+                    image_aspect_pad_target_ratio=image_aspect_pad_target_ratio,
+                )
+            )
             continue
         raise ValueError(f"Unsupported export part kind: {kind}")
     return "".join(text_parts), images
@@ -747,6 +865,9 @@ def convert_user_like_message(
     stitch_runtime_hints: bool,
     image_storage_mode: str,
     image_cache_dir: Path | None,
+    invalid_image_aspect_policy: str,
+    max_image_aspect_ratio: float,
+    image_aspect_pad_target_ratio: float,
 ) -> dict[str, Any] | None:
     message_type = message.get("type")
     content = message.get("content", {})
@@ -773,6 +894,9 @@ def convert_user_like_message(
             qwen_style_tool_success=qwen_style_tool_success,
             image_storage_mode=image_storage_mode,
             image_cache_dir=image_cache_dir,
+            invalid_image_aspect_policy=invalid_image_aspect_policy,
+            max_image_aspect_ratio=max_image_aspect_ratio,
+            image_aspect_pad_target_ratio=image_aspect_pad_target_ratio,
         )
         out: dict[str, Any] = {"role": role, "content": text}
         return out, images
@@ -791,7 +915,16 @@ def convert_user_like_message(
                 if image is None:
                     raise ValueError(f"Missing presented image for presented_img_idx={presented_img_idx}")
                 text += f"Image {presented_img_idx}:<image>"
-                images.append(materialize_image(image, image_storage_mode, image_cache_dir))
+                images.append(
+                    materialize_image(
+                        image,
+                        image_storage_mode,
+                        image_cache_dir,
+                        invalid_image_aspect_policy=invalid_image_aspect_policy,
+                        max_image_aspect_ratio=max_image_aspect_ratio,
+                        image_aspect_pad_target_ratio=image_aspect_pad_target_ratio,
+                    )
+                )
             return {"role": "tool", "content": text}, images
         return {"role": "tool", "content": ""}, []
     if message_type == "tool_result_fail_hint":
@@ -946,6 +1079,9 @@ def convert_record(
     tool_argument_order: str,
     image_storage_mode: str,
     image_cache_dir: Path | None,
+    invalid_image_aspect_policy: str,
+    max_image_aspect_ratio: float,
+    image_aspect_pad_target_ratio: float,
 ) -> dict[str, Any]:
     presented_images = restore_presented_images(record)
     image_map = {item.get("presented_img_idx"): item.get("image") for item in presented_images}
@@ -1080,6 +1216,9 @@ def convert_record(
                 stitch_runtime_hints,
                 image_storage_mode=image_storage_mode,
                 image_cache_dir=image_cache_dir,
+                invalid_image_aspect_policy=invalid_image_aspect_policy,
+                max_image_aspect_ratio=max_image_aspect_ratio,
+                image_aspect_pad_target_ratio=image_aspect_pad_target_ratio,
             )
             index += 1
             if converted is None:
@@ -1112,6 +1251,9 @@ def convert_one_path(
     tool_argument_order: str,
     image_storage_mode: str,
     image_cache_dir: Path | None,
+    invalid_image_aspect_policy: str,
+    max_image_aspect_ratio: float,
+    image_aspect_pad_target_ratio: float,
     only_correct_answers: bool,
     rewrite_file_uri_prefixes: list[tuple[str, str]],
     drop_degenerate_conversations: bool,
@@ -1152,6 +1294,9 @@ def convert_one_path(
             tool_argument_order=tool_argument_order,
             image_storage_mode=image_storage_mode,
             image_cache_dir=image_cache_dir,
+            invalid_image_aspect_policy=invalid_image_aspect_policy,
+            max_image_aspect_ratio=max_image_aspect_ratio,
+            image_aspect_pad_target_ratio=image_aspect_pad_target_ratio,
         )
     except DropConversationError as exc:
         return path.name, None, str(exc), question_id
@@ -1170,6 +1315,9 @@ def _convert_one_path_star(
         str,
         str,
         Path | None,
+        str,
+        float,
+        float,
         bool,
         list[tuple[str, str]],
         bool,
@@ -1186,6 +1334,9 @@ def _convert_one_path_star(
         tool_argument_order,
         image_storage_mode,
         image_cache_dir,
+        invalid_image_aspect_policy,
+        max_image_aspect_ratio,
+        image_aspect_pad_target_ratio,
         only_correct_answers,
         rewrite_file_uri_prefixes,
         drop_degenerate_conversations,
@@ -1201,6 +1352,9 @@ def _convert_one_path_star(
         tool_argument_order=tool_argument_order,
         image_storage_mode=image_storage_mode,
         image_cache_dir=image_cache_dir,
+        invalid_image_aspect_policy=invalid_image_aspect_policy,
+        max_image_aspect_ratio=max_image_aspect_ratio,
+        image_aspect_pad_target_ratio=image_aspect_pad_target_ratio,
         only_correct_answers=only_correct_answers,
         rewrite_file_uri_prefixes=rewrite_file_uri_prefixes,
         drop_degenerate_conversations=drop_degenerate_conversations,
@@ -1218,20 +1372,41 @@ def load_records(
     tool_argument_order: str,
     image_storage_mode: str,
     image_cache_dir: Path | None,
+    invalid_image_aspect_policy: str,
+    max_image_aspect_ratio: float,
+    image_aspect_pad_target_ratio: float,
     num_workers: int,
     only_correct_answers: bool,
     rewrite_file_uri_prefixes: list[tuple[str, str]],
     drop_degenerate_conversations: bool,
     degenerate_thresholds: DegenerateThresholds,
     degenerate_preview_chars: int,
+    conversion_progress_every: int,
+    disable_conversion_progress_bar: bool,
     allow_empty: bool = False,
 ) -> tuple[list[dict[str, Any]], int, Counter[str], list[str]]:
     records: list[dict[str, Any]] = []
     paths = sorted(input_dir.glob("*.json"))
     warning_counts: Counter[str] = Counter()
     wrong_question_ids: list[str] = []
+
+    def iter_with_progress(iterator: Any, total: int) -> Any:
+        if tqdm is not None and not disable_conversion_progress_bar:
+            return tqdm(iterator, total=total, desc=f"Converting {input_dir.name}", unit="conv")
+
+        def generator() -> Any:
+            started_at = time.time()
+            for idx, item in enumerate(iterator, start=1):
+                if conversion_progress_every > 0 and (idx == 1 or idx % conversion_progress_every == 0 or idx == total):
+                    elapsed = time.time() - started_at
+                    rate = idx / elapsed if elapsed > 0 else 0.0
+                    print(f"Converted {idx}/{total} conversations ({rate:.2f}/s)", flush=True)
+                yield item
+
+        return generator()
+
     if num_workers <= 1:
-        for path in paths:
+        for path in iter_with_progress(paths, len(paths)):
             _, converted, warning, question_id = convert_one_path(
                 path,
                 stitch_runtime_hints=stitch_runtime_hints,
@@ -1241,6 +1416,9 @@ def load_records(
                 tool_argument_order=tool_argument_order,
                 image_storage_mode=image_storage_mode,
                 image_cache_dir=image_cache_dir,
+                invalid_image_aspect_policy=invalid_image_aspect_policy,
+                max_image_aspect_ratio=max_image_aspect_ratio,
+                image_aspect_pad_target_ratio=image_aspect_pad_target_ratio,
                 only_correct_answers=only_correct_answers,
                 rewrite_file_uri_prefixes=rewrite_file_uri_prefixes,
                 drop_degenerate_conversations=drop_degenerate_conversations,
@@ -1265,6 +1443,9 @@ def load_records(
                 tool_argument_order,
                 image_storage_mode,
                 image_cache_dir,
+                invalid_image_aspect_policy,
+                max_image_aspect_ratio,
+                image_aspect_pad_target_ratio,
                 only_correct_answers,
                 rewrite_file_uri_prefixes,
                 drop_degenerate_conversations,
@@ -1274,7 +1455,8 @@ def load_records(
             for path in paths
         ]
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            for _, converted, warning, question_id in executor.map(_convert_one_path_star, tasks, chunksize=8):
+            mapped = executor.map(_convert_one_path_star, tasks, chunksize=8)
+            for _, converted, warning, question_id in iter_with_progress(mapped, len(tasks)):
                 if warning is not None:
                     warning_counts[warning] += 1
                     if only_correct_answers and question_id is not None:
@@ -1456,12 +1638,17 @@ def main() -> None:
         tool_argument_order=args.tool_argument_order,
         image_storage_mode=args.image_storage_mode,
         image_cache_dir=image_cache_dir,
+        invalid_image_aspect_policy=args.invalid_image_aspect_policy,
+        max_image_aspect_ratio=args.max_image_aspect_ratio,
+        image_aspect_pad_target_ratio=args.image_aspect_pad_target_ratio,
         num_workers=args.num_workers,
         only_correct_answers=args.only_correct_answers,
         rewrite_file_uri_prefixes=rewrite_file_uri_prefixes,
         drop_degenerate_conversations=args.drop_degenerate_conversations,
         degenerate_thresholds=degenerate_thresholds,
         degenerate_preview_chars=args.degenerate_preview_chars,
+        conversion_progress_every=args.conversion_progress_every,
+        disable_conversion_progress_bar=args.disable_conversion_progress_bar,
         allow_empty=args.wrong_question_ids_only,
     )
     df = pd.DataFrame(rows)

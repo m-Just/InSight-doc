@@ -5,7 +5,7 @@ LAUNCH_SCRIPT="${LAUNCH_SCRIPT:-/scratch/ywxzml3j/likaican/src/verl-qwen3-vl/scr
 OUTPUT_ROOT="${OUTPUT_ROOT:-/scratch/ywxzml3j/likaican/temp/insight_qwen_agent_full_sft_all_convos_0426_lora_sweep}"
 MASTER_LOG="${MASTER_LOG:-${OUTPUT_ROOT}/sweep.log}"
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-0}"
-MAX_LENGTH="${MAX_LENGTH:-32768}"
+MAX_LENGTH="${MAX_LENGTH:-65536}"
 MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-${MAX_LENGTH}}"
 TARGET_MODULES="${TARGET_MODULES:-all-linear}"
 FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-1}"
@@ -50,9 +50,6 @@ PY
 
   extra_sft_args="optim.lr_scheduler_type=cosine optim.lr_warmup_steps_ratio=0.05 optim.min_lr_ratio=${min_lr_ratio}"
   extra_sft_args="${extra_sft_args} model.lora_rank=${lora_rank} model.lora_alpha=${lora_alpha} model.target_modules=${TARGET_MODULES}"
-  if [[ "${FREEZE_VISION_TOWER}" == "1" || "${FREEZE_VISION_TOWER}" == "true" || "${FREEZE_VISION_TOWER}" == "yes" ]]; then
-    extra_sft_args="${extra_sft_args} model.freeze_vision_tower=True"
-  fi
   if [[ -n "${snapshot_dir}" ]]; then
     extra_sft_args="${extra_sft_args} trainer.batch_snapshot_dir=${snapshot_dir}"
     extra_sft_args="${extra_sft_args} trainer.batch_snapshot_steps=\"${SFT_BATCH_SNAPSHOT_STEPS}\""
@@ -115,17 +112,25 @@ main() {
   # - keep LoRA shape fixed at rank 32 / alpha 64
   # - use a wider LR range than full finetuning would typically tolerate
 
-  run_one "lora_exp1_lr2e-4_cosine_minlr2e-5_len32768_bs32_rank32_alpha64" "2e-4" "2e-5" "32" "32" "64" || {
-    failures=$(( failures + 1 ))
-    [[ "${CONTINUE_ON_FAILURE}" == "1" ]] || exit 1
-  }
+  # run_one "lora_exp1_lr2e-4_cosine_minlr2e-5_len32768_bs32_rank32_alpha64" "2e-4" "2e-5" "32" "32" "64" || {
+  #   failures=$(( failures + 1 ))
+  #   [[ "${CONTINUE_ON_FAILURE}" == "1" ]] || exit 1
+  # }
 
-  run_one "lora_exp2_lr1e-4_cosine_minlr1e-5_len32768_bs32_rank32_alpha64" "1e-4" "1e-5" "32" "32" "64" || {
-    failures=$(( failures + 1 ))
-    [[ "${CONTINUE_ON_FAILURE}" == "1" ]] || exit 1
-  }
+  # run_one "lora_exp2_lr1e-4_cosine_minlr1e-5_len32768_bs32_rank32_alpha64" "1e-4" "1e-5" "32" "32" "64" || {
+  #   failures=$(( failures + 1 ))
+  #   [[ "${CONTINUE_ON_FAILURE}" == "1" ]] || exit 1
+  # }
 
-  run_one "lora_exp3_lr5e-5_cosine_minlr5e-6_len32768_bs32_rank32_alpha64" "5e-5" "5e-6" "32" "32" "64" || {
+  # run_one "lora_exp3_lr5e-5_cosine_minlr5e-6_len32768_bs32_rank32_alpha64" "5e-5" "5e-6" "32" "32" "64" || {
+  #   failures=$(( failures + 1 ))
+  #   [[ "${CONTINUE_ON_FAILURE}" == "1" ]] || exit 1
+  # }
+
+  export FREEZE_VISION_TOWER=1
+  export USE_BASE_MODEL_TOOL_ARGUMENT_ORDER_FOR_MEDIUM=1
+  export TRAIN_MEDIUM_ONLY=1
+  run_one "lora_exp1_lr2e-4_cosine_minlr2e-5_len${MAX_LENGTH}_bs32_rank32_alpha64_freeze_vt_medium_only+p4_5" "2e-4" "2e-5" "32" "32" "64" || {
     failures=$(( failures + 1 ))
     [[ "${CONTINUE_ON_FAILURE}" == "1" ]] || exit 1
   }

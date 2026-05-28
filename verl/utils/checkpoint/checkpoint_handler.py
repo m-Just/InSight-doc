@@ -18,6 +18,7 @@
 import logging
 import os
 import re
+import shutil
 from enum import Enum
 
 import torch
@@ -126,6 +127,64 @@ class CheckpointHandler:
         if self.rank == 0 and self.default_hdfs_dir:
             hdfs_io.makedirs(self.default_hdfs_dir, exist_ok=True)
             hdfs_io.copy(src=local_global_step_folder, dst=self.default_hdfs_dir, dirs_exist_ok=True)
+
+        if self.mode == OrchestrationMode.SPMD:
+            torch.distributed.barrier()
+
+    def save_refresh_checkpoint(self, step):
+        """Save a rolling checkpoint without updating normal checkpoint tracking."""
+        from verl.utils.fs import local_mkdir_safe
+
+        refresh_dir = os.path.join(self.default_local_dir, "refresh")
+        local_temp_folder = os.path.join(refresh_dir, f".tmp_global_step_{step}")
+        local_global_step_folder = os.path.join(refresh_dir, f"global_step_{step}")
+
+        if self.rank == 0:
+            print(f"Refreshing checkpoint to: {local_global_step_folder}")
+            local_mkdir_safe(refresh_dir)
+            shutil.rmtree(local_temp_folder, ignore_errors=True)
+            shutil.rmtree(local_global_step_folder, ignore_errors=True)
+
+        if self.mode == OrchestrationMode.SPMD:
+            torch.distributed.barrier()
+
+        checkpoint_manager = getattr(self.engine, "checkpoint_manager", None)
+        previous_saved_paths = None
+        previous_global_step = None
+        if checkpoint_manager is not None:
+            previous_saved_paths = list(getattr(checkpoint_manager, "previous_saved_paths", []))
+            previous_global_step = getattr(checkpoint_manager, "previous_global_step", None)
+
+        self.engine.save_checkpoint(local_path=local_temp_folder, global_step=step, max_ckpt_to_keep=None)
+
+        if checkpoint_manager is not None:
+            checkpoint_manager.previous_saved_paths = previous_saved_paths
+            checkpoint_manager.previous_global_step = previous_global_step
+
+        if self.is_mp_src_rank_with_outputs:
+            dp_rank = self.dp_rank
+            local_mkdir_safe(local_temp_folder)
+            dataloader_local_path = os.path.join(local_temp_folder, f"data_{dp_rank}.pt")
+            dataloader_state_dict = self.train_dataloader.state_dict()
+            torch.save(dataloader_state_dict, dataloader_local_path)
+            print(f"Saved refresh dataloader state to: {dataloader_local_path}")
+
+        if self.mode == OrchestrationMode.SPMD:
+            torch.distributed.barrier()
+
+        if self.rank == 0:
+            for name in os.listdir(refresh_dir):
+                path = os.path.join(refresh_dir, name)
+                if name.startswith("global_step_") and path != local_global_step_folder:
+                    shutil.rmtree(path, ignore_errors=True)
+            os.rename(local_temp_folder, local_global_step_folder)
+
+            tracker_file = os.path.join(refresh_dir, "latest_refresh_checkpointed_iteration.txt")
+            temp_tracker_file = tracker_file + ".tmp"
+            with open(temp_tracker_file, "w") as f:
+                f.write(str(step))
+            os.rename(temp_tracker_file, tracker_file)
+            print(f"Updated refresh checkpoint tracker: {tracker_file}")
 
         if self.mode == OrchestrationMode.SPMD:
             torch.distributed.barrier()

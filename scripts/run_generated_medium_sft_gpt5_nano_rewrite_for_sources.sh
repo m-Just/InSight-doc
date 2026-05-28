@@ -36,6 +36,10 @@ Environment:
   PROGRESS_EVERY           default: 50
   ALLOW_OVERWRITE          default: 0; set 1 to regenerate existing parquets
   REWRITE_FILE_URI_PREFIXES optional; comma-separated OLD=NEW mappings passed to conversion
+  INVALID_IMAGE_ASPECT_POLICY default: drop; one of error,pad,drop
+  MAX_IMAGE_ASPECT_RATIO   default: 200
+  IMAGE_ASPECT_PAD_TARGET_RATIO default: 198
+  CONVERSION_PROGRESS_EVERY default: 100
 EOF
 }
 
@@ -78,6 +82,10 @@ MAX_FAILURE_RATIO="${MAX_FAILURE_RATIO:-0.005}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-50}"
 ALLOW_OVERWRITE="${ALLOW_OVERWRITE:-0}"
 REWRITE_FILE_URI_PREFIXES="${REWRITE_FILE_URI_PREFIXES:-}"
+INVALID_IMAGE_ASPECT_POLICY="${INVALID_IMAGE_ASPECT_POLICY:-drop}"
+MAX_IMAGE_ASPECT_RATIO="${MAX_IMAGE_ASPECT_RATIO:-200}"
+IMAGE_ASPECT_PAD_TARGET_RATIO="${IMAGE_ASPECT_PAD_TARGET_RATIO:-198}"
+CONVERSION_PROGRESS_EVERY="${CONVERSION_PROGRESS_EVERY:-100}"
 
 mkdir -p "${LOG_ROOT}"
 
@@ -92,6 +100,10 @@ echo "OPENAI_BASE_URL=${OPENAI_BASE_URL}"
 echo "API_LOGGER_SAVE_DIR=${API_LOGGER_SAVE_DIR}"
 echo "API_LOGGER_PROJECT_NAME=${API_LOGGER_PROJECT_NAME}"
 echo "LOG_ROOT=${LOG_ROOT}"
+echo "INVALID_IMAGE_ASPECT_POLICY=${INVALID_IMAGE_ASPECT_POLICY}"
+echo "MAX_IMAGE_ASPECT_RATIO=${MAX_IMAGE_ASPECT_RATIO}"
+echo "IMAGE_ASPECT_PAD_TARGET_RATIO=${IMAGE_ASPECT_PAD_TARGET_RATIO}"
+echo "CONVERSION_PROGRESS_EVERY=${CONVERSION_PROGRESS_EVERY}"
 
 rewrite_prefix_args=()
 if [[ -n "${REWRITE_FILE_URI_PREFIXES}" ]]; then
@@ -102,6 +114,12 @@ if [[ -n "${REWRITE_FILE_URI_PREFIXES}" ]]; then
     fi
   done
 fi
+
+image_aspect_args=(
+  --invalid-image-aspect-policy "${INVALID_IMAGE_ASPECT_POLICY}"
+  --max-image-aspect-ratio "${MAX_IMAGE_ASPECT_RATIO}"
+  --image-aspect-pad-target-ratio "${IMAGE_ASPECT_PAD_TARGET_RATIO}"
+)
 
 run_convert() {
   local log_file="$1"
@@ -176,6 +194,8 @@ for spec in "$@"; do
         --api-logger-project-name "${API_LOGGER_PROJECT_NAME}" \
         --insight-doc-root "${INSIGHT_DOC_ROOT}" \
         --num-workers "${CONVERT_NUM_WORKERS}" \
+        --conversion-progress-every "${CONVERSION_PROGRESS_EVERY}" \
+        "${image_aspect_args[@]}" \
         "${rewrite_prefix_args[@]}"
   fi
 
@@ -200,6 +220,8 @@ for spec in "$@"; do
         --drop-degenerate-conversations \
         --tool-argument-order base_model \
         --num-workers "${CONVERT_NUM_WORKERS}" \
+        --conversion-progress-every "${CONVERSION_PROGRESS_EVERY}" \
+        "${image_aspect_args[@]}" \
         "${rewrite_prefix_args[@]}"
   fi
 done

@@ -341,16 +341,25 @@ class RLHFDataset(Dataset):
 
         def attach_export_id(example, idx):
             extra_info = dict(example.get("extra_info") or {})
-            base_export_id = export_ids[idx]
+            base_export_id = str(export_ids[idx])
             extra_info["conversation_export_base_id"] = base_export_id
-            extra_info.setdefault("conversation_export_id", base_export_id)
+            existing_export_id = extra_info.get("conversation_export_id")
+            if not isinstance(existing_export_id, str) or not existing_export_id:
+                extra_info["conversation_export_id"] = base_export_id
             example["extra_info"] = extra_info
             return example
+
+        map_features = copy.deepcopy(dataframe.features)
+        extra_info_features = map_features.get("extra_info")
+        if isinstance(extra_info_features, dict):
+            extra_info_features["conversation_export_base_id"] = datasets.Value("string")
+            extra_info_features["conversation_export_id"] = datasets.Value("string")
 
         dataframe = dataframe.map(
             attach_export_id,
             with_indices=True,
             desc="Attaching deterministic conversation export ids",
+            features=map_features,
         )
         if self.conversation_export_resume_mode == "skip_completed":
             print(f"conversation export resume: skipped {skipped_completed} completed samples")
@@ -413,7 +422,8 @@ class RLHFDataset(Dataset):
         if agent_settings is None:
             return 0
 
-        initial_rescale = float(agent_settings.get("initial_rescale", 1.0))
+        extra_info = row_dict.get("extra_info") or {}
+        initial_rescale = float(extra_info.get("initial_rescale", agent_settings.get("initial_rescale", 1.0)))
         gpt_image_max_area = int(agent_settings.get("gpt_image_max_area", 0))
 
         total_tokens = 0

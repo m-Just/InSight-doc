@@ -153,6 +153,7 @@ run_experiment () {
             actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
             actor_rollout_ref.rollout.agent.agent_loop_config_path="recipe/vsearch/config/agent_${API_MODEL_FOR_AGENT:-gpt-5-mini}.yaml" \
             custom_reward_function.reward_kwargs.judge_model="${JUDGE_MODEL:-gpt-5-nano}" \
+            custom_reward_function.reward_kwargs.fallback_judge_model="${FALLBACK_JUDGE_MODEL:-}" \
             trainer.logger="$logger" \
             trainer.project_name="$PROJECT_NAME" \
             trainer.experiment_name="$EXP_NAME" \

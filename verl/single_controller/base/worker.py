@@ -49,6 +49,22 @@ class DistGlobalInfo:
 
 class WorkerHelper:
     @staticmethod
+    def _to_visible_device_ordinal(device_id: int | str) -> int:
+        device_id = int(device_id)
+        visible = os.environ.get(get_visible_devices_keyword().upper(), "")
+        if not visible:
+            return device_id
+        visible_ids = [int(x.strip()) for x in visible.split(",") if x.strip()]
+        if not visible_ids:
+            return device_id
+        try:
+            return visible_ids.index(device_id)
+        except ValueError as exc:
+            raise ValueError(
+                f"Device id {device_id} is not present in {get_visible_devices_keyword().upper()}={visible}"
+            ) from exc
+
+    @staticmethod
     def _get_node_ip():
         if os.getenv("WG_BACKEND", None) == "ray":
             return ray.util.get_node_ip_address()
@@ -285,9 +301,10 @@ class Worker(WorkerHelper):
             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set,
             # so we need to set local rank when the flag is set.
             device_name = "NPU" if is_npu_available else "GPU"
-            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
-            os.environ["LOCAL_RANK"] = local_rank
-            get_torch_device().set_device(int(local_rank))
+            device_id = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            local_rank = self._to_visible_device_ordinal(device_id)
+            os.environ["LOCAL_RANK"] = str(local_rank)
+            get_torch_device().set_device(local_rank)
 
     def _configure_with_store(self, store: dict):
         """

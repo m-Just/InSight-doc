@@ -27,8 +27,8 @@ USE_DYNAMIC_BSZ=True
 # If use dynamic batch size, tune `ppo_max_token_len_per_gpu` and `log_prob_max_token_len_per_gpu`
 # Otherwise, tune `ppo_micro_batch_size_per_gpu` and `log_prob_micro_batch_size_per_gpu`
 
-MAX_IMG_TOKENS_TRAIN=4K  # roughly 2000 * 2000 pixels per image
-MAX_IMG_TOKENS_VAL=4K
+MAX_IMG_TOKENS_TRAIN=16K  # roughly 3580 * 3580 pixels per image
+MAX_IMG_TOKENS_VAL=16K
 
 MAX_VAL_SAMPLE_DUMP_PER_DATA_SOURCE=0
 
@@ -64,8 +64,8 @@ run_experiment \
     actor_rollout_ref.rollout.val_kwargs.repetition_penalty=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     algorithm.subagent_advantage_estimator=null \
-    trainer.test_freq=25 \
-    trainer.total_training_steps=500 \
+    trainer.test_freq=100 \
+    trainer.total_training_steps=1000 \
     custom_reward_function.reward_kwargs.max_retries=15 \
     custom_reward_function.reward_kwargs.retry_interval=90 \
     +actor_rollout_ref.rollout.agent.vreasoner_v2_conversation_export_dir="/scratch/ywxzml3j/likaican/mms1_rl/exported_conversations/multi_agent_vsearch/${EXP_NAME}/${EVAL_NAME}" \

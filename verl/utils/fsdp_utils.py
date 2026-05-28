@@ -581,11 +581,17 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
         "_fsdp_wrapped_module.base_model.model.model.",
         "_fsdp_wrapped_module.base_model.model.model.layers.",
         "_fsdp_wrapped_module.base_model.model.model.language_model.layers.",
+        "_fsdp_wrapped_module.base_model.model.model.visual.blocks.",
+        "_fsdp_wrapped_module.base_model.model.model.visual.deepstack_merger_list.",
+        "_fsdp_wrapped_module.base_model.model.model.visual.merger.",
         # fsdp2
         "base_model.model.",
         "base_model.model.model.",
         "base_model.model.model.layers.",
         "base_model.model.model.language_model.layers.",
+        "base_model.model.model.visual.blocks.",
+        "base_model.model.model.visual.deepstack_merger_list.",
+        "base_model.model.model.visual.merger.",
     ]
     peft_model = getattr(fsdp_module, "_fsdp_wrapped_module", fsdp_module)
     for prefix in prefix_list:

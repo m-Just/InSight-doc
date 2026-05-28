@@ -66,8 +66,65 @@ UNANSWERABLE_ANSWER_VERIFICATION_HINT = (
     "Do not provide the answer for a similar substitute target.\n"
     "Return only a revised final answer in <answer>...</answer>."
 )
+UNANSWERABLE_EXPLICIT_REVISION_HINT = (
+    "Verification check: this question is unanswerable as written from the provided document.\n"
+    "Make sure your answer addresses the exact target in the question, and revise your final answer to reflect that, "
+    "if not already so.\n"
+    "If you answered a nearby related entity, field, unit, rank, year, or method instead of the exact target, "
+    "correct yourself.\n"
+    "If the document does not support the exact target as asked, say so directly in one sentence.\n"
+    "Do not provide the answer for a similar substitute target.\n"
+    "Return only a revised final answer in <answer>...</answer>."
+)
+UNANSWERABLE_EXPLICIT_REVISION_HINT_EVIDENCE_LINKED = (
+    "Verification check: this question is unanswerable as written from the provided document.\n"
+    "Revise your final answer to reflect that, if not already so.\n"
+    "Base the revision on the relevant information you found in the document.\n"
+    "If the document shows related information that does not answer the question as asked, briefly explain that "
+    "mismatch in a natural way.\n"
+    "Avoid generic 'insufficient information' answers when the document actually shows evidence that is related but "
+    "does not answer the exact question.\n"
+    "Do not answer a similar substitute target as if it were the requested one.\n"
+    "Return only a revised final answer in <answer>...</answer>."
+)
 ANSWER_VERIFICATION_HINT_EXPORT_TYPE = "answer_verification_hint"
 ANSWER_REVISION_EXPORT_TYPE = "answer_revision"
+
+
+def _looks_like_multipart_question(question: str | None) -> bool:
+    if not question:
+        return False
+    return len(re.findall(r"\([a-z]\)", question.lower())) >= 2
+
+
+def get_unanswerable_answer_verification_hint(mode: str, extra_info: dict[str, Any] | None = None) -> str:
+    extra_info = extra_info or {}
+    if mode == "soft":
+        return UNANSWERABLE_ANSWER_VERIFICATION_HINT
+    if mode == "explicit_unanswerable_revision":
+        return UNANSWERABLE_EXPLICIT_REVISION_HINT
+    if mode == "explicit_unanswerable_revision_evidence_linked":
+        multipart = _looks_like_multipart_question(str(extra_info.get("question") or ""))
+        selected_part_label = extra_info.get("selected_part_label")
+        if multipart:
+            selected_part_msg = ""
+            if isinstance(selected_part_label, str) and selected_part_label.strip():
+                selected_part_msg = f" The unsupported sub-question is part ({selected_part_label.strip()})."
+            return (
+                "Verification check: this is a multipart question, and one sub-question is unanswerable as written "
+                f"from the provided document.{selected_part_msg}\n"
+                "Keep the answerable sub-questions unchanged, and revise only the unsupported sub-question, if not "
+                "already so.\n"
+                "Base the revision on the relevant information you found in the document.\n"
+                "If the document shows related information that does not answer that sub-question as asked, briefly "
+                "explain that mismatch in a natural way.\n"
+                "Avoid generic 'insufficient information' answers when the document actually shows evidence that is "
+                "related but does not answer the exact sub-question.\n"
+                "Do not answer a similar substitute target as if it were the requested one.\n"
+                "Return only a revised final answer in <answer>...</answer>."
+            )
+        return UNANSWERABLE_EXPLICIT_REVISION_HINT_EVIDENCE_LINKED
+    raise ValueError(f"Unsupported unanswerable answer verification mode: {mode}")
 
 
 @dataclass
@@ -464,6 +521,32 @@ class VSearcherMixin:
         except ValueError as e:
             if "absolute aspect ratio must be smaller than 200" in str(e):
                 logger.warning(f"invalid aspect ratio: {e}")
+                job_id = uuid4().hex
+                return AgentLoopOutput(
+                    prompt_ids=[],
+                    response_ids=[],
+                    response_mask=[],
+                    response_logprobs=None,
+                    multi_modal_data={},
+                    reward_score=None,
+                    num_turns=0,
+                    metrics=AgentLoopMetrics(),
+                    extra_fields={
+                        "agent_name": self.AGENT_NAME,
+                        "job_id": job_id,
+                        "parent_job_id": kwargs.get("parent_job_id", None),
+                        "root_job_id": kwargs.get("root_job_id", job_id),
+                        "n_tool_calls": 0,
+                        "caller_feedback": None,
+                        "final_bbox": None,
+                        "tool_call_bboxes": [],
+                        "critical_failure": True,
+                        "messages": [],
+                        "multi_modal_data": {},
+                        "failure_reasons": [f"invalid_aspect_ratio: {e}"],
+                        "extra_info": kwargs.get("extra_info"),
+                    },
+                )
             else:
                 raise e
         t_after_parent = time.perf_counter()
@@ -625,7 +708,14 @@ class VSearcherLoopQwen3VL(VSearcherMixin, QwenAgentLoop):
             return bbox
         
         image_processed_wh: tuple[int, int] = extra_info["image_processed_wh"][0]
-        return resize_bbox(bbox, QWEN3_VL_COORD_RANGE, image_processed_wh)
+        try:
+            return resize_bbox(bbox, QWEN3_VL_COORD_RANGE, image_processed_wh)
+        except ValueError as e:
+            logger.warning(
+                "failed to resize final bbox from Qwen3-VL coords to image pixels: "
+                f"bbox={bbox}, image_processed_wh={image_processed_wh}, error={e}"
+            )
+            return None
 
     def _extract_bboxes_within_tool_call_tags(
         self, messages: ReconstructedMessages, extra_info: dict[str, Any] | None = None
@@ -654,7 +744,13 @@ class VSearcherLoopQwen3VL(VSearcherMixin, QwenAgentLoop):
             if bbox == (0, 0, 0, 0):
                 converted_bboxes.append(bbox)
             else:
-                converted_bboxes.append(resize_bbox(bbox, QWEN3_VL_COORD_RANGE, image_processed_wh))
+                try:
+                    converted_bboxes.append(resize_bbox(bbox, QWEN3_VL_COORD_RANGE, image_processed_wh))
+                except ValueError as e:
+                    logger.warning(
+                        "failed to resize tool-call bbox from Qwen3-VL coords to image pixels: "
+                        f"bbox={bbox}, image_processed_wh={image_processed_wh}, error={e}"
+                    )
         return converted_bboxes
 
 
@@ -677,6 +773,7 @@ class VReasonerLoop(AgentLoopBase):
         reasoning_effort: str | None = None,       # reasoning effort for vReasoner
         prompt_variant: str = "default",           # system prompt variant for vReasoner
         enable_unanswerable_answer_verification: bool = False,
+        unanswerable_answer_verification_mode: str = "soft",
         enable_tool_feedback: bool = True,         # enable tool feedback for vReasoner
         multi_image_input: bool = False,           # support multiple input images per query
         **kwargs,                                  # extra kwargs for vReasoner
@@ -691,6 +788,7 @@ class VReasonerLoop(AgentLoopBase):
         self.reasoning_effort = reasoning_effort
         self.prompt_variant = prompt_variant
         self.enable_unanswerable_answer_verification = enable_unanswerable_answer_verification
+        self.unanswerable_answer_verification_mode = unanswerable_answer_verification_mode
         self.enable_tool_feedback = enable_tool_feedback
         self.multi_image_input = multi_image_input
         vsearcher_loop_cls_name = self.config.actor_rollout_ref.rollout.agent.get("vsearcher_loop_cls", "VSearcherLoop")
@@ -873,7 +971,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     vsearcher_output.extra_fields["img_idx"] = img_idx
             vsearcher_outputs.append(vsearcher_output)
 
-            bbox = vsearcher_output.extra_fields["final_bbox"]
+            bbox = vsearcher_output.extra_fields.get("final_bbox")
             if bbox is None:
                 logger.warning("vsearcher failed to return a valid bbox")
                 break
@@ -1411,7 +1509,7 @@ To finish, bring everything together in a clear, synthesized answer that fully r
             child_runs.append(child_event)
             write_profile_event("vreasoner_v2_child", child_event, config=self.config)
 
-            bbox = vsearcher_output.extra_fields["final_bbox"]
+            bbox = vsearcher_output.extra_fields.get("final_bbox")
             error_message_due_to_vsearcher_failure = (
                 "ERROR: The requested region could not be turned into a usable zoomed view. "
                 "Try a more specific region description, or choose a different img_idx."
@@ -1593,7 +1691,9 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                 reasoning_effort=self.reasoning_effort,
                 enable_stop=self.enable_stop,
                 prompt_variant=self.prompt_variant,
-                followup_user_text=UNANSWERABLE_ANSWER_VERIFICATION_HINT,
+                followup_user_text=get_unanswerable_answer_verification_hint(
+                    self.unanswerable_answer_verification_mode
+                ),
                 force_answer_only=True,
             )
             t_verify_end = time.perf_counter()
@@ -1808,11 +1908,20 @@ To finish, bring everything together in a clear, synthesized answer that fully r
                     critical_failure=critical_failure,
                     final_failure_reasons=(request.failure_reasons if request is not None and request.failure_reasons else None),
                 )
+                export_index_metadata = {
+                    "global_step": kwargs.get("_global_steps"),
+                    "split": "val" if validate else "train",
+                    "validate": validate,
+                    "trajectory_sample_index": kwargs.get("_trajectory_sample_index"),
+                    "rollout_n": kwargs.get("_rollout_n"),
+                }
+                record["job"].update(export_index_metadata)
                 conversation_export_json_path = export_conversation(
                     self.conversation_export_dir,
                     record,
                     job_id=job_id,
                     export_id=conversation_export_id,
+                    index_metadata=export_index_metadata,
                 )
             except Exception as exc:
                 logger.warning("failed to export vreasoner_v2 conversation for %s: %s", job_id, exc)

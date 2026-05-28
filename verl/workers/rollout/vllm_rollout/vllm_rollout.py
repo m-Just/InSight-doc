@@ -85,6 +85,20 @@ if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
 
 
+def _to_visible_device_ordinal(device_id: int | str) -> int:
+    device_id = int(device_id)
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not visible:
+        return device_id
+    visible_ids = [int(x.strip()) for x in visible.split(",") if x.strip()]
+    if not visible_ids:
+        return device_id
+    try:
+        return visible_ids.index(device_id)
+    except ValueError as exc:
+        raise ValueError(f"Device id {device_id} is not present in CUDA_VISIBLE_DEVICES={visible}") from exc
+
+
 def _check_vllm_version_for_sleep_level():
     # https://github.com/vllm-project/vllm/issues/25171
     minver = "0.11.0"
@@ -207,7 +221,7 @@ class vLLMAsyncRollout(BaseRollout):
         all_kwargs[0]["local_rank"] = (
             0
             if not ray_noset_visible_devices()
-            else int(ray.get_runtime_context().get_accelerator_ids()[device_name][0])
+            else _to_visible_device_ordinal(ray.get_runtime_context().get_accelerator_ids()[device_name][0])
         )
         self.vllm_config = all_kwargs[0]["vllm_config"]
         if self.lora_config:

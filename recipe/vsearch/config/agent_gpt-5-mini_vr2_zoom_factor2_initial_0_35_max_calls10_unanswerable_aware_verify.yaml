@@ -11,6 +11,7 @@
   reasoning_effort: null
   prompt_variant: unanswerable_aware
   enable_unanswerable_answer_verification: true
+  unanswerable_answer_verification_mode: soft
   multi_image_input: True
 - name: vsearcher
   _target_: verl.experimental.agent_loop.insight_o3_agent_loop.VSearcherLoop

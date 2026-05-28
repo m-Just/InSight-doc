@@ -35,6 +35,10 @@ export CUDA_VISIBLE_DEVICES="${EVAL_CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-15360}"
 export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
 export CONVERSATION_EXPORT_DIR="${CONVERSATION_EXPORT_DIR:-$WORK_DIR/exported_conversations}"
+export LOAD_FORMAT="${LOAD_FORMAT:-}"
+export LORA_ADAPTER_PATH="${LORA_ADAPTER_PATH:-}"
+export LORA_RANK="${LORA_RANK:-0}"
+export LORA_ALPHA="${LORA_ALPHA:-16}"
 export TMPDIR="${TMPDIR:-/tmp}"
 export TMP="${TMP:-$TMPDIR}"
 export TEMP="${TEMP:-$TMPDIR}"
@@ -47,8 +51,8 @@ source recipe/vsearch/_base.sh
 
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
-run_experiment \
-  trainer.n_gpus_per_node=8 \
+hydra_args=(
+  trainer.n_gpus_per_node="${N_GPUS_PER_NODE:-8}" \
   actor_rollout_ref.rollout.agent.num_workers="${AGENT_NUM_WORKERS:-8}" \
   data.max_prompt_length=49152 \
   actor_rollout_ref.rollout.max_model_len=65536 \
@@ -70,3 +74,22 @@ run_experiment \
   custom_reward_function.reward_kwargs.max_retries=15 \
   custom_reward_function.reward_kwargs.retry_interval=90 \
   data.validation_shuffle=False
+)
+
+if [[ -n "$LORA_ADAPTER_PATH" ]]; then
+  if [[ "$LORA_RANK" == "0" ]]; then
+    echo "LORA_RANK must be set to a positive value when LORA_ADAPTER_PATH is set" >&2
+    exit 2
+  fi
+  hydra_args+=(
+    actor_rollout_ref.model.lora_adapter_path="$LORA_ADAPTER_PATH"
+    actor_rollout_ref.model.lora_rank="$LORA_RANK"
+    actor_rollout_ref.model.lora_alpha="$LORA_ALPHA"
+    actor_rollout_ref.rollout.load_format="${LOAD_FORMAT:-safetensors}"
+    trainer.val_only_hf_model_rollout=false
+  )
+elif [[ -n "$LOAD_FORMAT" ]]; then
+  hydra_args+=(actor_rollout_ref.rollout.load_format="$LOAD_FORMAT")
+fi
+
+run_experiment "${hydra_args[@]}"

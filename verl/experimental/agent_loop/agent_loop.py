@@ -617,6 +617,9 @@ class AgentLoopWorker:
             )
 
             kwargs["_validate"] = trajectory["validate"]
+            kwargs["_global_steps"] = trajectory["step"]
+            kwargs["_trajectory_sample_index"] = trajectory["sample_index"]
+            kwargs["_rollout_n"] = trajectory["rollout_n"]
             t_before_run = time.perf_counter()
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             t_after_run = time.perf_counter()
@@ -698,12 +701,15 @@ class AgentLoopWorker:
 
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
+            {"input_ids": output.prompt_ids or [[]]},  # [] => an empty batch, [[]] => a batch with an empty seq
             padding="max_length",
             max_length=self.config.actor_rollout_ref.rollout.prompt_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
+        if not hasattr(prompt_output["input_ids"], "dim"):
+            prompt_output["input_ids"] = torch.tensor(prompt_output["input_ids"])
+            prompt_output["attention_mask"] = torch.tensor(prompt_output["attention_mask"])
         if prompt_output["input_ids"].dim() == 1:
             prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
             prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
@@ -716,6 +722,9 @@ class AgentLoopWorker:
             return_tensors="pt",
             return_attention_mask=True,
         )
+        if not hasattr(response_output["input_ids"], "dim"):
+            response_output["input_ids"] = torch.tensor(response_output["input_ids"])
+            response_output["attention_mask"] = torch.tensor(response_output["attention_mask"])
         if response_output["input_ids"].dim() == 1:
             response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
@@ -727,6 +736,8 @@ class AgentLoopWorker:
             return_tensors="pt",
             return_attention_mask=False,
         )
+        if not hasattr(response_mask_output["input_ids"], "dim"):
+            response_mask_output["input_ids"] = torch.tensor(response_mask_output["input_ids"])
         if response_mask_output["input_ids"].dim() == 1:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 

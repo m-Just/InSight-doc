@@ -45,6 +45,10 @@ export DATA_VALIDATION_MAX_PROMPT_LENGTH="${DATA_VALIDATION_MAX_PROMPT_LENGTH:-1
 export ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-32768}"
 export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.75}"
+export LOAD_FORMAT="${LOAD_FORMAT:-}"
+export LORA_ADAPTER_PATH="${LORA_ADAPTER_PATH:-}"
+export LORA_RANK="${LORA_RANK:-0}"
+export LORA_ALPHA="${LORA_ALPHA:-16}"
 export VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.7}"
 export VAL_TOP_P="${VAL_TOP_P:-0.8}"
 export VAL_TOP_K="${VAL_TOP_K:-20}"
@@ -91,5 +95,25 @@ hydra_args=(
   +actor_rollout_ref.rollout.engine_kwargs.vllm.max_model_len="$VLLM_MAX_MODEL_LEN"
   +actor_rollout_ref.rollout.engine_kwargs.vllm.gpu_memory_utilization="$VLLM_GPU_MEMORY_UTILIZATION"
 )
+
+if [[ -n "$LORA_ADAPTER_PATH" ]]; then
+  if [[ "$LORA_RANK" == "0" ]]; then
+    echo "LORA_RANK must be set to a positive value when LORA_ADAPTER_PATH is set" >&2
+    exit 2
+  fi
+  hydra_args+=(
+    actor_rollout_ref.model.lora_adapter_path="$LORA_ADAPTER_PATH"
+    actor_rollout_ref.model.lora_rank="$LORA_RANK"
+    actor_rollout_ref.model.lora_alpha="$LORA_ALPHA"
+    actor_rollout_ref.rollout.load_format="${LOAD_FORMAT:-safetensors}"
+    trainer.val_only_hf_model_rollout=false
+  )
+elif [[ -n "$LOAD_FORMAT" ]]; then
+  hydra_args+=(actor_rollout_ref.rollout.load_format="$LOAD_FORMAT")
+fi
+
+if (($# > 0)); then
+  hydra_args+=("$@")
+fi
 
 run_experiment "${hydra_args[@]}"

@@ -6,6 +6,7 @@ data:
   train_batch_size: 256
   micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
   micro_batch_size_per_gpu: 4  # this is also val batch size
+  dataloader_num_workers: 8
   train_files: ~/data/gsm8k/train.parquet
   val_files: ~/data/gsm8k/test.parquet
   train_max_samples: -1  # set to -1 to use full dataset
@@ -23,6 +24,7 @@ data:
     enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
   max_length: 1024
   truncation: error
+  allow_overlength: False
   balance_dp_token: False
   chat_template: null
   custom_cls:
@@ -66,10 +68,17 @@ trainer:
   logger: [ 'console', 'wandb' ]
   seed: 1
   save_freq: -1
+  # Overwrite-style checkpointing for debugging/resume inspection.
+  # When >0, writes one rolling checkpoint under refresh/ without changing normal save_freq checkpoints.
+  refresh_freq: 0
   test_freq: -1
   nnodes: 1
   n_gpus_per_node: 8
   max_ckpt_to_keep: null  # Maximum number of checkpoints to keep, set to null to keep all
+
+  # Debug-only: skip forward/backward for the first N train steps.
+  # This is for reproducing a later batch quickly, not for real training resume.
+  debug_skip_train_steps: 0
 
   # Resume mode: "auto", "disable", or "resume_path"
   # "auto": resume from last checkpoint if available

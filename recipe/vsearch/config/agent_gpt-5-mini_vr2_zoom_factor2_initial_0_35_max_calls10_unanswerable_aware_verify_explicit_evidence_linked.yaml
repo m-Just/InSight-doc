@@ -1,0 +1,17 @@
+- name: vreasoner_v2
+  _target_: verl.experimental.agent_loop.insight_o3_agent_loop.VReasonerLoopV2
+  model: gpt-5-mini
+  max_tool_calls: 10
+  max_round_retries: 3
+  max_round_retries_val: 5
+  gpt_image_max_area: 1638400
+  max_completion_tokens: 8192
+  initial_rescale: 0.35
+  region_zoom_in_factor: 2.0
+  reasoning_effort: null
+  prompt_variant: unanswerable_aware
+  enable_unanswerable_answer_verification: true
+  unanswerable_answer_verification_mode: explicit_unanswerable_revision_evidence_linked
+  multi_image_input: True
+- name: vsearcher
+  _target_: verl.experimental.agent_loop.insight_o3_agent_loop.VSearcherLoop

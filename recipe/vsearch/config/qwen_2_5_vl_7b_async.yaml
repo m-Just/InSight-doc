@@ -107,6 +107,7 @@ custom_reward_function:
   reward_kwargs:
     reward_type: conditioned_on_tool_reward
     judge_model: gpt-5-nano
+    fallback_judge_model: null
     num_workers: 32
     # ======= fail-safe for judge API calls ========
     task_timeout: 60

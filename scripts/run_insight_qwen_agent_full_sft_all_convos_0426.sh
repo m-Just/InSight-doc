@@ -28,8 +28,14 @@ TRAIN_FILES=(
   "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/arxiv/spanning_train_part1/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
 )
 
+# "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3a/easy/processed_drop_degenerate/sft_data.parquet"
+# "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3a/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
+# "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3b/easy/processed_drop_degenerate/sft_data.parquet"
 # "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3b/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
+# "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3c/easy/processed_drop_degenerate/sft_data.parquet"
 # "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3c/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
+# "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3d/easy/processed_drop_degenerate/sft_data.parquet"
+# "/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated/O3_data_0424/train_part3d/medium/processed_gpt5_nano_rewrite/sft_data.parquet"
 
 USE_VSEARCHER_SYSTEM_FOR_EASY="${USE_VSEARCHER_SYSTEM_FOR_EASY:-0}"
 if [[ "${USE_VSEARCHER_SYSTEM_FOR_EASY}" == "1" || "${USE_VSEARCHER_SYSTEM_FOR_EASY}" == "true" || "${USE_VSEARCHER_SYSTEM_FOR_EASY}" == "yes" ]]; then
@@ -119,7 +125,7 @@ MAX_LENGTH="${MAX_LENGTH:-65536}"
 RESUME_MODE="${RESUME_MODE:-auto}"
 RESUME_FROM_PATH="${RESUME_FROM_PATH:-}"
 RDZV_PORT="${RDZV_PORT:-29501}"
-TRAINER_LOGGERS="${TRAINER_LOGGERS:-['console','wandb']}"
+TRAINER_LOGGERS="${TRAINER_LOGGERS:-['console']}"
 LOG_PATH="${LOG_PATH:-${WORK_DIR}/train.log}"
 EXTRA_SFT_ARGS="${EXTRA_SFT_ARGS:-}"
 FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-0}"

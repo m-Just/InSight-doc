@@ -845,6 +845,16 @@ class FSDPSFTTrainer:
         start_epoch = global_step // self.steps_per_epoch
 
         train_time = 0
+        debug_skip_train_steps = int(self.config.trainer.get("debug_skip_train_steps", 0) or 0)
+        if debug_skip_train_steps > 0:
+            log_with_rank(
+                f"DEBUG ONLY: skipping forward/backward for the first {debug_skip_train_steps} train steps. "
+                "This is not a valid training resume path.",
+                logger=logger,
+                rank=self.device_mesh.get_rank(),
+                level=logging.WARNING,
+                log_only_rank_0=True,
+            )
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             self.train_sampler.set_epoch(epoch=epoch)
 
@@ -858,6 +868,8 @@ class FSDPSFTTrainer:
                 )
             ):
                 global_step += 1
+                if global_step <= debug_skip_train_steps:
+                    continue
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).to(self.device_name)
                 metric = self.training_step(data)
                 train_time += metric["train/time(s)"]

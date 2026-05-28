@@ -20,7 +20,8 @@ import json
 import logging
 import os
 import warnings
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
+from enum import Enum
 from typing import Any, Optional
 
 import numpy as np
@@ -94,6 +95,25 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _jsonable_peft_config(peft_config) -> dict:
+    """Convert PEFT config dataclass fields to JSON-compatible values."""
+
+    def convert(value):
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, set):
+            return sorted(value)
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, list | tuple):
+            return [convert(item) for item in value]
+        return value
+
+    if is_dataclass(peft_config):
+        return convert(asdict(peft_config))
+    return convert(peft_config)
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -1112,10 +1132,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             peft_config = {}
             if dist.get_rank() == 0:
                 os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(peft_model.peft_config.get("default", {}))
-                peft_config["task_type"] = peft_config["task_type"].value
-                peft_config["peft_type"] = peft_config["peft_type"].value
-                peft_config["target_modules"] = list(peft_config["target_modules"])
+                peft_config = _jsonable_peft_config(peft_model.peft_config.get("default", {}))
             try:
                 if fsdp_version(self.actor_module_fsdp) > 0:
                     self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())

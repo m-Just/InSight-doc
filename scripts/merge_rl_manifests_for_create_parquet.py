@@ -78,6 +78,12 @@ def group_to_pdf_image_root(group_name: str, arxiv_root: Path, o3_root: Path) ->
             / "dpi200_aug_noaug_maxp40_jitter_seed0_pagedrop0.5_irrel0.3_seed0"
             / "pdf_image"
         ),
+        "arxiv__veqa_batch_0350_r2_train_6508_additional_mveqa_batch_0352_r2_train_6508_additional__dpi200_aug_noaug_maxp40_jitter_seed0": (
+            arxiv_root
+            / "veqa_batch_0350_r2_train_6508_additional_mveqa_batch_0352_r2_train_6508_additional"
+            / "dpi200_aug_noaug_maxp40_jitter_seed0"
+            / "pdf_image"
+        ),
         "arxiv__veqa_batch_0350_r2_train_mveqa_batch_0352_r2_train__dpi200_aug_noaug_maxp40": (
             arxiv_root
             / "veqa_batch_0350_r2_train_mveqa_batch_0352_r2_train"

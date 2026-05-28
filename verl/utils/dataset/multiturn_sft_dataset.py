@@ -16,6 +16,7 @@
 Multi-turn SFT dataset that supports training on conversation data with multiple turns
 """
 
+import copy
 import logging
 import os
 import re
@@ -82,6 +83,7 @@ class MultiTurnSFTDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         # for right padding
         self.max_length = config.get("max_length", 1024)
+        self.allow_overlength = config.get("allow_overlength", False)
         # Get messages_key from the new multiturn config structure
         self.messages_key = config.get("messages_key", "messages")
         self.image_key = config.get("image_key", "images")
@@ -100,6 +102,8 @@ class MultiTurnSFTDataset(Dataset):
         self.first_k_loss_tokens = int(config.get("first_k_loss_tokens", os.getenv("SFT_FIRST_K_LOSS_TOKENS", 16)))
         self.ignore_input_ids_mismatch = config.get("ignore_input_ids_mismatch", False)
         assert self.truncation in ["error", "left", "right"]
+        if self.allow_overlength and self.pad_mode != DatasetPadMode.NO_PADDING:
+            raise ValueError("allow_overlength=True is only supported with pad_mode=no_padding")
 
         if not isinstance(parquet_files, list | ListConfig):
             parquet_files = [parquet_files]
@@ -262,9 +266,15 @@ class MultiTurnSFTDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[self.messages_key]
-        images = example[self.image_key] if self.image_key in example else []
-        videos = example[self.video_key] if self.video_key in example else []
+        # The nested objects returned from pandas rows can alias the dataframe.
+        # Keep image/video materialization local to this sample; otherwise
+        # dataloader workers retain PIL images across batches and can be killed.
+        def copy_media_items(items):
+            return [dict(item) if isinstance(item, dict) else item for item in items]
+
+        messages: list = copy.deepcopy(example[self.messages_key])
+        images = copy_media_items(example[self.image_key]) if self.image_key in example else []
+        videos = copy_media_items(example[self.video_key]) if self.video_key in example else []
 
         image_offset, video_offset = 0, 0
         for message in messages:
@@ -371,6 +381,7 @@ class MultiTurnSFTDataset(Dataset):
         # 3. handle padding
         sequence_length = input_ids.shape[0]
         truncated = False
+        overlength = sequence_length > self.max_length
 
         # Handle sequence length
         if self.pad_mode == DatasetPadMode.RIGHT:
@@ -421,6 +432,7 @@ class MultiTurnSFTDataset(Dataset):
                 res["multi_modal_inputs"] = multi_modal_inputs
             res["debug_sample_info"] = self.debug_sample_info[item]
             res["truncate_flag"] = bool(truncated)
+            res["overlength_flag"] = bool(overlength)
             return res
         elif self.pad_mode == DatasetPadMode.NO_PADDING:
             if len(input_ids) > self.max_length:
@@ -439,7 +451,8 @@ class MultiTurnSFTDataset(Dataset):
                     first_k_loss_mask = first_k_loss_mask[: self.max_length]
                     position_ids = position_ids[..., : self.max_length]
                 elif self.truncation == "error":
-                    raise ValueError(f"{sequence_length=} is larger than {self.max_length=}")
+                    if not self.allow_overlength:
+                        raise ValueError(f"{sequence_length=} is larger than {self.max_length=}")
                 else:
                     raise ValueError(f"Unknown truncation method {self.truncation}")
 
@@ -455,6 +468,7 @@ class MultiTurnSFTDataset(Dataset):
                 res["multi_modal_inputs"] = multi_modal_inputs
             res["debug_sample_info"] = self.debug_sample_info[item]
             res["truncate_flag"] = bool(truncated)
+            res["overlength_flag"] = bool(overlength)
             return res
         else:
             raise ValueError(f"Unknown pad mode {self.pad_mode}")

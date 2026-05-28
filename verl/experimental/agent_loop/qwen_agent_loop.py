@@ -942,16 +942,20 @@ class InSightQwenAgentLoop(QwenAgentLoop):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         conversation_wall_time_start = time.perf_counter()
         messages = copy.deepcopy(list(kwargs["raw_prompt"]))
+        extra_info = dict(kwargs.get("extra_info") or {})
+        sample_initial_rescale = self._get_sample_initial_rescale(extra_info)
         # Smoke-test compatibility only:
         # some synthetic inference inputs are reconstructed from converted SFT rows whose images are already
         # in the presented form expected by InSightQwenAgentLoop. Normal eval/training flow should leave this
         # unset so the loop can build presented images from the raw prompt images itself.
         aligned_prompt, original_images, presented_images, actual_initial_rescale, initial_rescale_metadata = (
             self._build_presented_prompt(
-            messages,
-            images_are_presented=bool(kwargs.get("initial_images_already_presented", False)),
-            training_mode=not bool(kwargs.get("_validate", False)),
-        ))
+                messages,
+                images_are_presented=bool(kwargs.get("initial_images_already_presented", False)),
+                training_mode=not bool(kwargs.get("_validate", False)),
+                sample_initial_rescale=sample_initial_rescale,
+            )
+        )
 
         multi_modal_data = await self.process_vision_info(aligned_prompt)
         images = multi_modal_data.get("images")
@@ -1001,7 +1005,6 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         )
         agent_data.extra_fields["initial_prompt_shrink_warning"] = initial_prompt_fit_metadata.get("prompt_shrink_warning")
         agent_data.extra_fields["initial_prompt_fit_time"] = initial_prompt_fit_time
-        extra_info = dict(kwargs["extra_info"])
         extra_info["agent_name"] = "insight_qwen_agent"
         agent_data.extra_fields["agent_name"] = "insight_qwen_agent"
         agent_data.extra_fields["extra_info"] = extra_info
@@ -1079,11 +1082,12 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         conversation_export_json_path = None
         if self.conversation_export_dir:
             try:
+                validate = bool(kwargs.get("_validate", False))
                 record = build_export_record(
                     job_id=request_id,
                     parent_job_id=kwargs.get("parent_job_id"),
                     root_job_id=kwargs.get("root_job_id", request_id),
-                    validate=bool(kwargs.get("_validate", False)),
+                    validate=validate,
                     initial_question=kwargs["extra_info"]["question"],
                     messages_api=[],
                     raw_prompt=kwargs["raw_prompt"],
@@ -1144,11 +1148,20 @@ class InSightQwenAgentLoop(QwenAgentLoop):
                     agent_data.messages,
                     initial_question=kwargs["extra_info"]["question"],
                 )
+                export_index_metadata = {
+                    "global_step": kwargs.get("_global_steps"),
+                    "split": "val" if validate else "train",
+                    "validate": validate,
+                    "trajectory_sample_index": kwargs.get("_trajectory_sample_index"),
+                    "rollout_n": kwargs.get("_rollout_n"),
+                }
+                record["job"].update(export_index_metadata)
                 conversation_export_json_path = export_conversation(
                     self.conversation_export_dir,
                     record,
                     job_id=request_id,
                     export_id=conversation_export_id,
+                    index_metadata=export_index_metadata,
                 )
             except Exception as exc:
                 logger.warning("failed to export insight_qwen_agent conversation for %s: %s", request_id, exc)
@@ -1189,6 +1202,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         messages: list[dict[str, Any]],
         images_are_presented: bool = False,
         training_mode: bool = False,
+        sample_initial_rescale: float | None = None,
     ) -> tuple[list[dict[str, Any]], list[Image.Image], list[PresentedImageState], float, dict[str, Any]]:
         original_images: list[Image.Image] = []
         staged_messages: list[tuple[dict[str, Any], list[Any], list[str], bool]] = []
@@ -1229,6 +1243,7 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             image_sizes=[image.size for image in original_images],
             images_are_presented=images_are_presented,
             training_mode=training_mode,
+            sample_initial_rescale=sample_initial_rescale,
         )
 
         presented_images: list[PresentedImageState] = []
@@ -1378,20 +1393,27 @@ class InSightQwenAgentLoop(QwenAgentLoop):
         *,
         images_are_presented: bool,
         training_mode: bool,
+        sample_initial_rescale: float | None = None,
     ) -> tuple[float, dict[str, Any]]:
+        sample_override_applied = sample_initial_rescale is not None
+        configured_initial_rescale = self.initial_rescale
+        base_initial_rescale = sample_initial_rescale if sample_override_applied else configured_initial_rescale
         if images_are_presented:
-            return self.initial_rescale, {
+            return base_initial_rescale, {
                 "images_are_presented": True,
                 "randomized": False,
-                "sampled_initial_rescale": self.initial_rescale,
-                "actual_initial_rescale": self.initial_rescale,
+                "sampled_initial_rescale": base_initial_rescale,
+                "actual_initial_rescale": base_initial_rescale,
+                "configured_initial_rescale": configured_initial_rescale,
+                "sample_initial_rescale_override": sample_initial_rescale,
+                "sample_initial_rescale_override_applied": sample_override_applied,
             }
 
-        sampled_initial_rescale = self.initial_rescale
+        sampled_initial_rescale = base_initial_rescale
         randomized = False
         max_rescale_under_budget = None
 
-        if training_mode and self._should_randomize_initial_rescale() and image_sizes:
+        if not sample_override_applied and training_mode and self._should_randomize_initial_rescale() and image_sizes:
             randomized_rescale, max_rescale_under_budget = self._sample_training_initial_rescale(image_sizes)
             if randomized_rescale is not None:
                 sampled_initial_rescale = randomized_rescale
@@ -1410,13 +1432,28 @@ class InSightQwenAgentLoop(QwenAgentLoop):
             "randomized": randomized,
             "sampled_initial_rescale": sampled_initial_rescale,
             "actual_initial_rescale": actual_initial_rescale,
-            "configured_initial_rescale": self.initial_rescale,
+            "configured_initial_rescale": configured_initial_rescale,
+            "sample_initial_rescale_override": sample_initial_rescale,
+            "sample_initial_rescale_override_applied": sample_override_applied,
             "train_randomization_prob": self.train_initial_rescale_randomization_prob,
             "train_randomization_min": self.train_initial_rescale_randomization_min,
             "train_randomization_max": self.train_initial_rescale_randomization_max,
             "train_randomization_text_budget": self.train_initial_rescale_randomization_text_budget,
             "image_token_budget_estimate": max(self.prompt_length - self.train_initial_rescale_randomization_text_budget, 0),
         }
+
+    @staticmethod
+    def _get_sample_initial_rescale(extra_info: dict[str, Any]) -> float | None:
+        raw_value = extra_info.get("initial_rescale")
+        if raw_value is None or raw_value == "":
+            return None
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"extra_info.initial_rescale must be a positive finite float, got {raw_value!r}") from exc
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"extra_info.initial_rescale must be a positive finite float, got {raw_value!r}")
+        return value
 
     def _should_randomize_initial_rescale(self) -> bool:
         return (

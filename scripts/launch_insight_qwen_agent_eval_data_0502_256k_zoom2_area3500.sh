@@ -54,4 +54,4 @@ export VAL_FILES="${VAL_FILES:-${VAL_FILES_JSON}}"
 
 cd "$REPO_ROOT"
 
-bash "$REPO_ROOT/scripts/run_iq_ft_eval_default_sampling_rl15360.sh"
+bash "$REPO_ROOT/scripts/run_iq_ft_eval_default_sampling_rl15360.sh" "$@"
