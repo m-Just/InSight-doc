@@ -558,6 +558,8 @@ def write_conversation_export_index(
         "job_id": metadata.get("job_id"),
         "parent_job_id": metadata.get("parent_job_id"),
         "root_job_id": metadata.get("root_job_id"),
+        "run_name": metadata.get("run_name"),
+        "trial_name": metadata.get("trial_name"),
         "trajectory_sample_index": metadata.get("trajectory_sample_index"),
         "rollout_n": metadata.get("rollout_n"),
         "data_source": extra_info.get("data_source"),
