@@ -10,7 +10,7 @@ Typical usage:
     --output /path/to/global_step_700/actor_merged_hf/eval_defaults.yaml
 
 The output is intentionally smaller than the full Hydra config. It is meant to
-be consumed by evaluate.py via --eval-config and to serve as reproducible
+be consumed by the standalone eval scripts and to serve as reproducible
 metadata colocated with a checkpoint or merged HF model.
 """
 

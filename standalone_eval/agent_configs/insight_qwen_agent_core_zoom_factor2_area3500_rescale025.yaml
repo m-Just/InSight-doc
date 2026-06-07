@@ -1,0 +1,18 @@
+name: insight_qwen_agent
+
+tools:
+  qwen_tool_list:
+    - image_zoom_in_tool_qwen3vl
+  tool_parser: hermes
+  max_parallel_calls: 1
+
+turns:
+  max_user_turns: 10
+  max_assistant_turns: 11
+
+images:
+  initial_rescale: 0.25
+  gpt_image_max_area: 12250000  # 3500 * 3500
+  crop_image_max_area: 1638400  # 1280 * 1280
+  initial_input_pixels_lower_bound: 0
+  region_zoom_in_factor: 2.0

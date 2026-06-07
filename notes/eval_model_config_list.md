@@ -1,7 +1,7 @@
 # Standalone Eval Model/Inference Configs
 
 This note lists only model and inference-related fields for the cleaned
-`--model_config` interface. Dataset, reward, export, resume, general runtime,
+`--model-config` interface. Dataset, reward, export, resume, general runtime,
 and agent behavior fields are intentionally omitted from model config.
 
 ## Model/Backend Schema
@@ -53,17 +53,17 @@ tokens are mask `1`, tool-observation tokens are mask `0`, and both consume the
 same trajectory budget. For direct API/no-tool eval there are no tool
 observations, so this is equivalent to `max_completion_tokens`.
 
-Downstream cleanup: API models should not require local tokenizer or processor
-paths. The current standalone code still has this temporary coupling because the
-HTTPS path goes through shared Qwen/VL dataset and agent-runner setup. After the
-config update, tokenizer and processor loading for local ray/vLLM models should
-simply default to the top-level `model`; separate tokenizer/processor fields
-should be omitted from the cleaned schema unless a future special case proves
-necessary.
+Downstream cleanup: API models do not require local tokenizer or processor
+paths. The `https_openai_chat` path reads parquet rows directly, sends
+OpenAI-compatible chat messages with image URLs, and follows provider-side
+context handling. Tokenizer and processor loading is only used by local
+`ray_vllm` models, where both default to the top-level `model`; separate
+tokenizer/processor fields are omitted from the cleaned schema unless a future
+special case proves necessary.
 
 ## Agent/Tool Schema Configs
 
-These fields should stay under `--agent-config`, not `--model_config`.
+These fields should stay under `--agent-config`, not `--model-config`.
 
 Tool availability should be controlled only by the tool list:
 

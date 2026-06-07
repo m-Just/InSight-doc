@@ -395,38 +395,24 @@ def build_eval_command(
     agent_config = resolve_agent_config(args.agent_config_template, rescale)
     cmd = [
         args.python,
-        str(REPO_ROOT / "evaluate.py"),
-        "--generation-backend",
-        args.generation_backend,
+        str(REPO_ROOT / "standalone_eval" / "rollout.py"),
+        "--model-config",
+        args.model_config,
         "--val-files",
         json.dumps([parquet]),
-        "--model-path",
-        args.model_path,
         "--output-dir",
         str(output_dir),
-        "--cache-dir",
-        str(output_dir / "cache" / "rlhf"),
         "--agent-config",
         agent_config,
-        "--agent-config-name",
-        args.agent_config_name,
         "--num-trials",
         str(args.num_trials),
-        "--run-name",
-        args.run_name,
-        "--trial-name",
-        f"{args.run_name}_{safe_name(benchmark)}_rescale{rescale_tag(rescale)}",
-        "--checkpoint-every",
-        str(args.checkpoint_every),
-        "--progress-every",
-        str(args.progress_every),
+        "--agent-worker-processes",
+        str(args.agent_worker_processes),
+        "--worker-concurrency",
+        str(args.worker_concurrency),
     ]
-    if args.resume_mode == "resume":
-        cmd.append("--resume")
-    elif args.resume_mode == "failed_only":
-        cmd.append("--resume-failed-only")
-    if args.resume_fail_reason_filters:
-        cmd.extend(["--resume-fail-reason-filters", args.resume_fail_reason_filters])
+    if args.ray_server_manifest:
+        cmd.extend(["--ray-server-manifest", args.ray_server_manifest])
     cmd.extend(passthrough_args)
     return cmd
 
@@ -446,38 +432,33 @@ def run_command(cmd: list[str], log_path: Path, dry_run: bool) -> int:
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
-        description="Run and summarize standalone evaluate.py sweeps over benchmarks, rescale ratios, and trials."
+        description="Run and summarize standalone rollout.py sweeps over benchmarks, rescale ratios, and trials."
     )
     parser.add_argument("--output-root", required=True)
-    parser.add_argument("--run-name", required=True)
-    parser.add_argument("--model-path", required=True)
-    parser.add_argument("--generation-backend", choices=["ray_vllm", "https_openai_chat"], default="ray_vllm")
+    parser.add_argument("--model-config", required=True)
+    parser.add_argument("--ray-server-manifest")
     parser.add_argument("--benchmark", action="append", default=[], help="Benchmark spec NAME=PARQUET. Can be repeated.")
     parser.add_argument("--benchmark-json", help="JSON object or path mapping benchmark names to parquet paths.")
     parser.add_argument("--rescale-ratios", required=True, help="Comma-separated or JSON list, e.g. 0.25,0.35,0.5")
     parser.add_argument("--num-trials", type=int, default=1)
+    parser.add_argument("--agent-worker-processes", type=int, default=1)
+    parser.add_argument("--worker-concurrency", type=int, required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument(
         "--agent-config-template",
         default="recipe/vsearch/config/agent_insight_qwen_agent_core_zoom_factor2_area3500_rescale{tag}.yaml",
         help="Format string with {rescale}, {tag}, or {rescale_tag}.",
     )
-    parser.add_argument("--agent-config-name", default="insight_qwen_agent_core")
-    parser.add_argument("--resume-mode", choices=["none", "resume", "failed_only"], default="failed_only")
-    parser.add_argument(
-        "--resume-fail-reason-filters",
-        default='["timeout","rate_limit","agent_runtime_exception","score_failed","missing_sample"]',
-    )
-    parser.add_argument("--checkpoint-every", type=int, default=1)
-    parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--summarize-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
     args, passthrough_args = parser.parse_known_args()
     if args.num_trials < 1:
         parser.error("--num-trials must be >= 1")
-    if args.checkpoint_every < 0:
-        parser.error("--checkpoint-every must be >= 0")
+    if args.agent_worker_processes < 1:
+        parser.error("--agent-worker-processes must be >= 1")
+    if args.worker_concurrency < 1:
+        parser.error("--worker-concurrency must be >= 1")
     return args, passthrough_args
 
 
