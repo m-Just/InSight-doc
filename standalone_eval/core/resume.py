@@ -123,17 +123,23 @@ def compare_basic_config(existing: dict[str, Any], current: dict[str, Any]) -> t
 
 def ensure_basic_config_compatible(output_dir: Path, *, basic_config: dict[str, Any]) -> None:
     basic_config_path = output_dir / "basic_config.json"
+    def has_content(path: Path) -> bool:
+        if not path.exists():
+            return False
+        if path.is_dir():
+            return any(path.iterdir())
+        return path.stat().st_size > 0
+
     prior_outputs = [
         path.name
         for path in (
-            basic_config_path,
             output_dir / "samples.jsonl",
             output_dir / "manifest.json",
             output_dir / "done",
             output_dir / "checkpoints",
             output_dir / "exported_conversations",
         )
-        if path.exists()
+        if has_content(path)
     ]
     if basic_config_path.exists():
         existing = json.loads(basic_config_path.read_text(encoding="utf-8"))
