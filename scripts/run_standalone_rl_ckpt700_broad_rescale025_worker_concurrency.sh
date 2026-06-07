@@ -26,7 +26,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-$REPO_ROOT/workspace/rl_ckpt700_broad_rescale025_globa
 mkdir -p "$OUTPUT_DIR/logs" "$OUTPUT_DIR/cache"
 
 VAL_FILES="${VAL_FILES:-[\"/scratch/ywxzml3j/likaican/temp/eval_data_0502_parquets/dude200-insight_qwen_agent.parquet\",\"/scratch/ywxzml3j/likaican/temp/eval_data_0502_parquets/longdocurl200-insight_qwen_agent.parquet\",\"/scratch/ywxzml3j/likaican/temp/eval_data_0502_parquets/mmlite200-insight_qwen_agent.parquet\",\"/scratch/ywxzml3j/likaican/temp/eval_data_0502_parquets/mmlongbench200-insight_qwen_agent.parquet\",\"/scratch/ywxzml3j/likaican/temp/eval_data_0502_parquets/mpdocvqa200-insight_qwen_agent.parquet\"]}"
-AGENT_CONFIG="${AGENT_CONFIG:-recipe/vsearch/config/agent_insight_qwen_agent_core_zoom_factor2_area3500_rescale025.yaml}"
+AGENT_CONFIG="${AGENT_CONFIG:-standalone_eval/agent_configs/insight_qwen_agent_core_zoom_factor2_area3500_rescale025.yaml}"
 MODEL_CONFIG="${MODEL_CONFIG:-$OUTPUT_DIR/model_config.yaml}"
 SERVER_MANIFEST="${SERVER_MANIFEST:-$OUTPUT_DIR/ray_vllm_server_manifest.json}"
 HEARTBEAT_PATH="${HEARTBEAT_PATH:-$OUTPUT_DIR/ray_vllm_server.heartbeat}"
