@@ -49,6 +49,7 @@ def build_summary_metrics(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "response_tokens_total",
         "response_tokens_generated",
         "response_tokens_tool",
+        "n_tool_calls",
         "n_valid_tool_calls",
         "accuracy_reward",
         "score",

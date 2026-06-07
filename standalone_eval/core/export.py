@@ -172,6 +172,7 @@ def build_ray_sample_record(
     ground_truth = (row.get("reward_model") or {}).get("ground_truth")
     sample_extra_info = dict(result.extra_fields.get("extra_info") or {})
     sample_extra_info["conversation_export_json_path"] = export_path
+    n_tool_calls = max((int(result.num_turns) - 2) // 2, 0)
     return {
         "sample_index": sample_index,
         "trial_idx": trial_idx,
@@ -185,6 +186,7 @@ def build_ray_sample_record(
         "critical_failure": result.export_payload.critical_failure,
         "failure_reasons": result.export_payload.final_failure_reasons,
         "num_turns": result.num_turns,
+        "n_tool_calls": n_tool_calls,
         "wall_time_s": time.perf_counter() - started,
         "core_inference_time": result.extra_fields.get("core_inference_time"),
         "core_inference_time_raw": result.extra_fields.get("core_inference_time_raw"),
@@ -214,6 +216,7 @@ def build_rollout_summary_metrics(samples: list[dict[str, Any]]) -> dict[str, An
         "response_tokens_total",
         "response_tokens_generated",
         "response_tokens_tool",
+        "n_tool_calls",
     ]
     data_sources = sorted({sample["data_source"] for sample in samples})
     for data_source in data_sources:

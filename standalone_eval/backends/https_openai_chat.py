@@ -495,6 +495,7 @@ class HTTPSOpenAIChatBackend:
             "critical_failure": bool(failure_reasons),
             "failure_reasons": failure_reasons,
             "num_turns": len(messages) + (1 if response_text else 0),
+            "n_tool_calls": 0,
             "wall_time_s": elapsed,
             "core_inference_time": timing["core_inference_time"],
             "core_inference_time_raw": timing["core_inference_time_raw"],
