@@ -30,6 +30,7 @@ AGENT_CONFIG="${AGENT_CONFIG:-recipe/vsearch/config/agent_insight_qwen_agent_cor
 MODEL_CONFIG="${MODEL_CONFIG:-$OUTPUT_DIR/model_config.yaml}"
 SERVER_MANIFEST="${SERVER_MANIFEST:-$OUTPUT_DIR/ray_vllm_server_manifest.json}"
 HEARTBEAT_PATH="${HEARTBEAT_PATH:-$OUTPUT_DIR/ray_vllm_server.heartbeat}"
+RAY_TMPDIR="${RAY_TMPDIR:-/tmp/rvllm_${RUN_ID:0:32}}"
 
 GPUS="${GPUS:-0,1,2,3}"
 AGENT_WORKER_PROCESSES="${AGENT_WORKER_PROCESSES:-8}"
@@ -77,7 +78,7 @@ CUDA_VISIBLE_DEVICES="$GPUS" "$PYTHON_BIN" -u scripts/serve_ray_vllm.py \
   --model-config "$MODEL_CONFIG" \
   --server-manifest "$SERVER_MANIFEST" \
   --heartbeat-path "$HEARTBEAT_PATH" \
-  --ray-temp-dir "/tmp/ray_worker_concurrency_${WORKER_CONCURRENCY}_${RUN_ID}" \
+  --ray-temp-dir "$RAY_TMPDIR" \
   --ray-namespace "standalone_worker_concurrency_${WORKER_CONCURRENCY}_${RUN_ID}" \
   > "$OUTPUT_DIR/logs/serve_ray_vllm.log" 2>&1 &
 serve_pid=$!
