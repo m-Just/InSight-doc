@@ -14,25 +14,34 @@ from typing import Any, Awaitable, Callable
 from transformers import AutoProcessor, AutoTokenizer
 
 from insight_agent_core import CoreFunctionCall, InSightQwenAgentRunner, StandaloneInSightRuntime
-from insight_agent_core.ray_vllm import RayVLLMEndpointPool
+from insight_agent_core.prompt_length import create_prompt_length_estimator
 from standalone_eval.config.agent import (
     DEFAULT_PROCESSOR_CONCURRENCY,
     apply_agent_settings_to_args,
     build_core_config,
     build_dataset_config,
     build_sampling_params,
+    build_prompt_signature,
     build_tool_schemas,
     describe_processor,
     infer_processor_image_patch_size,
     load_agent_settings,
 )
 from standalone_eval.backends.base import RolloutJob
+from standalone_eval.backends.ray_vllm_endpoint import RayVLLMEndpointPool
 from standalone_eval.backends.ray_vllm_servers import connect_ray_vllm_servers
 from standalone_eval.core.export import build_ray_sample_record, make_export_id
 from standalone_eval.core.resume import build_row_provenance
+from standalone_eval.core.tool_parser import ToolParser
 from standalone_eval.core.utils import json_safe, parse_list_arg
-from verl.experimental.agent_loop.tool_parser import ToolParser
 from verl.utils.dataset.rl_dataset import RLHFDataset
+
+
+def tokenizer_processor_kwargs(model_path: str | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"trust_remote_code": True}
+    if model_path and "glm" in str(model_path).lower():
+        kwargs["fix_mistral_regex"] = True
+    return kwargs
 
 
 def load_ray_server_manifest(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -94,12 +103,20 @@ def compute_worker_concurrency(args: argparse.Namespace, n_workers: int | None =
     return int(args.worker_concurrency)
 
 
+def resolve_dataset_image_patch_size(args: argparse.Namespace, processor: Any) -> int:
+    configured = getattr(args, "ray_processor_image_patch_size", None)
+    if configured is not None:
+        return int(configured)
+    return infer_processor_image_patch_size(processor)
+
+
 async def build_process_agent_runner_components(
     args_dict: dict[str, Any],
 ) -> tuple[argparse.Namespace, InSightQwenAgentRunner, Any, dict[str, Any]]:
     args = argparse.Namespace(**args_dict)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    runtime_processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
+    loader_kwargs = tokenizer_processor_kwargs(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, **loader_kwargs)
+    runtime_processor = AutoProcessor.from_pretrained(args.model_path, **loader_kwargs)
     if args.custom_chat_template_file:
         template = Path(args.custom_chat_template_file).read_text(encoding="utf-8")
         tokenizer.chat_template = template
@@ -109,7 +126,18 @@ async def build_process_agent_runner_components(
     apply_agent_settings_to_args(args, agent_settings)
     tool_schemas = build_tool_schemas(parse_list_arg(args.qwen_tool_list))
     core_config = build_core_config(args, agent_settings, tool_schemas)
+    prompt_length_estimator = create_prompt_length_estimator(
+        estimator_name=getattr(args, "ray_prompt_length_estimator", "tokenized"),
+        model_path=args.model_path,
+        require_supported=bool(getattr(args, "ray_require_prompt_length_estimator", False)),
+    )
     args._core_config_for_export = dict(core_config.__dict__)
+    args._prompt_signature_for_export = build_prompt_signature(
+        args,
+        agent_settings,
+        tool_schemas,
+        processor_metadata=describe_processor(runtime_processor),
+    )
     sampling_params = build_sampling_params(args)
 
     if args.generation_backend == "ray_vllm":
@@ -130,6 +158,8 @@ async def build_process_agent_runner_components(
         tool_call_extractor=extract_tool_calls,
         apply_chat_template_kwargs={"max_tool_calls": args.max_user_turns},
         processor_concurrency=DEFAULT_PROCESSOR_CONCURRENCY,
+        image_patch_size=resolve_dataset_image_patch_size(args, runtime_processor),
+        prompt_length_estimator=prompt_length_estimator,
     )
     runner = InSightQwenAgentRunner(core_config, runtime)
     return args, runner, tokenizer, sampling_params
@@ -224,6 +254,7 @@ class RayVLLMBackend:
         self.dataset_processor_metadata_after_dataset: dict[str, Any] = {}
         self.core_config = None
         self.sampling_params: dict[str, Any] = {}
+        self.prompt_signature: dict[str, Any] = {}
         self.ray_server_manifest: dict[str, Any] = {}
         self.server_metadata: list[dict[str, Any]] = []
         self.stop_ray_heartbeat = lambda: None
@@ -231,8 +262,9 @@ class RayVLLMBackend:
 
     async def prepare(self) -> None:
         args = self.args
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-        self.dataset_processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
+        loader_kwargs = tokenizer_processor_kwargs(args.model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(args.model_path, **loader_kwargs)
+        self.dataset_processor = AutoProcessor.from_pretrained(args.model_path, **loader_kwargs)
         if args.custom_chat_template_file:
             template = Path(args.custom_chat_template_file).read_text(encoding="utf-8")
             self.tokenizer.chat_template = template
@@ -243,10 +275,29 @@ class RayVLLMBackend:
             "standalone dataset processor before dataset: "
             f"{json.dumps(json_safe(self.dataset_processor_metadata_before_dataset), ensure_ascii=False)}"
         )
+        prompt_length_estimator = create_prompt_length_estimator(
+            estimator_name=getattr(args, "ray_prompt_length_estimator", "tokenized"),
+            model_path=args.model_path,
+            require_supported=bool(getattr(args, "ray_require_prompt_length_estimator", False)),
+        )
+        print(
+            "standalone prompt length estimator: "
+            f"name={prompt_length_estimator.name} "
+            f"required={bool(getattr(args, 'ray_require_prompt_length_estimator', False))} "
+            f"safety_margin={int(getattr(args, 'ray_prompt_length_safety_margin', 0) or 0)}",
+            flush=True,
+        )
 
         tool_schemas = build_tool_schemas(parse_list_arg(args.qwen_tool_list))
         self.core_config = build_core_config(args, self.agent_settings, tool_schemas)
         args._core_config_for_export = dict(self.core_config.__dict__)
+        self.prompt_signature = build_prompt_signature(
+            args,
+            self.agent_settings,
+            tool_schemas,
+            processor_metadata=self.dataset_processor_metadata_before_dataset,
+        )
+        args._prompt_signature_for_export = self.prompt_signature
         self.sampling_params = build_sampling_params(args)
 
         if args.generation_backend != "ray_vllm":
@@ -255,16 +306,18 @@ class RayVLLMBackend:
         self.stop_ray_heartbeat = start_ray_server_heartbeat(self.ray_server_manifest)
 
     async def load_rows(self, val_files: list[str], max_samples: int) -> list[dict[str, Any]]:
-        provenance = build_row_provenance(val_files, max_samples)
+        provenance = build_row_provenance(val_files, -1)
+        image_patch_size = resolve_dataset_image_patch_size(self.args, self.dataset_processor)
+        print(f"standalone dataset image_patch_size: {image_patch_size}", flush=True)
         dataset = RLHFDataset(
             data_files=val_files,
             tokenizer=self.tokenizer,
             processor=self.dataset_processor,
             config=build_dataset_config(
                 self.args,
-                image_patch_size=infer_processor_image_patch_size(self.dataset_processor),
+                image_patch_size=image_patch_size,
             ),
-            max_samples=max_samples,
+            max_samples=-1,
         )
         if len(dataset) != len(provenance):
             raise RuntimeError(
@@ -280,6 +333,13 @@ class RayVLLMBackend:
         rows = []
         for idx in range(len(dataset)):
             row = dataset[idx]
+            row_agent_name = row.get("agent_name")
+            if row_agent_name and str(row_agent_name) != str(self.args.agent_name):
+                raise ValueError(
+                    "standalone eval agent config does not match parquet row agent_name: "
+                    f"row={row_agent_name!r} config={self.args.agent_name!r} "
+                    f"file={provenance[idx][0]} row_idx={provenance[idx][1]}"
+                )
             resume_val_file, resume_file_row_idx = provenance[idx]
             row["resume_val_file"] = resume_val_file
             row["resume_file_row_idx"] = int(resume_file_row_idx)
@@ -290,6 +350,7 @@ class RayVLLMBackend:
 
     def basic_config_extra(self) -> dict[str, Any]:
         return {
+            "prompt_signature": self.prompt_signature,
             "ray_server_manifest": {
                 "model_config_sha256": (self.ray_server_manifest.get("model_config") or {}).get("sha256"),
             }
@@ -383,6 +444,7 @@ class RayVLLMBackend:
     def manifest_extra(self) -> dict[str, Any]:
         return {
             "core_config": self.core_config.__dict__ if self.core_config is not None else None,
+            "prompt_signature": self.prompt_signature,
             "sampling_params": self.sampling_params,
             "ray_server_manifest": {
                 "path": str(Path(self.args.ray_server_manifest).resolve()),

@@ -32,6 +32,7 @@ from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
+import psutil
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
@@ -78,6 +79,204 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.vreasoner_v2_conversation_export import build_repeated_conversation_export_id
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+_DEBUG_MEM_ENABLED = os.environ.get("VERL_DEBUG_MEM", "").lower() in {"1", "true", "yes", "on"}
+_DEBUG_MEM_PROCESS = psutil.Process(os.getpid()) if _DEBUG_MEM_ENABLED else None
+
+
+def _tensor_size_gb(tensor) -> float:
+    if not hasattr(tensor, "element_size") or not hasattr(tensor, "numel"):
+        return 0.0
+    return tensor.element_size() * tensor.numel() / (1024**3)
+
+
+def _summarize_tensor_tokens(tensor) -> int:
+    if tensor is None or not hasattr(tensor, "detach"):
+        return 0
+    return int(tensor.detach().sum().item())
+
+
+def _tensor_row_token_sums(tensor) -> list[int]:
+    if tensor is None or not hasattr(tensor, "detach"):
+        return []
+    rows = int(tensor.shape[0]) if len(tensor.shape) > 0 else 1
+    if rows == 0:
+        return []
+    if tensor.numel() == 0:
+        return [0] * rows
+    row_sums = tensor.detach().reshape(rows, -1).sum(dim=-1).cpu().tolist()
+    return [int(value) for value in row_sums]
+
+
+def _max_equal_chunk_sum(values: list[int | float], chunks: int | None) -> int | float:
+    if not values or chunks is None or chunks <= 0:
+        return 0
+    if len(values) % chunks == 0:
+        chunk_size = len(values) // chunks
+        return max(sum(values[i * chunk_size : (i + 1) * chunk_size]) for i in range(chunks))
+    return max(sum(chunk.tolist()) for chunk in np.array_split(np.asarray(values), chunks))
+
+
+def _collect_batch_memory_risk_stats(batch: DataProto, dp_size: int | None = None) -> dict[str, int | float]:
+    stats: dict[str, int | float] = {
+        "image_items": 0,
+        "image_count": 0,
+        "image_tokens_sum": 0,
+        "image_tokens_max": 0,
+        "pixel_values_gb": 0.0,
+        "valid_tokens_sum": 0,
+        "response_tokens_sum": 0,
+        "prompt_tokens_sum": 0,
+        "max_image_tokens_sum_per_dp": 0,
+        "max_pixel_values_gb_per_dp": 0.0,
+        "max_valid_tokens_sum_per_dp": 0,
+        "max_response_tokens_sum_per_dp": 0,
+        "max_prompt_tokens_sum_per_dp": 0,
+    }
+
+    if batch is None:
+        return stats
+
+    batch_len = len(batch)
+    image_tokens_per_item: list[int] = [0] * batch_len
+    pixel_values_gb_per_item: list[float] = [0.0] * batch_len
+
+    if batch.batch is not None:
+        valid_tokens_per_item = _tensor_row_token_sums(batch.batch.get("attention_mask"))
+        response_tokens_per_item = _tensor_row_token_sums(batch.batch.get("response_mask"))
+        if valid_tokens_per_item and not response_tokens_per_item:
+            response_tokens_per_item = [0] * len(valid_tokens_per_item)
+        prompt_tokens_per_item = [
+            max(0, valid - response)
+            for valid, response in zip(valid_tokens_per_item, response_tokens_per_item, strict=False)
+        ]
+        valid_tokens_sum = sum(valid_tokens_per_item)
+        response_tokens_sum = sum(response_tokens_per_item)
+        stats["valid_tokens_sum"] = valid_tokens_sum
+        stats["response_tokens_sum"] = response_tokens_sum
+        stats["prompt_tokens_sum"] = max(0, valid_tokens_sum - response_tokens_sum)
+        stats["max_valid_tokens_sum_per_dp"] = _max_equal_chunk_sum(valid_tokens_per_item, dp_size)
+        stats["max_response_tokens_sum_per_dp"] = _max_equal_chunk_sum(response_tokens_per_item, dp_size)
+        stats["max_prompt_tokens_sum_per_dp"] = _max_equal_chunk_sum(prompt_tokens_per_item, dp_size)
+
+    if batch.non_tensor_batch is None or "multi_modal_inputs" not in batch.non_tensor_batch:
+        return stats
+
+    for item_idx, item in enumerate(batch.non_tensor_batch["multi_modal_inputs"]):
+        if not isinstance(item, dict) or not item:
+            continue
+        stats["image_items"] += 1
+        item_image_tokens = 0
+
+        grid = item.get("image_grid_thw")
+        if grid is not None:
+            try:
+                if hasattr(grid, "detach"):
+                    grid_arr = grid.detach().reshape(-1, 3).cpu().numpy()
+                else:
+                    grid_arr = np.asarray(grid).reshape(-1, 3)
+                per_image_tokens = grid_arr.prod(axis=1)
+                stats["image_count"] += int(len(per_image_tokens))
+                item_image_tokens = int(per_image_tokens.sum())
+                stats["image_tokens_sum"] += item_image_tokens
+                stats["image_tokens_max"] = max(
+                    int(stats["image_tokens_max"]), int(per_image_tokens.max(initial=0))
+                )
+            except Exception:
+                pass
+        if item_idx < len(image_tokens_per_item):
+            image_tokens_per_item[item_idx] = item_image_tokens
+
+        pixel_values = item.get("pixel_values")
+        if pixel_values is not None:
+            item_pixel_values_gb = _tensor_size_gb(pixel_values)
+            stats["pixel_values_gb"] += item_pixel_values_gb
+            if item_idx < len(pixel_values_gb_per_item):
+                pixel_values_gb_per_item[item_idx] = item_pixel_values_gb
+
+    stats["max_image_tokens_sum_per_dp"] = _max_equal_chunk_sum(image_tokens_per_item, dp_size)
+    stats["max_pixel_values_gb_per_dp"] = _max_equal_chunk_sum(pixel_values_gb_per_item, dp_size)
+
+    return stats
+
+
+def _summarize_multi_modal_inputs(batch: DataProto) -> str:
+    if batch is None or batch.non_tensor_batch is None or "multi_modal_inputs" not in batch.non_tensor_batch:
+        return "mm=none"
+
+    stats = _collect_batch_memory_risk_stats(batch)
+    pixel_values_shapes = []
+
+    for item in batch.non_tensor_batch["multi_modal_inputs"]:
+        if not isinstance(item, dict) or not item:
+            continue
+        pixel_values = item.get("pixel_values")
+        if pixel_values is not None:
+            if len(pixel_values_shapes) < 5 and hasattr(pixel_values, "shape"):
+                pixel_values_shapes.append(str(tuple(pixel_values.shape)))
+
+    return (
+        f"mm_items={stats['image_items']} images={stats['image_count']} "
+        f"image_tokens_sum={stats['image_tokens_sum']} image_tokens_max={stats['image_tokens_max']} "
+        f"pixel_values_gb={stats['pixel_values_gb']:.3f} "
+        f"pixel_shapes={pixel_values_shapes}"
+    )
+
+
+def _get_oom_risk_skip_reason(config, batch: DataProto, dp_size: int | None = None) -> str | None:
+    skip_config = config.trainer.get("skip_oom_risk_batch", None)
+    if not skip_config:
+        return None
+    if not skip_config.get("enabled", True):
+        return None
+
+    stats = _collect_batch_memory_risk_stats(batch, dp_size=dp_size)
+    threshold_keys = {
+        "max_image_tokens_sum": "image_tokens_sum",
+        "max_image_tokens_sum_per_dp": "max_image_tokens_sum_per_dp",
+        "max_image_tokens_per_image": "image_tokens_max",
+        "max_images": "image_count",
+        "max_pixel_values_gb": "pixel_values_gb",
+        "max_pixel_values_gb_per_dp": "max_pixel_values_gb_per_dp",
+        "max_valid_tokens_sum": "valid_tokens_sum",
+        "max_valid_tokens_sum_per_dp": "max_valid_tokens_sum_per_dp",
+        "max_prompt_tokens_sum": "prompt_tokens_sum",
+        "max_prompt_tokens_sum_per_dp": "max_prompt_tokens_sum_per_dp",
+        "max_response_tokens_sum": "response_tokens_sum",
+        "max_response_tokens_sum_per_dp": "max_response_tokens_sum_per_dp",
+    }
+    reasons = []
+    for config_key, stats_key in threshold_keys.items():
+        limit = skip_config.get(config_key, None)
+        if limit is None:
+            continue
+        value = stats[stats_key]
+        if float(value) > float(limit):
+            reasons.append(f"{stats_key}={value} > {config_key}={limit}")
+
+    if not reasons:
+        return None
+    stats_summary = ", ".join(f"{key}={value}" for key, value in stats.items())
+    return "; ".join(reasons) + f" ({stats_summary})"
+
+
+def _debug_mem(label: str, batch: DataProto | None = None) -> None:
+    if not _DEBUG_MEM_ENABLED:
+        return
+
+    rss_gb = _DEBUG_MEM_PROCESS.memory_info().rss / (1024**3)
+    parts = [f"DEBUG_MEM {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} rss_gb={rss_gb:.3f}", label]
+    if batch is not None:
+        tensor_gb = sum(_tensor_size_gb(tensor) for tensor in batch.batch.values()) if batch.batch is not None else 0.0
+        non_tensor_gb = (
+            sum(array.nbytes for array in batch.non_tensor_batch.values()) / (1024**3)
+            if batch.non_tensor_batch is not None
+            else 0.0
+        )
+        parts.append(f"batch_len={len(batch)} tensor_gb={tensor_gb:.3f} non_tensor_array_gb={non_tensor_gb:.6f}")
+        parts.append(_summarize_multi_modal_inputs(batch))
+    print(" | ".join(parts), flush=True)
 
 
 def _question_type_contains_not_answerable(question_type: Any) -> bool:
@@ -2351,6 +2550,8 @@ class RayPPOTrainer:
 
     def _force_concat(self, batch_train: DataProto, batch_other: DataProto, train_first: bool = True) -> DataProto:
         print(f"DEBUG: _force_concat: {len(batch_train)=}, {len(batch_other)=}, {train_first=}")
+        _debug_mem("_force_concat start batch_train", batch_train)
+        _debug_mem("_force_concat start batch_other", batch_other)
         for key, val in batch_train.batch.items():
             if key not in batch_other.batch.keys():
                 tensor_size = (len(batch_other), *val.shape[1:])
@@ -2360,7 +2561,11 @@ class RayPPOTrainer:
             if key not in batch_other.non_tensor_batch.keys():
                 print(f'DEBUG: _force_concat: adding dummy placeholders of size {len(batch_other)} for "{key}"')
                 batch_other.non_tensor_batch[key] = np.array([None] * len(batch_other), dtype=object)
-        return DataProto.concat([batch_train, batch_other] if train_first else [batch_other, batch_train])
+        _debug_mem("_force_concat before DataProto.concat batch_train", batch_train)
+        _debug_mem("_force_concat before DataProto.concat batch_other", batch_other)
+        output = DataProto.concat([batch_train, batch_other] if train_first else [batch_other, batch_train])
+        _debug_mem("_force_concat after DataProto.concat", output)
+        return output
 
     def fit(self):
         """
@@ -2569,6 +2774,20 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+
+                    oom_risk_skip_reason = _get_oom_risk_skip_reason(
+                        self.config, batch, dp_size=self._get_dp_size(self.actor_rollout_wg, "actor")
+                    )
+                    if oom_risk_skip_reason is not None:
+                        print(
+                            f"WARNING: skipping OOM-risk batch at global_step={self.global_steps}: "
+                            f"{oom_risk_skip_reason}",
+                            flush=True,
+                        )
+                        with marked_timer("stop_profile", timing_raw):
+                            self._stop_profiling(curr_step_profile)
+                        continue
+
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # append the main-agent/subagent batch back to the original batch for reward computation
                         if not self.config.trainer.get("train_on_main_agent_response", True):
@@ -2681,8 +2900,12 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            _debug_mem("before _compute_ref_log_prob", batch)
                             ref_log_prob = self._compute_ref_log_prob(batch)
+                            _debug_mem("after _compute_ref_log_prob input batch", batch)
+                            _debug_mem("after _compute_ref_log_prob ref_log_prob", ref_log_prob)
                             batch = batch.union(ref_log_prob)
+                            _debug_mem("after union ref_log_prob", batch)
 
                     # compute values
                     if self.use_critic:
@@ -2691,6 +2914,7 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
+                        _debug_mem("adv start", batch)
                         # append the main-agent/subagent batch back to the original batch for reward computation
                         if not self.config.trainer.get("train_on_main_agent_response", True):
                             batch = self._force_concat(batch, main_agent_batch, train_first=False)
@@ -2701,6 +2925,7 @@ class RayPPOTrainer:
                             batch = self._force_concat(batch, vreasoner_batch)
 
                         # we combine with rule-based rm
+                        _debug_mem("adv after optional force_concat", batch)
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             if self.config.reward_model.get("reward_fn_async_backend", "ray") == "ray":
@@ -2711,7 +2936,9 @@ class RayPPOTrainer:
                                 )
                                 if reward_tensor is None:  # fallback to synchronous computation
                                     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                        _debug_mem("adv before token_level_scores assignment", batch)
                         batch.batch["token_level_scores"] = reward_tensor
+                        _debug_mem("adv after token_level_scores assignment", batch)
 
                         if self.config.get("use_vsearch", False):
                             batch.non_tensor_batch.pop("critical_failure", None)
@@ -2723,6 +2950,7 @@ class RayPPOTrainer:
                             batch.non_tensor_batch.update(
                                 {k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()}
                             )
+                            _debug_mem("adv after reward_extra_infos update", batch)
 
                         # score computation may fail occasionally (e.g., due to GPT API error)
                         # we tolerate a small number of failed samples by replacing them with successful ones
@@ -2770,6 +2998,7 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        _debug_mem("adv after token_level_rewards", batch)
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -2800,6 +3029,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        _debug_mem("adv after compute_advantage", batch)
 
                         if not self.config.trainer.get("train_on_vreasoner_response", True):
                             vreasoner_idxs = np.where(batch.non_tensor_batch["agent_name"] == "vreasoner")[0]

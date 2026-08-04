@@ -91,6 +91,7 @@ setup(
     package_data={
         "": ["version/*"],
         "verl": ["trainer/config/*.yaml"],
+        "insight_agent_core": ["configs/*.yaml"],
     },
     include_package_data=True,
     long_description=long_description,

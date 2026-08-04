@@ -10,15 +10,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 for extra_path in (
     REPO_ROOT,
     Path("/scratch/ywxzml3j/likaican/src/InSight-o3"),
-    Path("/scratch/ywxzml3j/likaican/src/Qwen-Agent"),
 ):
     if extra_path.exists() and str(extra_path) not in sys.path:
         sys.path.insert(0, str(extra_path))
 
 from standalone_eval.config.agent import apply_agent_settings_to_args, load_agent_settings
-from standalone_eval.backends.https_openai_chat import HTTPSOpenAIChatBackend
-from standalone_eval.backends.ray_vllm import RayVLLMBackend
-from standalone_eval.config.model import apply_model_config, load_model_config, sha256_file
+from standalone_eval.config.model import (
+    apply_model_config,
+    load_model_config,
+    normalize_https_max_retries,
+    normalize_https_timeout,
+    semantic_model_config_sha256,
+    sha256_file,
+)
 from standalone_eval.core.orchestrator import run_rollout
 
 
@@ -41,6 +45,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-samples", type=int, default=-1)
     parser.add_argument("--num-trials", type=int, default=1)
+    parser.add_argument(
+        "--shuffle-rows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Shuffle loaded val rows before trial expansion. Enabled by default for cross-benchmark load balancing.",
+    )
+    parser.add_argument("--shuffle-seed", type=int, default=42)
     parser.add_argument("--agent-worker-processes", type=int, default=1)
     parser.add_argument(
         "--worker-concurrency",
@@ -52,18 +63,38 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--ray-server-manifest", help="Manifest written by scripts/serve_ray_vllm.py.")
-    parser.add_argument("--api-timeout-max-retries", type=int, default=1)
-    parser.add_argument("--api-timeout-retry-backoff-seconds", type=float, default=3.0)
     parser.add_argument("--context-overflow-max-halving-trials", type=int, default=4)
+    parser.add_argument(
+        "--https-timeout-override",
+        help=(
+            "Override https_openai_chat.timeout from --model-config without changing resume identity. "
+            "Use only for transport retries against the same model/data/config."
+        ),
+    )
+    parser.add_argument(
+        "--https-max-retries-override",
+        help=(
+            "Override https_openai_chat.max_retries from --model-config without changing resume identity. "
+            "Use only for transport retries against the same model/data/config."
+        ),
+    )
     args = parser.parse_args()
 
     model_config_data = load_model_config(args.model_config)
     model_config_sha256 = sha256_file(args.model_config)
+    model_config_semantic_sha256 = semantic_model_config_sha256(model_config_data)
     apply_model_config(args, model_config_data)
     args._model_config_data = model_config_data
     args._model_config_sha256 = model_config_sha256
+    args._model_config_semantic_sha256 = model_config_semantic_sha256
     args.custom_chat_template_file = None
     args.logprobs = False
+
+    if args.generation_backend == "https_openai_chat":
+        if args.https_timeout_override is not None:
+            args.https_timeout = normalize_https_timeout(args.https_timeout_override)
+        if args.https_max_retries_override is not None:
+            args.https_max_retries = normalize_https_max_retries(args.https_max_retries_override)
 
     if args.max_samples == 0:
         parser.error("--max-samples=0 is not useful for eval; use -1 for uncapped or a positive cap")
@@ -83,8 +114,12 @@ async def async_main(args: argparse.Namespace) -> None:
     apply_agent_settings_to_args(args, agent_settings)
     export_dir = Path(args.output_dir) / "exported_conversations"
     if args.generation_backend == "ray_vllm":
+        from standalone_eval.backends.ray_vllm import RayVLLMBackend
+
         backend = RayVLLMBackend(args, agent_settings, export_dir)
     elif args.generation_backend == "https_openai_chat":
+        from standalone_eval.backends.https_openai_chat import HTTPSOpenAIChatBackend
+
         backend = HTTPSOpenAIChatBackend(args, agent_settings, export_dir)
     else:
         raise ValueError(f"unsupported generation backend: {args.generation_backend}")

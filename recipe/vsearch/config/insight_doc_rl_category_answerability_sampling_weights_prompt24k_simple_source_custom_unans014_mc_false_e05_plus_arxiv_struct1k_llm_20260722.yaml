@@ -1,0 +1,55 @@
+# Sampling weights for RL 16k prompt24k + MC false-E + LLM-rewritten arXiv structural 1k add-on
+#
+# Base parquet:
+# notes/generated/rl_16k_prompt24k_r05_to_r035_simple_datasource_plus_mc_false_e05_20260705/insight_doc_rl_16k_prompt24k_r05_to_r035_simple_datasource_plus_mc_false_e_filtered-insight_qwen_agent.parquet
+#
+# LLM-rewritten structural add-on parquet:
+# notes/generated/arxiv_struct_rewrite_full_1000_llm_20260722/rewritten_sample.parquet
+#
+# Combined parquet:
+# notes/generated/rl_16k_prompt24k_r05_to_r035_simple_datasource_plus_mc_false_e05_plus_arxiv_struct1k_llm_20260722/insight_doc_rl_16k_prompt24k_r05_to_r035_simple_datasource_plus_mc_false_e_arxiv_struct1k_llm-insight_qwen_agent.parquet
+#
+# Design:
+# - Preserve the existing 14% unanswerable mass.
+# - Add 5% total mass for LLM-rewritten arXiv structural LongDocURL-like rows.
+# - Steal the 5% only from answerable arXiv rows:
+#   - 2.8% from arxiv_veqa_answerable for single-answer structural rows.
+#   - 2.2% from arxiv_mveqa_answerable for list-answer structural rows.
+# - Split the add-on mass across r0.25/r0.35/r0.5 according to the original
+#   answerable arXiv rescale mix in the current RL parquet.
+#
+# Totals:
+# - answerable sources: 86%
+# - unanswerable sources: 14%
+# - LLM-rewritten arXiv structural add-on: 5% of all samples
+weights:
+  arxiv_mveqa_answerable: 0.13216666666665
+  arxiv_mveqa_answerable_mc_false_e: 0.00043658088235294
+  arxiv_mveqa_unanswerable: 0.021316872428000001
+  arxiv_struct_list_answerable_r025: 0.014689290436315556
+  arxiv_struct_list_answerable_r035: 0.0064186866460996033
+  arxiv_struct_list_answerable_r05: 0.00089202291758483908
+  arxiv_struct_single_answerable_r025: 0.018547467007237122
+  arxiv_struct_single_answerable_r035: 0.0082605363984674333
+  arxiv_struct_single_answerable_r05: 0.001191996594295445
+  arxiv_veqa_answerable: 0.12616666666665
+  arxiv_veqa_answerable_mc_false_e: 0.012913602941176
+  arxiv_veqa_unanswerable: 0.021316872428000001
+  docvqa_answerable: 0.083333333333289003
+  docvqa_answerable_mc_false_e: 0.0048253676470588003
+  docvqa_unanswerable: 0.0115226337449
+  dude_answerable: 0.18749999999992001
+  dude_answerable_mc_false_e: 0.0087545955882352994
+  dude_unanswerable: 0.025925925925900001
+  info_answerable: 0.028992248062000001
+  info_answerable_mc_false_e: 0.0017003676470587999
+  info_unanswerable: 0.0092181069958800002
+  map_metro_answerable: 0.11957364341057999
+  map_metro_answerable_mc_false_e: 0.0079733455882353005
+  map_metro_unanswerable: 0.023045267489700001
+  map_travel_answerable: 0.033333333333372003
+  map_travel_answerable_mc_false_e: 0.0095128676470588001
+  map_travel_unanswerable: 0.0046090534979400001
+  poster_answerable: 0.048934108527142001
+  poster_answerable_mc_false_e: 0.0038832720588235
+  poster_unanswerable: 0.023045267489700001

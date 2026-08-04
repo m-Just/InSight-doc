@@ -9,9 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from standalone_eval.core.resume import EXPORT_GLOBAL_STEP, EXPORT_SPLIT, EXPORT_VALIDATE
-from standalone_eval.core.utils import json_safe
-from verl.experimental.agent_loop.qwen_agent_loop import _build_insight_export_conversation
 from verl.utils.vreasoner_v2_conversation_export import (
+    build_insight_export_conversation,
     build_export_record,
     build_repeated_conversation_export_id,
     build_root_conversation_export_id,
@@ -55,6 +54,7 @@ def export_ray_result(
     payload = result.export_payload
     initial_question = payload.extra_info.get("question", "")
     core_export = getattr(args, "_core_config_for_export", {}) or {}
+    prompt_signature = getattr(args, "_prompt_signature_for_export", {}) or {}
     model_config_path = getattr(args, "model_config", None)
     model_config_sha256 = getattr(args, "_model_config_sha256", None)
     record = build_export_record(
@@ -94,6 +94,7 @@ def export_ray_result(
             "gpt_image_max_area": core_export.get("gpt_image_max_area"),
             "crop_image_max_area": core_export.get("crop_image_max_area"),
             "region_zoom_in_factor": core_export.get("region_zoom_in_factor"),
+            "prompt_signature_sha256": prompt_signature.get("sha256"),
             "model_config_path": str(Path(model_config_path).resolve()) if model_config_path else None,
             "model_config_sha256": model_config_sha256,
             "lengths": {
@@ -111,6 +112,7 @@ def export_ray_result(
                 "core_inference_time": result.extra_fields.get("core_inference_time", 0.0),
                 "conversation_wall_time": result.extra_fields.get("conversation_wall_time", 0.0),
             },
+            "turn_trace": result.extra_fields.get("turn_trace", []),
             "agent_name": args.agent_name,
         },
         sampling_params=dict(sampling_params),
@@ -121,7 +123,7 @@ def export_ray_result(
         final_failure_reasons=payload.final_failure_reasons,
     )
     record["agent_name"] = args.agent_name
-    record["conversation"] = _build_insight_export_conversation(payload.messages, initial_question=initial_question)
+    record["conversation"] = build_insight_export_conversation(payload.messages, initial_question=initial_question)
     record["job"].update(
         {
             "global_step": EXPORT_GLOBAL_STEP,
@@ -198,6 +200,7 @@ def build_ray_sample_record(
         "response_tokens_total": result.extra_fields.get("response_tokens_total"),
         "response_tokens_generated": result.extra_fields.get("response_tokens_generated"),
         "response_tokens_tool": result.extra_fields.get("response_tokens_tool"),
+        "turn_trace": result.extra_fields.get("turn_trace", []),
         "is_not_answerable": question_type_contains_not_answerable(sample_extra_info.get("question_type"))
         or ground_truth_is_not_answerable(ground_truth),
     }

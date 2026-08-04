@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 from collections import defaultdict
@@ -28,6 +29,126 @@ from insight_o3 import prompts as insight_o3_prompts  # pyright: ignore[reportMi
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _judge_completion_token_budget(default: int = 2048) -> int:
+    raw_value = os.getenv("JUDGE_MAX_COMPLETION_TOKENS")
+    if raw_value is None:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        logger.warning("Invalid JUDGE_MAX_COMPLETION_TOKENS=%r; using default %s", raw_value, default)
+        return default
+
+
+def _judge_completion_token_kwargs(judge_model: str, default: int = 2048) -> dict[str, int]:
+    budget = _judge_completion_token_budget(default)
+    if judge_model.lower().startswith("gpt-5"):
+        return {"max_completion_tokens": budget}
+    return {"max_tokens": budget}
+
+
+VERIFY_WITH_RAW_FINAL_ANSWER_PROMPT = """
+You are given an image/document question, the ground truth (GT) answer, an extracted model answer, and the model's full final answer text.
+
+Decide whether the model answered the question correctly.
+
+Rules:
+- Mark <correct> when the final answer gives the same answer as GT. Semantically equivalent wording is okay for descriptive answers.
+- Ignore harmless formatting differences: punctuation, capitalization, whitespace, equivalent units, and clearly approximate numeric rounding.
+- For names, labels, organizations, IDs, option letters, dates, numbers, and extracted text, require the exact essential identifier. Do not accept spelling/OCR variants, missing characters, or extra characters inside the identifier unless GT explicitly lists aliases.
+- A full-name or expanded-name answer is correct for a shorter GT name only when it contains the GT name as an exact token/string and does not identify a different entity.
+- For titles, sections, headings, or paragraph-selection questions, the core GT text must be identified or quoted; ignore only location/source/caption context, not broader parent items, narrower child items, neighboring items, or extra distinct selections.
+- For list, multi-part, or selection questions, require the exact requested item set: all essential GT items must be present, and broader parent items, merely related items, or extra distinct items are wrong.
+- If GT is unanswerable, mark <correct> only when the final answer clearly says the answer cannot be determined, the requested page/table/field/item is absent, no matching item exists, or none satisfy the question.
+- If the final answer's conclusion is wrong, unavailable, or contradicted by its own text, mark <wrong> even if it mentions the GT in passing.
+- If uncertain, reply with <wrong>.
+
+Only reply with <correct> or <wrong>, no explanations.
+
+Question: {question}
+GT Answer: {gt_answer}
+Extracted Model Answer: {extracted_answer}
+Full Final Answer: {full_final_answer}
+""".strip()
+
+
+VERIFY_FINAL_ANSWER_ONLY_PROMPT = """
+You are given an image/document question, the ground truth (GT) answer, and the model's final answer text.
+
+Decide whether the model answered the question correctly.
+
+Rules:
+- Mark <correct> when the final answer gives the same answer as GT. Semantically equivalent wording is okay for descriptive answers.
+- Ignore harmless formatting differences: punctuation, capitalization, whitespace, equivalent units, and clearly approximate numeric rounding.
+- For names, labels, organizations, IDs, option letters, dates, numbers, and extracted text, require the exact essential identifier. Do not accept spelling/OCR variants, missing characters, or extra characters inside the identifier unless GT explicitly lists aliases.
+- A full-name or expanded-name answer is correct for a shorter GT name only when it contains the GT name as an exact token/string and does not identify a different entity.
+- For titles, sections, headings, or paragraph-selection questions, the core GT text must be identified or quoted; ignore only location/source/caption context, not broader parent items, narrower child items, neighboring items, or extra distinct selections.
+- For list, multi-part, or selection questions, require the exact requested item set: all essential GT items must be present, and broader parent items, merely related items, or extra distinct items are wrong.
+- If GT is unanswerable, mark <correct> only when the final answer clearly says the answer cannot be determined, the requested page/table/field/item is absent, no matching item exists, or none satisfy the question.
+- If the final answer's conclusion is wrong, unavailable, or contradicted by its own text, mark <wrong> even if it mentions the GT in passing.
+- If uncertain, reply with <wrong>.
+
+Only reply with <correct> or <wrong>, no explanations.
+
+Question: {question}
+GT Answer: {gt_answer}
+Final Answer: {full_final_answer}
+""".strip()
+
+
+LEGACY_PROMPT_V2_OPEN_QA_EXTRACTION_PROMPT = """
+You are given a question and a model-generated final response.
+Your task is to extract the model's final answer for later grading.
+
+Instructions:
+- Prefer content inside <answer>...</answer> or \\boxed{{...}}; otherwise take the last decisive span.
+- Keep the answer concise, but do not drop requested answer content or a stated no-answer/refusal.
+- Do not invent, infer, or repair missing answer content.
+- Output only the extracted answer text.
+
+Question: {question}
+Model Response: {model_response}
+
+Extracted Answer:
+""".strip()
+
+
+LEGACY_PROMPT_V2_MCQA_EXTRACTION_PROMPT = """
+You are given a multiple-choice question with options and a model-generated final answer.
+Your task is to extract the option letter selected by the model.
+
+Instructions:
+- Output only one option letter, such as A, B, C, D, or E.
+- Use the final selected option, not options merely mentioned or rejected in reasoning.
+- If no option is selected or the selection is ambiguous, output UNKNOWN.
+
+Question: {question}
+Options: {options}
+Model Answer: {model_answer}
+
+Selected Option:
+""".strip()
+
+
+LEGACY_PROMPT_V2_QA_VERIFY_PROMPT = """
+You are given an image/document question, the ground truth (GT) answer, and a model's extracted answer.
+
+Compare the model's answer with the GT answer.
+
+Rules:
+- Mark <correct> only when the model answer gives the same answer as GT. Semantically equivalent wording is okay.
+- If GT is answerable and the model answer says it cannot answer or cannot determine the answer, mark <wrong>.
+- If GT says the question is not answerable, mark <correct> only when the model answer also says the answer cannot be determined or is absent.
+- If uncertain, reply with <wrong>.
+
+Only reply with <correct> or <wrong>, no explanations.
+
+Question: {question}
+GT Answer: {gt_answer}
+Model Answer: {model_answer}
+""".strip()
 
 
 class ParseError(Exception): pass
@@ -492,6 +613,510 @@ def _normalize_judge_extracted_answer(text: str | None) -> str | None:
     return candidate or None
 
 
+def _extract_raw_final_answer_for_judge(final_message: str) -> str:
+    raw_answer = _extract_last_tagged_content(final_message, "answer")
+    if raw_answer is None:
+        raw_answer = _extract_last_boxed_answer(final_message)
+    if raw_answer is None:
+        raw_answer = final_message.strip()
+    return _crop_judge_answer_context(raw_answer)
+
+
+def _is_not_answerable_text(text: str) -> bool:
+    normalized = normalize_answer(text)
+    return any(
+        phrase in normalized
+        for phrase in (
+            "not answerable",
+            "cannot answer",
+            "can not answer",
+            "cannot be determined",
+            "can not be determined",
+            "cannot determine",
+            "can not determine",
+            "not provided",
+            "not available",
+            "not explicitly derived",
+            "cannot be explicitly derived",
+            "can not be explicitly derived",
+        )
+    )
+
+
+def _raw_final_answer_matches_not_answerable(full_final_answer: str) -> bool:
+    normalized = normalize_answer(full_final_answer)
+    if _is_not_answerable_text(full_final_answer):
+        return True
+    return bool(
+        re.search(r"\bnone\b", normalized)
+        or re.search(r"\bno (?:listed )?(?:candidate|item|person|president|option|answer|matching item)\b", normalized)
+        or re.search(r"\bno [a-z0-9 ]{0,80}\b(?:satisf(?:y|ies|ied)|match(?:es|ed)?|had|has)\b", normalized)
+    )
+
+
+def _raw_final_answer_is_hierarchy_leaf_only(ground_truth: str, full_final_answer: str) -> bool:
+    """Detect path-like GTs where the answer only gives the leaf title."""
+
+    if ">" not in str(ground_truth):
+        return False
+    parts = [normalize_answer(part) for part in str(ground_truth).split(">")]
+    parts = [part for part in parts if part]
+    if len(parts) < 2:
+        return False
+    normalized_answer = normalize_answer(full_final_answer)
+    if not normalized_answer:
+        return False
+    leaf = parts[-1]
+    parents = parts[:-1]
+    return leaf in normalized_answer and any(parent not in normalized_answer for parent in parents)
+
+
+def _parse_mc_options_from_question(question: str) -> dict[str, str]:
+    option_matches = list(
+        re.finditer(
+            r"(?<![A-Za-z0-9])(?:\(([A-E])\)(?:[.:])?\s*|([A-E])\.\s+)",
+            question,
+        )
+    )
+    if len(option_matches) < 2:
+        return {}
+
+    labels = [(match.group(1) or match.group(2)) for match in option_matches]
+    unique_labels = list(dict.fromkeys(labels))
+    expected_labels = [chr(ord("A") + idx) for idx in range(len(unique_labels))]
+    if unique_labels != expected_labels:
+        return {}
+
+    options: dict[str, str] = {}
+    for i, match in enumerate(option_matches):
+        label = labels[i]
+        start = match.end()
+        end = option_matches[i + 1].start() if i + 1 < len(option_matches) else len(question)
+        option_text = question[start:end].strip()
+        if option_text:
+            options[label] = option_text
+    return options
+
+
+def _parse_mc_options_from_question_v1(question: str) -> dict[str, str]:
+    """Historical single_call_v1 MC parser kept for provenance.
+
+    It only recognizes parenthesized options and is intentionally less robust
+    than the v2 parser.
+    """
+
+    option_matches = list(re.finditer(r"\(([A-E])\)\s*", question))
+    if len(option_matches) < 2:
+        return {}
+
+    options: dict[str, str] = {}
+    for i, match in enumerate(option_matches):
+        label = match.group(1)
+        start = match.end()
+        end = option_matches[i + 1].start() if i + 1 < len(option_matches) else len(question)
+        option_text = question[start:end].strip()
+        if option_text:
+            options[label] = option_text
+    return options
+
+
+def _raw_final_answer_matches_mc_ground_truth_v1(
+    *,
+    question: str,
+    ground_truth: str,
+    full_final_answer: str,
+) -> bool | None:
+    """Historical single_call_v1 MC rule kept for reproducibility.
+
+    This preserves the known bug where mentioning the GT option anywhere can
+    mark the row correct, even if the answer later rejects it.
+    """
+
+    gt = ground_truth.strip().upper()
+    if not re.fullmatch(r"[A-E]", gt):
+        return None
+
+    options = _parse_mc_options_from_question_v1(question)
+    if gt not in options:
+        return None
+
+    answer_text = full_final_answer.strip()
+    upper_answer = answer_text.upper()
+    explicit_labels = re.findall(r"\(([A-E])\)", upper_answer)
+    explicit_labels.extend(
+        re.findall(
+            r"\b(?:ANSWER|OPTION|CHOICE|SELECTED|SELECT|CORRECT ANSWER|BEST ANSWER)\b\s*(?:IS|:)?\s*([A-E])\b",
+            upper_answer,
+        )
+    )
+    if explicit_labels:
+        return gt in {label.upper() for label in explicit_labels}
+
+    if re.fullmatch(rf"(?:\(?{gt}\)?|(?:answer|option|choice)\s*\(?{gt}\)?)", answer_text, flags=re.IGNORECASE):
+        return True
+
+    normalized_answer = normalize_answer(full_final_answer)
+    normalized_option = normalize_answer(options[gt])
+    if normalized_option and normalized_option in normalized_answer:
+        return True
+
+    return False
+
+
+def _extract_explicit_mc_selected_label(answer_text: str) -> str | None:
+    """Extract a final selected MC label from high-precision answer cues.
+
+    This intentionally does not treat every ``(A)`` mention as a selection.
+    Model explanations often compare or reject options before giving the final
+    answer; accepting any GT-label mention creates false positives.
+    """
+
+    candidates: list[tuple[int, str]] = []
+    patterns = (
+        r"\b(?:FINAL\s+ANSWER|ANSWER|CORRECT\s+ANSWER|BEST\s+ANSWER|CORRECT\s+OPTION|BEST\s+OPTION|SELECTED\s+OPTION|CORRECT\s+CHOICE|BEST\s+CHOICE|SELECTED\s+CHOICE|MY\s+ANSWER)\b\s*(?:IS|:|=)?\s*\(?([A-E])\)?\b",
+        r"\b(?:CORRECT|FINAL)\b[^.\n]{0,120}?\b(?:IS|:|=)\s*\(?([A-E])\)?\b",
+        r"\b(?:CHOOSE|SELECT|PICK|GO\s+WITH)\b\s*(?:OPTION|CHOICE)?\s*\(?([A-E])\)?\b",
+        r"\b(?:MATCHES|CORRESPONDS\s+TO|MAPS\s+TO)\b\s*(?:OPTION|CHOICE)\s*\(?([A-E])\)?\b",
+        r"\b(?:THEREFORE|THUS|SO|HENCE|OVERALL)\b[^.\n]{0,120}?\b(?:ANSWER|OPTION|CHOICE)\b\s*(?:IS|:|=)?\s*\(?([A-E])\)?\b",
+    )
+    upper_answer = answer_text.upper().replace("*", "").replace("`", "")
+    for pattern in patterns:
+        for match in re.finditer(pattern, upper_answer):
+            if _mc_selection_context_is_negative(upper_answer, match.start(), match.end()):
+                continue
+            candidates.append((match.start(), match.group(1).upper()))
+
+    tail_match = re.search(r"\(([A-E])\)[).:]?(?:\s+[^()]{0,120})?\s*$", upper_answer)
+    if tail_match:
+        before = upper_answer[max(0, tail_match.start() - 40) : tail_match.start()]
+        after = upper_answer[tail_match.end() :]
+        earlier_parenthesized_labels = re.findall(r"\(([A-E])\)", upper_answer[: tail_match.start()])
+        if not earlier_parenthesized_labels and not re.search(
+            r"\b(?:NOT|INCORRECT|WRONG|EXCEPT|RATHER\s+THAN)\b",
+            before + " " + after,
+        ):
+            candidates.append((tail_match.start(), tail_match.group(1).upper()))
+
+    # A final line like "(E) All the above answers are wrong" is also an
+    # explicit selection, but a mid-answer option mention/list is not.
+    nonempty_lines = [(start, line.strip()) for start, line in _iter_answer_lines_with_offsets(upper_answer) if line.strip()]
+    if nonempty_lines:
+        line_start, stripped = nonempty_lines[-1]
+        match = re.fullmatch(
+            r"(?:\(([A-E])\)|([A-E])(?:[).:]|$)|(?:OPTION|CHOICE)\s*\(?([A-E])\)?)(?:\s+.*)?",
+            stripped,
+        )
+        mentioned_line_labels = re.findall(r"\(([A-E])\)|\b(?:OPTION|CHOICE)\s*\(?([A-E])\)?\b", stripped)
+        mentioned_line_labels = [match[0] or match[1] for match in mentioned_line_labels]
+        if (
+            match
+            and len(mentioned_line_labels) <= 1
+            and not _mc_selection_context_is_negative(stripped, match.start(), match.end())
+        ):
+            candidates.append((line_start, (match.group(1) or match.group(2) or match.group(3)).upper()))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def _iter_answer_lines_with_offsets(text: str):
+    offset = 0
+    for line in text.splitlines():
+        yield offset, line
+        offset += len(line) + 1
+
+
+def _mc_selection_context_is_negative(upper_text: str, start: int, end: int) -> bool:
+    """Return true when an option mention is clearly being rejected, not selected."""
+
+    before = upper_text[max(0, start - 40) : start]
+    after = upper_text[end : min(len(upper_text), end + 80)]
+    context = before + " " + after
+    return bool(
+        re.search(r"\b(?:NOT|NO|NEITHER|INCORRECT|WRONG|FALSE|REJECT(?:ED)?|EXCLUDE(?:D)?)\b", before)
+        or re.search(
+            r"^\s*\)?[).:]?\s*(?:IS|ARE|WAS|WERE|SEEMS|APPEARS|WOULD\s+BE)?\s*"
+            r"(?:NOT\s+(?:CORRECT|ACCURATE|APPLICABLE|RIGHT|THE\s+ANSWER|A\s+GOOD\s+ANSWER|A\s+MATCH)|"
+            r"INCORRECT|WRONG|FALSE|LESS\s+PRECISE|PARTIALLY\s+CORRECT|NOT\s+PERFECT)",
+            after,
+        )
+    )
+
+
+def _strip_direct_answer_prefix(answer_text: str) -> str:
+    stripped = answer_text.strip().strip("`").strip()
+    return re.sub(
+        r"^(?:final\s+answer|answer|the\s+answer|model\s+answer)\s*(?:is|:|=)?\s*",
+        "",
+        stripped,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _is_concise_mc_answer(answer_text: str) -> bool:
+    words = re.findall(r"\w+", answer_text)
+    return len(words) <= 32 and len(answer_text.strip()) <= 240
+
+
+def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    if not text or not phrase:
+        return False
+    return bool(re.search(rf"(?:^|\s){re.escape(phrase)}(?:$|\s)", text))
+
+
+def _mc_option_is_rejection_option(option_text: str) -> bool:
+    normalized = normalize_answer(option_text)
+    return (
+        _is_not_answerable_text(option_text)
+        or "all above answers are wrong" in normalized
+        or "all the above answers are wrong" in normalized
+        or "none of the above" in normalized
+        or "none of the provided options" in normalized
+        or "none of the listed options" in normalized
+        or "none of the options" in normalized
+        or "does not provide sufficient information" in normalized
+        or "does not feature" in normalized
+        or "image does not" in normalized
+    )
+
+
+def _match_concise_answer_to_mc_options(answer_text: str, options: dict[str, str]) -> tuple[str, bool] | None:
+    direct_answer = _strip_direct_answer_prefix(answer_text)
+    normalized_answer = normalize_answer(direct_answer)
+    if not normalized_answer:
+        return None
+
+    matches: list[tuple[str, bool]] = []
+    for label, option_text in options.items():
+        normalized_option = normalize_answer(option_text)
+        if not normalized_option:
+            continue
+        exact_match = normalized_answer == normalized_option
+        loose_match = _contains_normalized_phrase(normalized_option, normalized_answer) or _contains_normalized_phrase(
+            normalized_answer,
+            normalized_option,
+        )
+        if exact_match or loose_match:
+            matches.append((label, exact_match))
+
+    matched_labels = {label for label, _ in matches}
+    if len(matched_labels) == 1:
+        return matches[0]
+    return None
+
+
+def _raw_final_answer_matches_mc_ground_truth(
+    *,
+    question: str,
+    ground_truth: str,
+    full_final_answer: str,
+) -> bool | None:
+    gt = ground_truth.strip().upper()
+    if not re.fullmatch(r"[A-E]", gt):
+        return None
+
+    options = _parse_mc_options_from_question(question)
+    if gt not in options:
+        return None
+
+    answer_text = full_final_answer.strip()
+    selected_label = _extract_explicit_mc_selected_label(answer_text)
+    if selected_label is not None:
+        return selected_label == gt
+
+    if _mc_option_is_rejection_option(answer_text) and _mc_option_is_rejection_option(options.get("E", "")):
+        return gt == "E"
+
+    explicit_label_mentions = re.findall(r"\(([A-E])\)|\b(?:OPTION|CHOICE)\s*([A-E])\b", answer_text.upper())
+    mentioned_labels = {(match[0] or match[1]).upper() for match in explicit_label_mentions if match[0] or match[1]}
+    if _is_concise_mc_answer(answer_text) and len(mentioned_labels) <= 1:
+        matched_label = _match_concise_answer_to_mc_options(answer_text, options)
+        if matched_label is not None:
+            label, exact_match = matched_label
+            if label == gt:
+                return True
+            if exact_match:
+                return None
+
+    return None
+
+
+def _looks_like_list_ground_truth(ground_truth: str) -> bool:
+    stripped = ground_truth.strip()
+    if stripped.startswith("[") or stripped.startswith("(") or stripped.startswith("{"):
+        return True
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return False
+    if isinstance(parsed, str):
+        parsed_stripped = parsed.strip()
+        return parsed_stripped.startswith("[") or parsed_stripped.startswith("(") or parsed_stripped.startswith("{")
+    return isinstance(parsed, (list, tuple, dict))
+
+
+def _parse_list_ground_truth(ground_truth: str) -> list[str] | None:
+    stripped = ground_truth.strip()
+    for candidate in (stripped,):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except Exception:
+                return None
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+    return None
+
+
+def _section_like_ids(text: str) -> set[str]:
+    ids = set()
+    for match in re.finditer(r"\b\d+(?:\.\d+)+\b", text):
+        ids.add(match.group(0).replace(".", ""))
+    return ids
+
+
+def _is_title_or_section_selection_question(question: str) -> bool:
+    normalized = normalize_answer(question)
+    return bool(
+        ("title" in normalized or "section" in normalized or "heading" in normalized)
+        and ("select" in normalized or "which" in normalized or "best match" in normalized)
+    )
+
+
+def _raw_final_answer_matches_scalar_title_ground_truth(
+    *,
+    question: str,
+    ground_truth: str,
+    full_final_answer: str,
+) -> bool:
+    if _looks_like_list_ground_truth(ground_truth) or not _is_title_or_section_selection_question(question):
+        return False
+
+    normalized_gt = normalize_answer(ground_truth)
+    normalized_answer = normalize_answer(full_final_answer)
+    if not normalized_gt or not normalized_answer:
+        return False
+    if re.search(
+        rf"\b(?:containing|contains|page containing|specifically|section containing|chapter containing)\b.{{0,80}}\b{re.escape(normalized_gt)}\b",
+        normalized_answer,
+    ):
+        return False
+    if normalized_gt in normalized_answer:
+        return True
+
+    # Accept scalar title/header answers that preserve a long core suffix while
+    # dropping source/owner prefixes from the formal GT title.
+    gt_tokens = normalized_gt.split()
+    for start in range(1, len(gt_tokens) - 1):
+        suffix = " ".join(gt_tokens[start:])
+        if len(suffix) >= 18 and suffix in normalized_answer:
+            return True
+    return False
+
+
+def _raw_final_answer_matches_list_ground_truth(
+    *,
+    question: str,
+    ground_truth: str,
+    full_final_answer: str,
+) -> bool:
+    items = _parse_list_ground_truth(ground_truth)
+    if not items or not _is_title_or_section_selection_question(question):
+        return False
+
+    normalized_answer = normalize_answer(full_final_answer)
+    normalized_gt = normalize_answer(ground_truth)
+    if re.search(r"(?m)^\s*[-*]\s+", full_final_answer):
+        return False
+    if "section" not in normalized_gt and re.search(r"\bsection\s+\d+\b", normalized_answer):
+        return False
+
+    answer_tokens = set(normalized_answer.split())
+    for item in items:
+        item_tokens = [
+            token
+            for token in normalize_answer(item).split()
+            if len(token) > 2 and not any(ch.isdigit() for ch in token) and token not in {"and", "the"}
+        ]
+        if not item_tokens:
+            return False
+        covered = sum(token in answer_tokens for token in item_tokens)
+        if covered / len(item_tokens) < 0.70:
+            return False
+
+    gt_section_ids = set().union(*(_section_like_ids(item) for item in items))
+    answer_section_ids = _section_like_ids(full_final_answer)
+    if gt_section_ids and not answer_section_ids.issubset(gt_section_ids):
+        return False
+
+    return True
+
+
+def _is_entity_identity_question(question: str) -> bool:
+    normalized = normalize_answer(question)
+    return bool(
+        re.search(r"\bwho\b", normalized)
+        or any(
+            phrase in normalized
+            for phrase in (
+                "signator",
+                "signatory",
+                "signatories",
+                "author",
+                "auditor",
+                "representative",
+                "signed by",
+            )
+        )
+    )
+
+
+def _raw_final_answer_matches_entity_ground_truth(
+    *,
+    question: str,
+    ground_truth: str,
+    full_final_answer: str,
+) -> bool:
+    if _looks_like_list_ground_truth(ground_truth) or not _is_entity_identity_question(question):
+        return False
+
+    ignored_tokens = {
+        "and",
+        "for",
+        "on",
+        "behalf",
+        "of",
+        "the",
+        "senior",
+        "statutory",
+        "auditor",
+        "chartered",
+        "accountant",
+        "accountants",
+        "representative",
+        "author",
+        "signed",
+        "signatory",
+        "signatories",
+    }
+    gt_tokens = [
+        token
+        for token in normalize_answer(ground_truth).split()
+        if len(token) > 1 and token not in ignored_tokens
+    ]
+    if len(gt_tokens) < 2:
+        return False
+
+    answer_tokens = set(normalize_answer(full_final_answer).split())
+    covered = sum(token in answer_tokens for token in gt_tokens)
+    return covered / len(gt_tokens) >= 0.8
+
+
 async def _extract_answer_for_insight_qwen_agent(
     *,
     question: str,
@@ -499,25 +1124,31 @@ async def _extract_answer_for_insight_qwen_agent(
     extra_info: dict,
     judge_client: AsyncOpenAI,
     judge_model: str,
+    prompt_version: str = "legacy",
 ) -> str | None:
-    raw_answer = _extract_last_tagged_content(final_message, "answer")
-    if raw_answer is None:
-        raw_answer = _extract_last_boxed_answer(final_message)
-    if raw_answer is None:
-        raw_answer = final_message.strip()
+    raw_answer = _extract_raw_final_answer_for_judge(final_message)
     if not raw_answer:
         return None
 
-    raw_answer = _crop_judge_answer_context(raw_answer)
     options = extra_info.get("options")
     if options:
-        prompt = insight_o3_prompts.GPT_EVAL_MCQA_PROMPT.format(
+        prompt_template = (
+            LEGACY_PROMPT_V2_MCQA_EXTRACTION_PROMPT
+            if prompt_version == "legacy_prompt_v2"
+            else insight_o3_prompts.GPT_EVAL_MCQA_PROMPT
+        )
+        prompt = prompt_template.format(
             question=question,
             options=options,
             model_answer=raw_answer,
         )
     else:
-        prompt = insight_o3_prompts.GPT_EVAL_OPEN_QA_PROMPT.format(
+        prompt_template = (
+            LEGACY_PROMPT_V2_OPEN_QA_EXTRACTION_PROMPT
+            if prompt_version == "legacy_prompt_v2"
+            else insight_o3_prompts.GPT_EVAL_OPEN_QA_PROMPT
+        )
+        prompt = prompt_template.format(
             question=question,
             model_response=raw_answer,
         )
@@ -527,7 +1158,7 @@ async def _extract_answer_for_insight_qwen_agent(
             query=prompt,
             model=judge_model,
             client=judge_client,
-            max_completion_tokens=2048,
+            **_judge_completion_token_kwargs(judge_model),
         )
     except Exception as e:
         raise JudgeError(f"answer extraction judge failed: {e}") from e
@@ -669,6 +1300,7 @@ async def compute_accuracy_reward(
     ground_truth: str,
     judge_client: AsyncOpenAI,
     judge_model: str = "gpt-5-nano",
+    verify_prompt_template: str | None = None,
 ) -> float:
     """Compute the accuracy reward of the extracted answer."""
 
@@ -692,7 +1324,7 @@ async def compute_accuracy_reward(
         return fallback_accuracy
 
     # Use judge model to verify the answer
-    query = verify_prompt.format(
+    query = (verify_prompt_template or verify_prompt).format(
         question=question,
         gt_answer=ground_truth,
         model_answer=extracted_answer,
@@ -703,7 +1335,7 @@ async def compute_accuracy_reward(
             query,
             model=judge_model,
             client=judge_client,
-            max_tokens=2048,
+            **_judge_completion_token_kwargs(judge_model),
         )
         response_text = judge_response.choices[0].message.content
     except Exception as e:
@@ -713,6 +1345,168 @@ async def compute_accuracy_reward(
         ) from e
 
     return float("<correct>" in response_text)
+
+
+def _compute_rule_based_raw_final_answer_accuracy(
+    question: str,
+    full_final_answer: str,
+    ground_truth: str,
+) -> float | None:
+    mc_match = _raw_final_answer_matches_mc_ground_truth_v1(
+        question=question,
+        ground_truth=ground_truth,
+        full_final_answer=full_final_answer,
+    )
+    if mc_match is not None:
+        return float(mc_match)
+    normalized_ground_truth = normalize_answer(ground_truth)
+    normalized_full_answer = normalize_answer(full_final_answer)
+    if normalized_ground_truth and normalized_ground_truth == normalized_full_answer:
+        return 1.0
+    if _raw_final_answer_matches_scalar_title_ground_truth(
+        question=question,
+        ground_truth=ground_truth,
+        full_final_answer=full_final_answer,
+    ):
+        return 1.0
+    if _raw_final_answer_matches_list_ground_truth(
+        question=question,
+        ground_truth=ground_truth,
+        full_final_answer=full_final_answer,
+    ):
+        return 1.0
+    if _raw_final_answer_matches_entity_ground_truth(
+        question=question,
+        ground_truth=ground_truth,
+        full_final_answer=full_final_answer,
+    ):
+        return 1.0
+    if _is_not_answerable_text(ground_truth) and _raw_final_answer_matches_not_answerable(full_final_answer):
+        return 1.0
+    return None
+
+
+def _compute_rule_based_raw_final_answer_accuracy_v2(
+    question: str,
+    full_final_answer: str,
+    ground_truth: str,
+) -> float | None:
+    mc_match = _raw_final_answer_matches_mc_ground_truth(
+        question=question,
+        ground_truth=ground_truth,
+        full_final_answer=full_final_answer,
+    )
+    if mc_match is not None:
+        return float(mc_match)
+    normalized_ground_truth = normalize_answer(ground_truth)
+    normalized_full_answer = normalize_answer(full_final_answer)
+    if normalized_ground_truth and normalized_ground_truth == normalized_full_answer:
+        return 1.0
+    return None
+
+
+async def compute_accuracy_reward_with_raw_final_answer(
+    data_source: str,
+    question: str,
+    extracted_answer: str,
+    full_final_answer: str,
+    ground_truth: str,
+    judge_client: AsyncOpenAI,
+    judge_model: str = "gpt-5-nano",
+    rule_version: str = "v1",
+) -> float:
+    """Verify fallback answer correctness using extracted and raw final answer text."""
+
+    rule_fn = (
+        _compute_rule_based_raw_final_answer_accuracy_v2
+        if rule_version == "v2"
+        else _compute_rule_based_raw_final_answer_accuracy
+    )
+    rule_based_accuracy = rule_fn(
+        question=question,
+        full_final_answer=full_final_answer,
+        ground_truth=ground_truth,
+    )
+    if rule_based_accuracy is not None:
+        return rule_based_accuracy
+
+    if not os.getenv("OPENAI_API_KEY") and not os.getenv("OPENAI_BASE_URL"):
+        logger.warning("No judge endpoint configured; raw-final-answer fallback unavailable.")
+        return 0.0
+
+    query = VERIFY_WITH_RAW_FINAL_ANSWER_PROMPT.format(
+        question=question,
+        gt_answer=ground_truth,
+        extracted_answer=extracted_answer,
+        full_final_answer=full_final_answer,
+    )
+
+    try:
+        _, judge_response = await query_api(
+            query,
+            model=judge_model,
+            client=judge_client,
+            **_judge_completion_token_kwargs(judge_model),
+        )
+        response_text = judge_response.choices[0].message.content
+    except Exception as e:
+        raise JudgeError(
+            f"raw-final-answer judge query failed ({type(e).__name__}: {e!r}); "
+            "batch retry can handle this transient failure"
+        ) from e
+
+    return float("<correct>" in str(response_text))
+
+
+async def compute_accuracy_reward_with_final_answer_only(
+    data_source: str,
+    question: str,
+    full_final_answer: str,
+    ground_truth: str,
+    judge_client: AsyncOpenAI,
+    judge_model: str = "gpt-5-nano",
+    rule_version: str = "v1",
+) -> float:
+    """Verify single-call answer correctness using only the raw final answer text."""
+
+    rule_fn = (
+        _compute_rule_based_raw_final_answer_accuracy_v2
+        if rule_version == "v2"
+        else _compute_rule_based_raw_final_answer_accuracy
+    )
+    rule_based_accuracy = rule_fn(
+        question=question,
+        full_final_answer=full_final_answer,
+        ground_truth=ground_truth,
+    )
+    if rule_based_accuracy is not None:
+        return rule_based_accuracy
+
+    if not os.getenv("OPENAI_API_KEY") and not os.getenv("OPENAI_BASE_URL"):
+        logger.warning("No judge endpoint configured; final-answer-only judge unavailable.")
+        return 0.0
+
+    query = VERIFY_FINAL_ANSWER_ONLY_PROMPT.format(
+        question=question,
+        gt_answer=ground_truth,
+        full_final_answer=full_final_answer,
+    )
+
+    try:
+        _, judge_response = await query_api(
+            query,
+            model=judge_model,
+            client=judge_client,
+            **_judge_completion_token_kwargs(judge_model),
+        )
+        response_text = judge_response.choices[0].message.content
+    except Exception as e:
+        raise JudgeError(
+            f"final-answer-only judge query failed ({type(e).__name__}: {e!r}); "
+            "batch retry can handle this transient failure"
+        ) from e
+
+    return float("<correct>" in str(response_text))
 
 
 async def compute_score_single_vsearch_base(
@@ -847,6 +1641,34 @@ async def compute_score_single_insight_qwen_agent(
         _record_judge_metadata(score, reward_kwargs)
         return score
 
+    insight_qwen_judge_mode = reward_kwargs.get("insight_qwen_judge_mode")
+    if insight_qwen_judge_mode in {"single_call_v1", "single_call_v2"}:
+        raw_final_answer = _extract_raw_final_answer_for_judge(final_message)
+        score.extracted_answer = raw_final_answer
+        score.format_reward = float(bool(raw_final_answer))
+        if raw_final_answer:
+            score.accuracy_reward = await compute_accuracy_reward_with_final_answer_only(
+                data_source,
+                extra_info["question"],
+                raw_final_answer,
+                ground_truth,
+                reward_kwargs["judge_client"],
+                reward_kwargs["judge_model"],
+                rule_version="v2" if insight_qwen_judge_mode == "single_call_v2" else "v1",
+            )
+        else:
+            score.accuracy_reward = 0.0
+        score.n_valid_tool_calls = solution_str.count("<tool_response>")
+        _record_judge_metadata(score, reward_kwargs)
+        return score
+
+    legacy_prompt_version = "legacy_prompt_v2" if insight_qwen_judge_mode == "legacy_prompt_v2" else "legacy"
+    legacy_verify_prompt_template = (
+        LEGACY_PROMPT_V2_QA_VERIFY_PROMPT
+        if insight_qwen_judge_mode == "legacy_prompt_v2"
+        else None
+    )
+
     rule_based_answer = _extract_last_tagged_content(final_message, "answer")
     if rule_based_answer is None:
         rule_based_answer = _extract_last_boxed_answer(final_message)
@@ -860,6 +1682,7 @@ async def compute_score_single_insight_qwen_agent(
             extra_info=extra_info,
             judge_client=reward_kwargs["judge_client"],
             judge_model=reward_kwargs["judge_model"],
+            prompt_version=legacy_prompt_version,
         )
 
     score.format_reward = float(bool(score.extracted_answer))
@@ -871,11 +1694,46 @@ async def compute_score_single_insight_qwen_agent(
             ground_truth,
             reward_kwargs["judge_client"],
             reward_kwargs["judge_model"],
+            verify_prompt_template=legacy_verify_prompt_template,
         )
     else:
         score.accuracy_reward = 0.0
 
     score.n_valid_tool_calls = solution_str.count("<tool_response>")
+
+    if (
+        score.accuracy_reward == 0.0
+        and score.extracted_answer
+        and reward_kwargs.get("insight_qwen_judge_mode") == "raw_final_answer_fallback_v2"
+    ):
+        raw_final_answer = _extract_raw_final_answer_for_judge(final_message)
+        score.accuracy_reward = await compute_accuracy_reward_with_raw_final_answer(
+            data_source,
+            extra_info["question"],
+            str(score.extracted_answer),
+            raw_final_answer,
+            ground_truth,
+            reward_kwargs["judge_client"],
+            reward_kwargs["judge_model"],
+        )
+
+    if score.accuracy_reward == 0.0 and insight_qwen_judge_mode == "legacy_raw_final_answer_fallback_v1":
+        raw_final_answer = _extract_raw_final_answer_for_judge(final_message)
+        if raw_final_answer:
+            if not _raw_final_answer_is_hierarchy_leaf_only(ground_truth, raw_final_answer):
+                score.accuracy_reward = await compute_accuracy_reward_with_raw_final_answer(
+                    data_source,
+                    extra_info["question"],
+                    str(score.extracted_answer or ""),
+                    raw_final_answer,
+                    ground_truth,
+                    reward_kwargs["judge_client"],
+                    reward_kwargs["judge_model"],
+                    rule_version="v2",
+                )
+                if not score.extracted_answer:
+                    score.extracted_answer = raw_final_answer
+
     _record_judge_metadata(score, reward_kwargs)
     return score
 

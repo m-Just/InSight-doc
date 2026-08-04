@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import sys
 from pathlib import Path
@@ -13,7 +12,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 for extra_path in (
     REPO_ROOT,
     Path("/scratch/ywxzml3j/likaican/src/InSight-o3"),
-    Path("/scratch/ywxzml3j/likaican/src/Qwen-Agent"),
 ):
     if extra_path.exists() and str(extra_path) not in sys.path:
         sys.path.insert(0, str(extra_path))

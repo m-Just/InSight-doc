@@ -47,6 +47,26 @@ def test_seqlen_balancing():
     torch.testing.assert_close(new_batch, dataproto.batch)
 
 
+def test_seqlen_balancing_respects_token_cap():
+    input_ids = torch.randint(low=0, high=10, size=(5, 60))
+    attention_mask = torch.ones_like(input_ids)
+    dataproto = DataProto.from_single_dict({"input_ids": input_ids, "attention_mask": attention_mask})
+
+    micro_batches, micro_bsz_idx_lst = rearrange_micro_batches(dataproto.batch, max_token_len=100)
+
+    assert len(micro_batches) == 5
+    for micro_batch in micro_batches:
+        assert int(micro_batch["attention_mask"].sum().item()) <= 100
+
+    batch = torch.cat(micro_batches)
+    micro_bsz_idx = []
+    for idx in micro_bsz_idx_lst:
+        micro_bsz_idx.extend(idx)
+    reverse_idx_map = torch.tensor(get_reverse_idx(micro_bsz_idx))
+    new_batch = batch[reverse_idx_map]
+    torch.testing.assert_close(new_batch, dataproto.batch)
+
+
 def test_dynamic_batch():
     input_ids = torch.randint(low=0, high=10, size=(20, 100))
 
@@ -100,19 +120,28 @@ def _worker(rank, world_size, init_method, max_token_len, use_same_dp, min_mb):
 
     if min_mb is not None:
         expected = max(local, min_mb)
-        assert len(micros) == expected
+        assert len(micros) >= expected
     if use_same_dp:
         # gather all local_counts
         counts = [torch.zeros(1, device=f"{get_device_name()}:{rank}") for _ in range(world_size)]
         counts[rank].fill_(local)
         dist.all_gather(counts, counts[rank])
         expected = max(int(c.item()) for c in counts)
-        assert len(micros) == expected
+        assert len(micros) >= expected
+
+        actual_count = torch.tensor([len(micros)], device=f"{get_device_name()}:{rank}")
+        actual_counts = [torch.zeros(1, device=f"{get_device_name()}:{rank}") for _ in range(world_size)]
+        dist.all_gather(actual_counts, actual_count)
+        assert len({int(c.item()) for c in actual_counts}) == 1
     else:
         # if neither, we get the local natural count
-        assert len(micros) == local
+        assert len(micros) >= local
 
-    # 5) reconstruction sanity: concat→reverse_idx→orig
+    for idx in idx_lst:
+        token_sum = int(seq_len_effective[idx].sum().item())
+        assert token_sum <= max_token_len
+
+    # 5) reconstruction sanity: concat to reverse_idx to orig
     flat = torch.cat(micros, dim=0)
     idx = []
     for sub in idx_lst:

@@ -1,0 +1,52 @@
+# Sampling weights for RL data with the 1k arXiv structural LongDocURL-like add-on.
+#
+# Base parquet: /scratch/ywxzml3j/likaican/src/verl-qwen3-vl/notes/generated/rl_16k_prompt24k_r05_to_r035_simple_datasource_plus_mc_false_e05_20260705/insight_doc_rl_16k_prompt24k_r05_to_r035_simple_datasource_plus_mc_false_e_filtered-insight_qwen_agent.parquet
+# Add-on parquet: /scratch/ywxzml3j/likaican/src/verl-qwen3-vl/notes/generated/arxiv_struct_longdocurl_like_1k_uniform_multi_final_v5_pagechecked_20260722/arxiv_struct_longdocurl_like_deterministic_1000-insight_qwen_agent.parquet
+# Combined parquet: /scratch/ywxzml3j/likaican/src/verl-qwen3-vl/notes/generated/rl_16k_prompt24k_r05_to_r035_simple_datasource_plus_mc_false_e05_plus_arxiv_struct1k_20260722/insight_doc_rl_16k_prompt24k_r05_to_r035_simple_datasource_plus_mc_false_e_arxiv_struct1k-insight_qwen_agent.parquet
+#
+# Design:
+# - Preserve the previous total sampling mass and all non-arXiv weights.
+# - Preserve the previous unanswerable mass and MC false-E calibration weights.
+# - Add 5% total mass for arXiv structural answerable rows.
+# - Steal 2.8% from arxiv_veqa_answerable for single-answer structural rows.
+# - Steal 2.2% from arxiv_mveqa_answerable for list-answer structural rows.
+# - Split the new structural mass over r025/r035/r05 using the rescale mix of the stolen source.
+#
+# Resulting structural add-on masses:
+# - arxiv_struct_single_answerable_r025: 0.01854746700723712
+# - arxiv_struct_single_answerable_r035: 0.008260536398467433
+# - arxiv_struct_single_answerable_r05: 0.001191996594295445
+# - arxiv_struct_list_answerable_r025: 0.01468929043631556
+# - arxiv_struct_list_answerable_r035: 0.006418686646099603
+# - arxiv_struct_list_answerable_r05: 0.0008920229175848391
+weights:
+  arxiv_mveqa_answerable: 0.13216666666665
+  arxiv_mveqa_unanswerable: 0.021316872428
+  arxiv_veqa_answerable: 0.12616666666665
+  arxiv_veqa_unanswerable: 0.021316872428
+  docvqa_answerable: 0.083333333333289
+  docvqa_unanswerable: 0.0115226337449
+  dude_answerable: 0.18749999999992
+  dude_unanswerable: 0.0259259259259
+  info_answerable: 0.028992248062
+  info_unanswerable: 0.00921810699588
+  map_metro_answerable: 0.11957364341058
+  map_metro_unanswerable: 0.0230452674897
+  map_travel_answerable: 0.033333333333372
+  map_travel_unanswerable: 0.00460905349794
+  poster_answerable: 0.048934108527142
+  poster_unanswerable: 0.0230452674897
+  arxiv_mveqa_answerable_mc_false_e: 0.00043658088235294
+  arxiv_veqa_answerable_mc_false_e: 0.012913602941176
+  docvqa_answerable_mc_false_e: 0.0048253676470588
+  dude_answerable_mc_false_e: 0.008754595588235299
+  info_answerable_mc_false_e: 0.0017003676470588
+  map_metro_answerable_mc_false_e: 0.0079733455882353
+  map_travel_answerable_mc_false_e: 0.0095128676470588
+  poster_answerable_mc_false_e: 0.0038832720588235
+  arxiv_struct_single_answerable_r025: 0.01854746700723712
+  arxiv_struct_single_answerable_r035: 0.008260536398467433
+  arxiv_struct_single_answerable_r05: 0.001191996594295445
+  arxiv_struct_list_answerable_r025: 0.01468929043631556
+  arxiv_struct_list_answerable_r035: 0.006418686646099603
+  arxiv_struct_list_answerable_r05: 0.0008920229175848391

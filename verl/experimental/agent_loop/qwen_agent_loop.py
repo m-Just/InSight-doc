@@ -11,7 +11,6 @@ import json
 import logging
 import math
 import os
-import re
 import tempfile
 import time
 from typing import Any
@@ -49,10 +48,9 @@ from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.vreasoner_v2_conversation_export import (
+    build_insight_export_conversation as _build_insight_export_conversation,
     build_export_record,
     export_conversation,
-    parse_assistant_message,
-    parse_user_message,
 )
 
 logger = logging.getLogger(__file__)
@@ -66,7 +64,16 @@ QWEN_IMAGE_MAX_ASPECT_RATIO = 200.0
 INITIAL_PROMPT_SHRINK_AREA_FACTOR = 0.5
 INITIAL_PROMPT_SHRINK_DIM_FACTOR = math.sqrt(INITIAL_PROMPT_SHRINK_AREA_FACTOR)
 INITIAL_PROMPT_MAX_SHRINK_STEPS = 4
-IMAGE_LABEL_RE = re.compile(r"^Image (\d+):$")
+
+
+def _is_generation_context_length_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return (
+        "maximum model length" in message
+        or "maximum context length" in message
+        or "longer than the maximum model length" in message
+    )
+
 
 def _image_aspect_ratio(size: tuple[int, int]) -> float:
     width, height = size
@@ -148,165 +155,6 @@ def _record_core_inference_metrics(agent_data: AgentData) -> None:
     agent_data.extra_fields["tool_calls"] = tool_calls
     agent_data.extra_fields["core_inference_time"] = core_inference_time
 
-
-def _message_text_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(
-            item.get("text", "")
-            for item in content
-            if isinstance(item, dict) and item.get("type") == "text"
-        )
-    return "" if content is None else str(content)
-
-
-def _strip_wrapped_tag(text: str, tag: str) -> str:
-    pattern = rf"<{tag}>.*?</{tag}>"
-    return re.sub(pattern, "", text, flags=re.DOTALL).strip()
-
-
-def _text_before_tag(text: str, tag: str) -> str:
-    marker = f"<{tag}>"
-    if marker not in text:
-        return text.strip()
-    return text.split(marker, 1)[0].strip()
-
-
-def _convert_export_multimodal_content(
-    content: Any,
-    *,
-    next_presented_idx: int,
-) -> tuple[Any, int]:
-    if not isinstance(content, list):
-        return _message_text_content(content), next_presented_idx
-
-    converted_content: list[dict[str, Any]] = []
-    pending_presented_idx: int | None = None
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-
-        item_type = item.get("type")
-        if item_type == "text":
-            text = item.get("text", "")
-            converted_content.append({"type": "text", "text": text})
-            match = IMAGE_LABEL_RE.match(text.strip())
-            if match:
-                pending_presented_idx = int(match.group(1))
-            continue
-
-        if item_type == "image":
-            presented_idx = pending_presented_idx if pending_presented_idx is not None else next_presented_idx
-            converted_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"presented://{presented_idx}",
-                        "detail": "high",
-                    },
-                }
-            )
-            next_presented_idx = max(next_presented_idx, presented_idx + 1)
-            pending_presented_idx = None
-            continue
-
-        if "text" in item and isinstance(item["text"], str):
-            converted_content.append({"type": "text", "text": item["text"]})
-
-    return converted_content, next_presented_idx
-
-
-def _build_insight_export_conversation(
-    messages: list[dict[str, Any]],
-    *,
-    initial_question: str,
-) -> list[dict[str, Any]]:
-    conversation: list[dict[str, Any]] = []
-    next_presented_idx = 0
-    last_assistant_idx = max((idx for idx, message in enumerate(messages) if message.get("role") == "assistant"), default=-1)
-
-    for idx, message in enumerate(messages):
-        role = message.get("role")
-        content = message.get("content")
-
-        if role == "system":
-            conversation.append(
-                {
-                    "message_idx": idx,
-                    "role": "system",
-                    "type": "system_prompt",
-                    "content": {"text": _message_text_content(content)},
-                }
-            )
-            continue
-
-        if role == "assistant":
-            text = _message_text_content(content)
-            parsed = parse_assistant_message(text)
-            extracted_tags = parsed.get("content", {}).get("extracted_tags", {})
-            parsed_tool_call = extracted_tags.get("tool_call")
-            if parsed.get("type") == "others" and parsed_tool_call is not None:
-                tool_call_parse_error = parsed.get("tool_call_parse_error")
-                parsed = {
-                    "type": "tool_call",
-                    "content": {
-                        "think": _text_before_tag(text, "tool_call"),
-                        "tool_call": parsed_tool_call,
-                    },
-                    "tag_counts": parsed.get("tag_counts", {}),
-                }
-                if tool_call_parse_error is not None:
-                    parsed["tool_call_parse_error"] = tool_call_parse_error
-            elif parsed.get("type") == "others" and idx == last_assistant_idx and text.strip():
-                parsed = {
-                    "type": "answer",
-                    "content": {
-                        "think": "",
-                        "answer": text.strip(),
-                    },
-                    "tag_counts": parsed.get("tag_counts", {}),
-                }
-            conversation.append({"message_idx": idx, "role": "assistant", **parsed})
-            continue
-
-        if role == "user":
-            converted_content, next_presented_idx = _convert_export_multimodal_content(
-                content,
-                next_presented_idx=next_presented_idx,
-            )
-            parsed = parse_user_message(converted_content, initial_question=initial_question)
-            conversation.append({"message_idx": idx, "role": "user", **parsed})
-            continue
-
-        if role == "tool":
-            converted_content, next_presented_idx = _convert_export_multimodal_content(
-                content,
-                next_presented_idx=next_presented_idx,
-            )
-            parsed = parse_user_message(converted_content, initial_question=initial_question)
-            if parsed.get("type") == "others":
-                text = parsed.get("content", {}).get("text", "").strip()
-                parsed = {
-                    "type": "tool_result_fail_hint",
-                    "content": {
-                        "error_message": text,
-                        "hint": "",
-                    },
-                }
-            conversation.append({"message_idx": idx, "role": "user", **parsed})
-            continue
-
-        conversation.append(
-            {
-                "message_idx": idx,
-                "role": role,
-                "type": "others",
-                "content": {"value": _message_text_content(content)},
-            }
-        )
-
-    return conversation
 
 @register("qwen_agent")
 class QwenAgentLoop(AgentLoopBase):
@@ -523,14 +371,48 @@ class QwenAgentLoop(AgentLoopBase):
             return AgentState.TERMINATED
         generation_sampling_params["max_tokens"] = turn_max_tokens
 
-        with simple_timer("generate_sequences", agent_data.metrics):
-            output = await self.server_manager.generate(
-                request_id=agent_data.request_id,
-                prompt_ids=agent_data.prompt_ids,
-                sampling_params=generation_sampling_params,
-                image_data=agent_data.image_data if agent_data.image_data else None,
-                video_data=agent_data.video_data if agent_data.video_data else None,
+        try:
+            with simple_timer("generate_sequences", agent_data.metrics):
+                output = await self.server_manager.generate(
+                    request_id=agent_data.request_id,
+                    prompt_ids=agent_data.prompt_ids,
+                    sampling_params=generation_sampling_params,
+                    image_data=agent_data.image_data if agent_data.image_data else None,
+                    video_data=agent_data.video_data if agent_data.video_data else None,
+                )
+        except Exception as exc:
+            if not _is_generation_context_length_error(exc):
+                raise
+            image_count = len(agent_data.image_data) if agent_data.image_data else 0
+            video_count = len(agent_data.video_data) if agent_data.video_data else 0
+            failure_reason = (
+                "generation_context_length_overflow: "
+                f"prompt_tokens={len(agent_data.prompt_ids)} "
+                f"images={image_count} videos={video_count} "
+                f"remaining_response_length={remaining_response_length} "
+                f"turn_max_tokens={turn_max_tokens}"
             )
+            logger.warning("%s: %s", failure_reason, exc)
+            print(f"[QwenAgentLoop] WARNING: {failure_reason}: {str(exc)[:500]}")
+            agent_data.extra_fields["response_truncated"] = True
+            agent_data.extra_fields.setdefault("failure_reasons", []).append(failure_reason)
+            agent_data.extra_fields.setdefault("export_failure_events", []).append(
+                {
+                    "kind": "generation",
+                    "status": "context_length_overflow",
+                    "error_message": str(exc)[:2000],
+                    "prompt_tokens": len(agent_data.prompt_ids),
+                    "image_count": image_count,
+                    "video_count": video_count,
+                    "remaining_response_length": remaining_response_length,
+                    "turn_max_tokens": turn_max_tokens,
+                    "assistant_turns": agent_data.assistant_turns,
+                    "user_turns": agent_data.user_turns,
+                }
+            )
+            agent_data.messages.append({"role": "assistant", "content": ""})
+            agent_data.assistant_turns += 1
+            return AgentState.TERMINATED
 
         if output.num_preempted is not None:
             agent_data.metrics["num_preempted"] = output.num_preempted

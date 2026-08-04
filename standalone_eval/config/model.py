@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
-from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
@@ -17,10 +17,16 @@ DEFAULT_RAY_VLLM_CONFIG = {
     "max_model_len": 262144,
     "max_num_seqs": 1024,
     "max_num_batched_tokens": 32768,
-    "gpu_memory_utilization": 0.9,
+    "gpu_memory_utilization": 0.8,
     "enable_prefix_caching": True,
     "enable_chunked_prefill": True,
     "enforce_eager": True,
+    "disable_log_stats": True,
+    "trust_remote_code": False,
+    "processor_image_patch_size": None,
+    "prompt_length_estimator": "tokenized",
+    "require_prompt_length_estimator": False,
+    "prompt_length_safety_margin": 0,
     "sampling": {
         "temperature": 0.7,
         "top_p": 0.8,
@@ -59,6 +65,41 @@ def sha256_file(path: str | os.PathLike[str]) -> str:
     return digest.hexdigest()
 
 
+def semantic_model_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the model config fields that affect generated content.
+
+    HTTPS timeout/retry policy is intentionally excluded so failed rows can be
+    resumed with more robust transport settings without changing eval identity.
+    Ray/vLLM memory-budgeting is also excluded: it affects whether requests fit,
+    not the model weights, prompt content, or sampling parameters.
+    """
+    semantic = copy.deepcopy(config)
+    https_cfg = semantic.get("https_openai_chat")
+    if isinstance(https_cfg, dict):
+        https_cfg.pop("timeout", None)
+        https_cfg.pop("max_retries", None)
+    ray_cfg = semantic.get("ray_vllm")
+    if isinstance(ray_cfg, dict):
+        ray_cfg.pop("gpu_memory_utilization", None)
+        ray_cfg.pop("disable_log_stats", None)
+        # Prompt length estimators only affect local preflight fit-gating.
+        # They do not change model weights, prompts, or sampling, so allow
+        # safer estimators to resume existing rollout directories.
+        ray_cfg.pop("prompt_length_estimator", None)
+        ray_cfg.pop("require_prompt_length_estimator", None)
+        ray_cfg.pop("prompt_length_safety_margin", None)
+    return semantic
+
+
+def semantic_model_config_sha256(config: dict[str, Any]) -> str:
+    payload = json_dumps_canonical(semantic_model_config(config))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def json_dumps_canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
 def optional_config_string(value: Any) -> str | None:
     if value is None:
         return None
@@ -66,6 +107,26 @@ def optional_config_string(value: Any) -> str | None:
     if not text or text.lower() in {"none", "null"}:
         return None
     return text
+
+
+def openai_not_given() -> Any:
+    from openai._types import NOT_GIVEN
+
+    return NOT_GIVEN
+
+
+def normalize_https_timeout(value: Any) -> float | None | Any:
+    if isinstance(value, str) and value.strip().lower() == "default":
+        return openai_not_given()
+    if value is None:
+        return None
+    return float(value)
+
+
+def normalize_https_max_retries(value: Any) -> int | Any:
+    if isinstance(value, str) and value.strip().lower() == "default":
+        return openai_not_given()
+    return int(value)
 
 
 def merge_dict(defaults: dict[str, Any], overrides: dict[str, Any] | None) -> dict[str, Any]:
@@ -147,9 +208,17 @@ def apply_model_config(args: Any, config: dict[str, Any]) -> None:
         args.ray_enable_prefix_caching = bool(ray_cfg["enable_prefix_caching"])
         args.ray_enable_chunked_prefill = bool(ray_cfg["enable_chunked_prefill"])
         args.ray_enforce_eager = bool(ray_cfg["enforce_eager"])
+        args.ray_disable_log_stats = bool(ray_cfg.get("disable_log_stats", True))
         args.ray_dtype = RAY_VLLM_ADAPTER_DEFAULTS["dtype"]
         args.ray_load_format = RAY_VLLM_ADAPTER_DEFAULTS["load_format"]
-        args.ray_trust_remote_code = RAY_VLLM_ADAPTER_DEFAULTS["trust_remote_code"]
+        args.ray_trust_remote_code = bool(ray_cfg.get("trust_remote_code", RAY_VLLM_ADAPTER_DEFAULTS["trust_remote_code"]))
+        processor_image_patch_size = ray_cfg.get("processor_image_patch_size")
+        args.ray_processor_image_patch_size = (
+            None if processor_image_patch_size is None else int(processor_image_patch_size)
+        )
+        args.ray_prompt_length_estimator = str(ray_cfg.get("prompt_length_estimator") or "tokenized")
+        args.ray_require_prompt_length_estimator = bool(ray_cfg.get("require_prompt_length_estimator", False))
+        args.ray_prompt_length_safety_margin = int(ray_cfg.get("prompt_length_safety_margin", 0) or 0)
         args.ray_enable_sleep_mode = RAY_VLLM_ADAPTER_DEFAULTS["enable_sleep_mode"]
         args.ray_scheduling_policy = RAY_VLLM_ADAPTER_DEFAULTS["scheduling_policy"]
     else:
@@ -159,8 +228,8 @@ def apply_model_config(args: Any, config: dict[str, Any]) -> None:
         args.max_model_len = None
         args.https_base_url = https_cfg.get("base_url") or os.getenv("OPENAI_BASE_URL")
         args.https_api_key_env = str(https_cfg.get("api_key_env") or "OPENAI_API_KEY")
-        args.https_timeout = float(https_cfg.get("timeout", 180))
-        args.https_max_retries = int(https_cfg.get("max_retries", 1))
+        args.https_timeout = normalize_https_timeout(https_cfg.get("timeout", 180))
+        args.https_max_retries = normalize_https_max_retries(https_cfg.get("max_retries", 1))
         args.https_image_format = str(https_cfg.get("image_format") or "png").upper()
         args.https_image_detail = optional_config_string(https_cfg.get("image_detail", "high"))
         args.https_reasoning_effort = optional_config_string(https_cfg.get("reasoning_effort", "high"))

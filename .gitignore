@@ -128,3 +128,26 @@ logs
 log
 outputs
 .history
+
+# Local research/runtime artifacts
+.codex
+.codex/
+.cursor/
+.hf_home/
+.conda_envs/
+.conda_pkgs/
+.conda_pkgs:/
+.venvs/
+workspace/
+artifacts/
+portable_exports/
+debug_*/
+external/
+gradio_space_v0804/
+agent_demo_runtime/
+verl-recipe/
+recipe/vsearch/run.async0
+recipe/vsearch/run.vllm-latest
+notes/generated/
+notes/eval_sweeps/
+tmp_*.tex

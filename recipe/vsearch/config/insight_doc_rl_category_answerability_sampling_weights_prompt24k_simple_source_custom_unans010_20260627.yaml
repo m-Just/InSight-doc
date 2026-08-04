@@ -1,0 +1,37 @@
+# Sampling weights for:
+# notes/generated/rl_16k_prompt24k_r05_to_r035_simple_datasource_20260617/
+#   insight_doc_rl_16k_prompt24k_r05_to_r035_simple_datasource-insight_qwen_agent.parquet
+#
+# Same category marginals as custom_20260617, but total unanswerable mass is
+# reduced from 0.18225 to 0.10. Per-category totals are preserved by scaling
+# each unanswerable weight by 0.10 / 0.18225 and moving the freed mass to the
+# corresponding answerable key.
+#
+# Category target marginals:
+#   arxiv_mveqa: 0.185
+#   arxiv_veqa:  0.185
+#   docvqa:      0.100
+#   dude:        0.225
+#   info:        0.040
+#   map_metro:   0.150
+#   map_travel:  0.040
+#   poster:      0.075
+#
+# Overall answerable/unanswerable = 0.90 / 0.10.
+weights:
+  arxiv_mveqa_answerable: 0.169773662551
+  arxiv_mveqa_unanswerable: 0.0152263374486
+  arxiv_veqa_answerable: 0.169773662551
+  arxiv_veqa_unanswerable: 0.0152263374486
+  docvqa_answerable: 0.0917695473251
+  docvqa_unanswerable: 0.0082304526749
+  dude_answerable: 0.206481481481
+  dude_unanswerable: 0.0185185185185
+  info_answerable: 0.0334156378601
+  info_unanswerable: 0.00658436213992
+  map_metro_answerable: 0.13353909465
+  map_metro_unanswerable: 0.0164609053498
+  map_travel_answerable: 0.03670781893
+  map_travel_unanswerable: 0.00329218106996
+  poster_answerable: 0.0585390946502
+  poster_unanswerable: 0.0164609053498

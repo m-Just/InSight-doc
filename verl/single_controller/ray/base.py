@@ -14,7 +14,9 @@
 import inspect
 import logging
 import os
+import psutil
 import socket
+import time
 from copy import deepcopy
 from typing import Any, Optional
 
@@ -34,6 +36,85 @@ __all__ = ["Worker"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_DEBUG_WORKERDICT_BOUNDARY_ENABLED = os.environ.get(
+    "VERL_DEBUG_WORKERDICT_BOUNDARY", os.environ.get("VERL_DEBUG_MEM", "")
+).lower() in {"1", "true", "yes", "on"}
+_DEBUG_WORKERDICT_METHODS = {
+    name.strip()
+    for name in os.environ.get(
+        "VERL_DEBUG_WORKERDICT_METHODS",
+        "ref_compute_ref_log_prob,actor_update_actor,actor_compute_log_prob",
+    ).split(",")
+    if name.strip()
+}
+
+
+def _debug_tensor_size_gb(tensor) -> float:
+    if not hasattr(tensor, "element_size") or not hasattr(tensor, "numel"):
+        return 0.0
+    return tensor.element_size() * tensor.numel() / (1024**3)
+
+
+def _debug_dataproto_short(data: DataProto) -> str:
+    tensor_gb = sum(_debug_tensor_size_gb(tensor) for tensor in data.batch.values()) if data.batch is not None else 0.0
+    parts = [f"DataProto(len={len(data)} tensor_gb={tensor_gb:.3f})"]
+    if data.non_tensor_batch is not None and "multi_modal_inputs" in data.non_tensor_batch:
+        image_count = 0
+        image_tokens_sum = 0
+        pixel_values_gb = 0.0
+        for item in data.non_tensor_batch["multi_modal_inputs"]:
+            if not isinstance(item, dict) or not item:
+                continue
+            grid = item.get("image_grid_thw")
+            if grid is not None:
+                try:
+                    if hasattr(grid, "detach"):
+                        grid_arr = grid.detach().reshape(-1, 3).cpu().numpy()
+                    else:
+                        grid_arr = np.asarray(grid).reshape(-1, 3)
+                    per_image_tokens = grid_arr.prod(axis=1)
+                    image_count += int(len(per_image_tokens))
+                    image_tokens_sum += int(per_image_tokens.sum())
+                except Exception:
+                    pass
+            pixel_values = item.get("pixel_values")
+            if pixel_values is not None:
+                pixel_values_gb += _debug_tensor_size_gb(pixel_values)
+        parts.append(f"images={image_count} image_tokens_sum={image_tokens_sum} pixel_values_gb={pixel_values_gb:.3f}")
+    return " ".join(parts)
+
+
+def _debug_workerdict_boundary(event: str, method_name: str, key: str, args: tuple = (), kwargs: dict | None = None) -> None:
+    if not _DEBUG_WORKERDICT_BOUNDARY_ENABLED:
+        return
+    bound_name = f"{key}_{method_name}"
+    if "*" not in _DEBUG_WORKERDICT_METHODS and bound_name not in _DEBUG_WORKERDICT_METHODS:
+        return
+
+    summaries = []
+    for idx, arg in enumerate(args[:3]):
+        if isinstance(arg, DataProto):
+            summaries.append(f"arg{idx}={_debug_dataproto_short(arg)}")
+        else:
+            summaries.append(f"arg{idx}={type(arg).__name__}")
+    if kwargs:
+        summaries.append(f"kwargs={sorted(kwargs.keys())}")
+
+    rss_gb = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+    print(
+        " | ".join(
+            [
+                f"DEBUG_WORKERDICT_BOUNDARY {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"pid={os.getpid()}",
+                f"method={bound_name}",
+                event,
+                f"rss_gb={rss_gb:.3f}",
+                *summaries,
+            ]
+        ),
+        flush=True,
+    )
 
 
 def get_random_string(length: int) -> str:
@@ -843,11 +924,25 @@ def _bind_workers_method_to_parent(cls, key, user_defined_cls):
             def generate_function(name, key=key):
                 def func(self, *args, **kwargs):
                     # dispatch to the actual worker
-                    return getattr(self.worker_dict[key], name)(*args, **kwargs)
+                    _debug_workerdict_boundary("start", name, key, args, kwargs)
+                    try:
+                        output = getattr(self.worker_dict[key], name)(*args, **kwargs)
+                    except Exception:
+                        _debug_workerdict_boundary("exception", name, key, args, kwargs)
+                        raise
+                    _debug_workerdict_boundary("end", name, key, args, kwargs)
+                    return output
 
                 async def async_func(self, *args, **kwargs):
                     # dispatch to the actual worker
-                    return await getattr(self.worker_dict[key], name)(*args, **kwargs)
+                    _debug_workerdict_boundary("start", name, key, args, kwargs)
+                    try:
+                        output = await getattr(self.worker_dict[key], name)(*args, **kwargs)
+                    except Exception:
+                        _debug_workerdict_boundary("exception", name, key, args, kwargs)
+                        raise
+                    _debug_workerdict_boundary("end", name, key, args, kwargs)
+                    return output
 
                 wrapper = async_func if inspect.iscoroutinefunction(method) else func  # noqa: B023
 

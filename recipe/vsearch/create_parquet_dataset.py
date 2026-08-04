@@ -35,6 +35,14 @@ PROMPTS = {
         "system": QWEN3_VL_ANALYSIS_PROMPT,
         "user_template": "<image>{question}",
     },
+    "insight_qwen_agent_no_tool": {
+        "system": QWEN3_VL_ANALYSIS_PROMPT,
+        "user_template": "<image>{question}",
+    },
+    "insight_qwen_agent_no_tool_no_system": {
+        "system": None,
+        "user_template": "<image>{question}",
+    },
     "vreasoner_qwen3_vl": {
         "system": QWEN3_VL_ANALYSIS_PROMPT,
         "user_template": "<image>{question}\nPut your final answer inside <answer>...</answer>.",
@@ -544,12 +552,29 @@ class InSightDocBase(VerlFormatDataset):
             "question_involved_visual_details": visual_details,
             "question_type": example.get("question_type"),
         }
-        optional_extra_info_keys = ("initial_rescale", "initial_rescale_source", "initial_rescale_dpi")
+        optional_extra_info_keys = (
+            "initial_rescale",
+            "initial_rescale_source",
+            "initial_rescale_dpi",
+            "original_initial_rescale",
+            "original_initial_rescale_source",
+            "original_initial_rescale_dpi",
+            "initial_rescale_before_prompt_cap_recovery",
+            "initial_rescale_source_before_prompt_cap_recovery",
+            "initial_rescale_dpi_before_prompt_cap_recovery",
+        )
         for key in optional_extra_info_keys:
             value = example.get(key)
             if value is None:
                 continue
-            extra_info[key] = float(value) if key == "initial_rescale" else value
+            if key in {
+                "initial_rescale",
+                "original_initial_rescale",
+                "initial_rescale_before_prompt_cap_recovery",
+            }:
+                extra_info[key] = float(value)
+            else:
+                extra_info[key] = value
         return extra_info
 
 
@@ -595,6 +620,27 @@ class InSightEvalO3Bench(InSightDocBase):
     def __init__(self, data_root, **extra_options):
         extra_options = {"manifest_file": "o3bench_manifest.json", **extra_options}
         super().__init__(data_root, **extra_options)
+
+
+class InSightEvalDudeFull(InSightDocBase):
+    DATA_SOURCE = "dude"
+
+
+class InSightEvalLongDocURLFull(InSightDocBase):
+    DATA_SOURCE = "longdocurl"
+
+
+class InSightEvalMMLiteFull(MME_RealWorld_Lite):
+    DATA_SOURCE = "mmlite"
+    SPLITS = ["all", "test"]
+
+
+class InSightEvalMMLongBenchFull(InSightDocBase):
+    DATA_SOURCE = "mmlongbench"
+
+
+class InSightEvalMPDocVQAFull(InSightDocBase):
+    DATA_SOURCE = "mpdocvqa"
 
 
 class InSightDocRL(InSightDocBase):

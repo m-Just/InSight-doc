@@ -19,6 +19,13 @@ import warnings
 __all__ = ["hf_tokenizer", "hf_processor"]
 
 
+def _glm_tokenizer_kwargs(name_or_path, kwargs):
+    if isinstance(name_or_path, str) and "glm" in name_or_path.lower():
+        kwargs = dict(kwargs)
+        kwargs.setdefault("fix_mistral_regex", True)
+    return kwargs
+
+
 def set_pad_token_id(tokenizer):
     """Set pad_token_id to eos_token_id if it is None.
 
@@ -58,7 +65,7 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         )
         kwargs["eos_token"] = "<end_of_turn>"
         kwargs["eos_token_id"] = 107
-    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **_glm_tokenizer_kwargs(name_or_path, kwargs))
     if correct_pad_token:
         set_pad_token_id(tokenizer)
     return tokenizer
@@ -76,7 +83,7 @@ def hf_processor(name_or_path, **kwargs):
     from transformers import AutoConfig, AutoProcessor
 
     try:
-        processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+        processor = AutoProcessor.from_pretrained(name_or_path, **_glm_tokenizer_kwargs(name_or_path, kwargs))
         config = AutoConfig.from_pretrained(name_or_path, **kwargs)
 
         # Bind vlm model's get_rope_index method to processor
@@ -94,6 +101,8 @@ def hf_processor(name_or_path, **kwargs):
                 from transformers.models.qwen3_vl import Qwen3VLModel
 
                 processor.get_rope_index = types.MethodType(Qwen3VLModel.get_rope_index, processor)
+            case "Glm4vProcessor":
+                pass
             case "Glm4vImageProcessor":
                 from transformers.models.glm4v import Glm4vModel
 

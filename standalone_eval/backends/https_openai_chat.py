@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import pandas as pd
+from openai._types import NotGiven
 from PIL import Image
 
 from insight_agent_core.images import cap_size_by_area, load_prompt_image, resize_dims_by_factor
 from insight_agent_core.insight_qwen_agent import resolve_dynamic_initial_rescale
-from insight_agent_core.openai_https import _image_to_data_url
 from standalone_eval.backends.base import RolloutJob
+from standalone_eval.backends.openai_https import _image_to_data_url
 from standalone_eval.core.export import (
     ground_truth_is_not_answerable,
     make_export_id,
@@ -38,6 +39,12 @@ def optional_https_string(value: Any) -> str | None:
     if not text or text.lower() in {"none", "null"}:
         return None
     return text
+
+
+def exportable_openai_option(value: Any) -> Any:
+    if isinstance(value, NotGiven):
+        return "default"
+    return value
 
 
 def image_ref_value(image_ref: Any) -> Any:
@@ -165,11 +172,6 @@ def is_context_overflow_error_text(text: str) -> bool:
     )
 
 
-def is_timeout_error_text(text: str) -> bool:
-    lowered = text.lower()
-    return "timeout" in lowered or "timed out" in lowered
-
-
 def response_usage_value(response: Any, name: str) -> int | None:
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -204,6 +206,7 @@ def build_https_export_record(
     export_dir: Path,
 ) -> str:
     extra_info = dict(row.get("extra_info") or {})
+    extra_info["agent_name"] = args.agent_name
     initial_question = str(extra_info.get("question") or "")
     export_id = make_export_id({**row, "extra_info": extra_info}, sample_index, trial_idx)
     messages_api = [*messages, {"role": "assistant", "content": response_text}]
@@ -271,7 +274,9 @@ async def create_https_client(args: argparse.Namespace):
         base_url=args.https_base_url,
         timeout=args.https_timeout,
     )
-    return client.with_options(max_retries=args.https_max_retries), insight_api.complete_chat_and_maybe_log
+    if not isinstance(args.https_max_retries, NotGiven):
+        client = client.with_options(max_retries=args.https_max_retries)
+    return client, insight_api.complete_chat_and_maybe_log
 
 
 class HTTPSOpenAIChatBackend:
@@ -293,8 +298,8 @@ class HTTPSOpenAIChatBackend:
                 "endpoint_type": "openai_compatible_https_chat",
                 "base_url": args.https_base_url,
                 "model": args.model,
-                "timeout": args.https_timeout,
-                "max_retries": args.https_max_retries,
+                "timeout": exportable_openai_option(args.https_timeout),
+                "max_retries": exportable_openai_option(args.https_max_retries),
                 "image_format": args.https_image_format,
                 "image_detail": optional_https_string(args.https_image_detail),
                 "reasoning_effort": optional_https_string(args.https_reasoning_effort),
@@ -329,8 +334,6 @@ class HTTPSOpenAIChatBackend:
                     extra_info = item.get("extra_info") or {}
                     item["uid"] = str(extra_info.get("question_id") or len(rows))
                 rows.append(item)
-                if max_samples > 0 and len(rows) >= max_samples:
-                    return rows
         return rows
 
     def basic_config_extra(self) -> dict[str, Any]:
@@ -352,12 +355,13 @@ class HTTPSOpenAIChatBackend:
         }
 
         async def run_one(job: RolloutJob) -> None:
-            sample = await self._generate_sample(job, semaphore)
+            async with semaphore:
+                sample = await self._generate_sample(job)
             await on_sample(job, sample)
 
         await asyncio.gather(*(run_one(job) for job in jobs))
 
-    async def _generate_sample(self, job: RolloutJob, semaphore: asyncio.Semaphore) -> dict[str, Any]:
+    async def _generate_sample(self, job: RolloutJob) -> dict[str, Any]:
         args = self.args
         row = job.row
         request_id = f"https-{uuid.uuid4().hex}"
@@ -369,7 +373,6 @@ class HTTPSOpenAIChatBackend:
         max_area = int(self.agent_settings.get("gpt_image_max_area", 1280 * 1280) or 0)
         initial_input_pixels_lower_bound = int(self.agent_settings.get("initial_input_pixels_lower_bound", 0) or 0)
         current_rescale = initial_rescale
-        timeout_retry_index = 0
         context_retry_index = 0
         failure_reasons: list[str] = []
         response_text = ""
@@ -399,16 +402,15 @@ class HTTPSOpenAIChatBackend:
             }
             kwargs = {key: value for key, value in kwargs.items() if value is not None}
             try:
-                async with semaphore:
-                    request_t0 = time.perf_counter()
-                    response = await self.complete_chat_and_maybe_log(
-                        messages=messages,
-                        model=args.model,
-                        client=self.client,
-                        show_detailed_error_message=True,
-                        **kwargs,
-                    )
-                    request_elapsed = time.perf_counter() - request_t0
+                request_t0 = time.perf_counter()
+                response = await self.complete_chat_and_maybe_log(
+                    messages=messages,
+                    model=args.model,
+                    client=self.client,
+                    show_detailed_error_message=True,
+                    **kwargs,
+                )
+                request_elapsed = time.perf_counter() - request_t0
                 if not response.choices:
                     failure_reasons = ["empty_response_choices"]
                     break
@@ -420,16 +422,6 @@ class HTTPSOpenAIChatBackend:
                 break
             except Exception as exc:
                 error_text = f"{type(exc).__name__}: {exc}"
-                if is_timeout_error_text(error_text) and timeout_retry_index < args.api_timeout_max_retries:
-                    timeout_retry_index += 1
-                    sleep_seconds = args.api_timeout_retry_backoff_seconds * timeout_retry_index
-                    print(
-                        f"WARNING: HTTPS sample {job.sample_index} hit API timeout; retrying in {sleep_seconds:.1f}s "
-                        f"(retry {timeout_retry_index}/{args.api_timeout_max_retries})",
-                        flush=True,
-                    )
-                    await asyncio.sleep(sleep_seconds)
-                    continue
                 if is_context_overflow_error_text(error_text) and context_retry_index < args.context_overflow_max_halving_trials:
                     context_retry_index += 1
                     current_rescale /= 2.0
@@ -481,6 +473,7 @@ class HTTPSOpenAIChatBackend:
         )
         ground_truth = (row.get("reward_model") or {}).get("ground_truth")
         sample_extra_info = dict(row.get("extra_info") or {})
+        sample_extra_info["agent_name"] = args.agent_name
         sample_extra_info["conversation_export_json_path"] = export_path
         return {
             "sample_index": job.sample_index,

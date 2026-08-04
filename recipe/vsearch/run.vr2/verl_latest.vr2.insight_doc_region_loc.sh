@@ -31,6 +31,10 @@ export JUDGE_MODEL=gpt-5-nano
 # export OPENAI_API_KEY='sk-TF4MriCPDbUsIaUXRY21hfEDu2OlnjDBssqMnX3i8I3RvmIx'
 # export OPENAI_CLIENT_TIMEOUT=60
 export OPENAI_CLIENT_TIMEOUT=1800
+# Long VR2 evals send many multi-image requests through API_HTTP(S)_PROXY.
+# Disable proxy keepalive by default to avoid long-lived pooled connections
+# entering read stalls; override with API_DISABLE_KEEPALIVE=0 if needed.
+export API_DISABLE_KEEPALIVE="${API_DISABLE_KEEPALIVE:-1}"
 
 export TRAIN_FILES='[/scratch/ywxzml3j/likaican/data/InSightDocRegionLocalization/all-vsearcher_qwen3vl.parquet]'
 # export VAL_FILES='[/scratch/ywxzml3j/likaican/data/vstar_bench/full-deepeyes_prompt-vreasoner.parquet,/scratch/ywxzml3j/likaican/data/o3_bench/release_v1_3-deepeyes_prompt-vreasoner.parquet]'
@@ -84,7 +88,7 @@ run_experiment \
     custom_reward_function.reward_kwargs.reward_weights.tool=0.0 \
     custom_reward_function.reward_kwargs.format_reward.simple=True \
     trainer.debug_skip_worker_init="${DEBUG_SKIP_WORKER_INIT:-False}" \
-    data.val_batch_size=16 \
+    data.val_batch_size="${VAL_BATCH_SIZE:-16}" \
     data.validation_shuffle=False \
     custom_reward_function.reward_kwargs.max_retries=15 \
     custom_reward_function.reward_kwargs.retry_interval=90 \

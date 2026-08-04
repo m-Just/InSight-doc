@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 import uuid
 from pathlib import Path
@@ -71,7 +72,12 @@ async def run_rollout(
 
     await backend.prepare()
     try:
-        rows = await backend.load_rows(canonical_val_files, int(args.max_samples))
+        rows = await backend.load_rows(canonical_val_files, -1)
+        if bool(getattr(args, "shuffle_rows", True)):
+            random.Random(int(getattr(args, "shuffle_seed", 42))).shuffle(rows)
+        max_samples = int(args.max_samples)
+        if max_samples > 0:
+            rows = rows[:max_samples]
         basic_config = build_basic_config(
             args,
             agent_settings=agent_settings,
@@ -205,6 +211,10 @@ async def run_rollout(
         "num_expected_samples": len(jobs),
         "num_queued_samples": len(queued_jobs),
         "num_trials": args.num_trials,
+        "row_order": {
+            "shuffle_rows": bool(getattr(args, "shuffle_rows", True)),
+            "shuffle_seed": int(getattr(args, "shuffle_seed", 42)),
+        },
         "resume": {
             "mode": "automatic",
             "loaded_existing": resume_existing_count,

@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import time
 
 import torch
 from torch import nn
@@ -44,6 +45,175 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_REF_MICROBATCH_DEBUG_ENABLED = os.environ.get(
+    "VERL_DEBUG_REF_MICROBATCH", os.environ.get("VERL_DEBUG_MEM", "")
+).lower() in {"1", "true", "yes", "on"}
+_ACTOR_UPDATE_DEBUG_ENABLED = os.environ.get(
+    "VERL_DEBUG_ACTOR_UPDATE", os.environ.get("VERL_DEBUG_MEM", "")
+).lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_tensor_size_gb(tensor) -> float:
+    if not hasattr(tensor, "element_size") or not hasattr(tensor, "numel"):
+        return 0.0
+    return tensor.element_size() * tensor.numel() / (1024**3)
+
+
+def _debug_tensor_sum(tensor) -> int:
+    if tensor is None or not hasattr(tensor, "detach"):
+        return 0
+    return int(tensor.detach().sum().item())
+
+
+def _debug_response_token_sum(responses, pad_token_id: int) -> int:
+    if responses is None or not hasattr(responses, "detach"):
+        return 0
+    return int(responses.detach().ne(pad_token_id).sum().item())
+
+
+def _debug_distributed_rank() -> int:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return -1
+    return int(torch.distributed.get_rank())
+
+
+def _debug_cuda_memory_summary() -> str:
+    if not torch.cuda.is_available():
+        return "cuda=unavailable"
+    try:
+        device = torch.cuda.current_device()
+        return (
+            f"cuda_device={device} "
+            f"alloc_gb={torch.cuda.memory_allocated(device) / (1024**3):.3f} "
+            f"reserved_gb={torch.cuda.memory_reserved(device) / (1024**3):.3f} "
+            f"max_alloc_gb={torch.cuda.max_memory_allocated(device) / (1024**3):.3f} "
+            f"max_reserved_gb={torch.cuda.max_memory_reserved(device) / (1024**3):.3f}"
+        )
+    except Exception as exc:
+        return f"cuda_mem_error={type(exc).__name__}:{exc}"
+
+
+def _debug_micro_batch_summary(micro_batch: DataProto, pad_token_id: int) -> str:
+    batch = micro_batch.batch
+    non_tensor_batch = micro_batch.non_tensor_batch
+
+    attention_mask = batch.get("attention_mask") if batch is not None else None
+    responses = batch.get("responses") if batch is not None else None
+    valid_tokens = _debug_tensor_sum(attention_mask)
+    response_tokens = _debug_response_token_sum(responses, pad_token_id)
+    prompt_tokens = max(0, valid_tokens - response_tokens)
+
+    input_shape = tuple(batch["input_ids"].shape) if batch is not None and "input_ids" in batch else None
+    response_shape = tuple(responses.shape) if responses is not None and hasattr(responses, "shape") else None
+
+    image_items = 0
+    image_count = 0
+    image_tokens_sum = 0
+    image_tokens_max = 0
+    pixel_values_gb = 0.0
+    pixel_shapes = []
+
+    if non_tensor_batch is not None and "multi_modal_inputs" in non_tensor_batch:
+        for item in non_tensor_batch["multi_modal_inputs"]:
+            if not isinstance(item, dict) or not item:
+                continue
+            image_items += 1
+            grid = item.get("image_grid_thw")
+            if grid is not None:
+                try:
+                    if hasattr(grid, "detach"):
+                        grid_tensor = grid.detach().reshape(-1, 3)
+                    else:
+                        grid_tensor = torch.as_tensor(grid).reshape(-1, 3)
+                    per_image_tokens = grid_tensor.prod(dim=1)
+                    image_count += int(per_image_tokens.numel())
+                    if per_image_tokens.numel() > 0:
+                        image_tokens_sum += int(per_image_tokens.sum().item())
+                        image_tokens_max = max(image_tokens_max, int(per_image_tokens.max().item()))
+                except Exception:
+                    pass
+            pixel_values = item.get("pixel_values")
+            if pixel_values is not None:
+                pixel_values_gb += _debug_tensor_size_gb(pixel_values)
+                if len(pixel_shapes) < 5 and hasattr(pixel_values, "shape"):
+                    pixel_shapes.append(tuple(pixel_values.shape))
+
+    return (
+        f"mb_len={len(micro_batch)} input_shape={input_shape} response_shape={response_shape} "
+        f"valid_tokens={valid_tokens} prompt_tokens={prompt_tokens} response_tokens={response_tokens} "
+        f"mm_items={image_items} images={image_count} image_tokens_sum={image_tokens_sum} "
+        f"image_tokens_max={image_tokens_max} pixel_values_gb={pixel_values_gb:.3f} "
+        f"pixel_shapes={pixel_shapes}"
+    )
+
+
+def _debug_ref_micro_batch(
+    *,
+    label: str,
+    micro_batch: DataProto,
+    pad_token_id: int,
+    micro_batch_idx: int,
+    num_micro_batches: int,
+    outputs: dict[str, torch.Tensor] | None = None,
+) -> None:
+    parts = [
+        f"DEBUG_REF_MICROBATCH {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"pid={os.getpid()} rank={_debug_distributed_rank()} local_rank={os.environ.get('LOCAL_RANK', '?')}",
+        f"{label} micro_batch={micro_batch_idx + 1}/{num_micro_batches}",
+        _debug_cuda_memory_summary(),
+        _debug_micro_batch_summary(micro_batch, pad_token_id),
+    ]
+    if outputs is not None:
+        output_parts = []
+        for key, value in outputs.items():
+            if hasattr(value, "shape"):
+                output_parts.append(f"{key}_shape={tuple(value.shape)}")
+                output_parts.append(f"{key}_gb={_debug_tensor_size_gb(value):.6f}")
+        if output_parts:
+            parts.append(" ".join(output_parts))
+    print(" | ".join(parts), flush=True)
+
+
+def _debug_actor_update_event(
+    *,
+    label: str,
+    pad_token_id: int,
+    micro_batch: DataProto | None = None,
+    epoch_idx: int | None = None,
+    batch_idx: int | None = None,
+    micro_batch_idx: int | None = None,
+    num_micro_batches: int | None = None,
+    outputs: dict[str, torch.Tensor] | None = None,
+    extra: str | None = None,
+) -> None:
+    index_parts = []
+    if epoch_idx is not None:
+        index_parts.append(f"epoch={epoch_idx + 1}")
+    if batch_idx is not None:
+        index_parts.append(f"mini_batch={batch_idx + 1}")
+    if micro_batch_idx is not None and num_micro_batches is not None:
+        index_parts.append(f"micro_batch={micro_batch_idx + 1}/{num_micro_batches}")
+
+    parts = [
+        f"DEBUG_ACTOR_UPDATE {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"pid={os.getpid()} rank={_debug_distributed_rank()} local_rank={os.environ.get('LOCAL_RANK', '?')}",
+        " ".join([label, *index_parts]).strip(),
+        _debug_cuda_memory_summary(),
+    ]
+    if micro_batch is not None:
+        parts.append(_debug_micro_batch_summary(micro_batch, pad_token_id))
+    if outputs is not None:
+        output_parts = []
+        for key, value in outputs.items():
+            if hasattr(value, "shape"):
+                output_parts.append(f"{key}_shape={tuple(value.shape)}")
+                output_parts.append(f"{key}_gb={_debug_tensor_size_gb(value):.6f}")
+        if output_parts:
+            parts.append(" ".join(output_parts))
+    if extra:
+        parts.append(extra)
+    print(" | ".join(parts), flush=True)
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -240,6 +410,14 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
+                    if self.use_ulysses_sp and is_vlm_model:
+                        model_type = getattr(
+                            getattr(self.actor_module, "module", self.actor_module).config,
+                            "model_type",
+                            None,
+                        )
+                        if model_type in {"qwen3_vl", "qwen3_vl_moe"}:
+                            extra_args["shifted_labels"] = input_ids_rmpad_rolled
 
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
@@ -446,6 +624,9 @@ class DataParallelPPOActor(BasePPOActor):
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         pad_token_id = data.meta_info.get("pad_token_id", 0)
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+        debug_ref_microbatch = _REF_MICROBATCH_DEBUG_ENABLED and bool(
+            data.meta_info.get("debug_ref_log_prob_microbatch", False)
+        )
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -454,23 +635,114 @@ class DataParallelPPOActor(BasePPOActor):
             if "uid" in data.non_tensor_batch:
                 non_tensor_select_keys.append("uid")
 
+        if debug_ref_microbatch:
+            _debug_ref_micro_batch(
+                label="before_select",
+                micro_batch=data,
+                pad_token_id=pad_token_id,
+                micro_batch_idx=0,
+                num_micro_batches=1,
+            )
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+        if debug_ref_microbatch:
+            _debug_ref_micro_batch(
+                label="after_select",
+                micro_batch=data,
+                pad_token_id=pad_token_id,
+                micro_batch_idx=0,
+                num_micro_batches=1,
+            )
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
+            if debug_ref_microbatch:
+                _debug_ref_micro_batch(
+                    label="before_prepare_dynamic_batch",
+                    micro_batch=data,
+                    pad_token_id=pad_token_id,
+                    micro_batch_idx=0,
+                    num_micro_batches=1,
+                )
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            if debug_ref_microbatch:
+                _debug_ref_micro_batch(
+                    label="after_prepare_dynamic_batch",
+                    micro_batch=data,
+                    pad_token_id=pad_token_id,
+                    micro_batch_idx=0,
+                    num_micro_batches=len(micro_batches),
+                )
         else:
+            if debug_ref_microbatch:
+                _debug_ref_micro_batch(
+                    label="before_fixed_split",
+                    micro_batch=data,
+                    pad_token_id=pad_token_id,
+                    micro_batch_idx=0,
+                    num_micro_batches=1,
+                )
             micro_batches = data.split(micro_batch_size)
+            if debug_ref_microbatch:
+                _debug_ref_micro_batch(
+                    label="after_fixed_split",
+                    micro_batch=data,
+                    pad_token_id=pad_token_id,
+                    micro_batch_idx=0,
+                    num_micro_batches=len(micro_batches),
+                )
+
+        num_micro_batches = len(micro_batches)
+        if debug_ref_microbatch:
+            print(
+                " | ".join(
+                    [
+                        f"DEBUG_REF_MICROBATCH {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"pid={os.getpid()} rank={_debug_distributed_rank()} "
+                        f"local_rank={os.environ.get('LOCAL_RANK', '?')}",
+                        "start",
+                        f"data_len={len(data)} micro_batch_size={micro_batch_size} "
+                        f"use_dynamic_bsz={use_dynamic_bsz} num_micro_batches={num_micro_batches}",
+                        _debug_cuda_memory_summary(),
+                        _debug_micro_batch_summary(data, pad_token_id),
+                    ]
+                ),
+                flush=True,
+            )
 
         log_probs_lst = []
         entropy_lst = []
         sum_pi_squared_lst = []
-        for micro_batch in micro_batches:
+        for micro_batch_idx, micro_batch in enumerate(micro_batches):
+            if debug_ref_microbatch:
+                _debug_ref_micro_batch(
+                    label="before_to_device",
+                    micro_batch=micro_batch,
+                    pad_token_id=pad_token_id,
+                    micro_batch_idx=micro_batch_idx,
+                    num_micro_batches=num_micro_batches,
+                )
             micro_batch = micro_batch.to(get_device_id())
+            if debug_ref_microbatch:
+                _debug_ref_micro_batch(
+                    label="after_to_device_before_forward",
+                    micro_batch=micro_batch,
+                    pad_token_id=pad_token_id,
+                    micro_batch_idx=micro_batch_idx,
+                    num_micro_batches=num_micro_batches,
+                )
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
             with torch.no_grad():
                 outputs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                )
+            if debug_ref_microbatch:
+                _debug_ref_micro_batch(
+                    label="after_forward",
+                    micro_batch=micro_batch,
+                    pad_token_id=pad_token_id,
+                    micro_batch_idx=micro_batch_idx,
+                    num_micro_batches=num_micro_batches,
+                    outputs=outputs,
                 )
             log_probs_lst.append(outputs["log_probs"])
             if calculate_entropy:
@@ -478,7 +750,35 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_sum_pi_squared:
                 sum_pi_squared_lst.append(outputs["sum_pi_squared"])
 
+        if debug_ref_microbatch:
+            print(
+                " | ".join(
+                    [
+                        f"DEBUG_REF_MICROBATCH {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"pid={os.getpid()} rank={_debug_distributed_rank()} "
+                        f"local_rank={os.environ.get('LOCAL_RANK', '?')}",
+                        "before_concat",
+                        f"log_probs_parts={len(log_probs_lst)}",
+                        _debug_cuda_memory_summary(),
+                    ]
+                ),
+                flush=True,
+            )
         log_probs = torch.concat(log_probs_lst, dim=0)
+        if debug_ref_microbatch:
+            print(
+                " | ".join(
+                    [
+                        f"DEBUG_REF_MICROBATCH {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"pid={os.getpid()} rank={_debug_distributed_rank()} "
+                        f"local_rank={os.environ.get('LOCAL_RANK', '?')}",
+                        "after_concat",
+                        f"log_probs_shape={tuple(log_probs.shape)} log_probs_gb={_debug_tensor_size_gb(log_probs):.6f}",
+                        _debug_cuda_memory_summary(),
+                    ]
+                ),
+                flush=True,
+            )
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
         if calculate_sum_pi_squared:
@@ -554,12 +854,25 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        debug_actor_update = _ACTOR_UPDATE_DEBUG_ENABLED
+        if debug_actor_update:
+            _debug_actor_update_event(
+                label="start",
+                pad_token_id=pad_token_id,
+                micro_batch=data,
+                extra=(
+                    f"ppo_epochs={self.config.ppo_epochs} mini_batches={len(mini_batches)} "
+                    f"ppo_mini_batch_size={self.config.ppo_mini_batch_size} "
+                    f"use_dynamic_bsz={self.config.use_dynamic_bsz} "
+                    f"ppo_max_token_len_per_gpu={self.config.ppo_max_token_len_per_gpu}"
+                ),
+            )
 
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
         }
-        for _ in range(self.config.ppo_epochs):
+        for epoch_idx in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
@@ -570,10 +883,48 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
-                self.actor_optimizer.zero_grad()
+                num_micro_batches = len(micro_batches)
+                if debug_actor_update:
+                    _debug_actor_update_event(
+                        label="mini_batch_start",
+                        pad_token_id=pad_token_id,
+                        micro_batch=mini_batch,
+                        epoch_idx=epoch_idx,
+                        batch_idx=batch_idx,
+                        extra=f"num_micro_batches={num_micro_batches}",
+                    )
 
-                for micro_batch in micro_batches:
+                self.actor_optimizer.zero_grad()
+                if debug_actor_update:
+                    _debug_actor_update_event(
+                        label="after_zero_grad",
+                        pad_token_id=pad_token_id,
+                        epoch_idx=epoch_idx,
+                        batch_idx=batch_idx,
+                    )
+
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
+                    if debug_actor_update:
+                        _debug_actor_update_event(
+                            label="before_to_device",
+                            pad_token_id=pad_token_id,
+                            micro_batch=micro_batch,
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch_idx,
+                            micro_batch_idx=micro_batch_idx,
+                            num_micro_batches=num_micro_batches,
+                        )
                     micro_batch = micro_batch.to(get_device_id())
+                    if debug_actor_update:
+                        _debug_actor_update_event(
+                            label="after_to_device_before_forward",
+                            pad_token_id=pad_token_id,
+                            micro_batch=micro_batch,
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch_idx,
+                            micro_batch_idx=micro_batch_idx,
+                            num_micro_batches=num_micro_batches,
+                        )
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
                     response_mask = model_inputs["response_mask"]
@@ -595,6 +946,17 @@ class DataParallelPPOActor(BasePPOActor):
                     outputs = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    if debug_actor_update:
+                        _debug_actor_update_event(
+                            label="after_forward",
+                            pad_token_id=pad_token_id,
+                            micro_batch=micro_batch,
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch_idx,
+                            micro_batch_idx=micro_batch_idx,
+                            num_micro_batches=num_micro_batches,
+                            outputs=outputs,
+                        )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
 
@@ -668,16 +1030,62 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
+                    if debug_actor_update:
+                        try:
+                            loss_value = float(loss.detach().item())
+                        except Exception:
+                            loss_value = float("nan")
+                        _debug_actor_update_event(
+                            label="before_backward",
+                            pad_token_id=pad_token_id,
+                            micro_batch=micro_batch,
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch_idx,
+                            micro_batch_idx=micro_batch_idx,
+                            num_micro_batches=num_micro_batches,
+                            extra=f"loss={loss_value:.8g}",
+                        )
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    if debug_actor_update:
+                        _debug_actor_update_event(
+                            label="after_backward",
+                            pad_token_id=pad_token_id,
+                            micro_batch=micro_batch,
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch_idx,
+                            micro_batch_idx=micro_batch_idx,
+                            num_micro_batches=num_micro_batches,
+                        )
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
 
+                if debug_actor_update:
+                    _debug_actor_update_event(
+                        label="before_optimizer_step",
+                        pad_token_id=pad_token_id,
+                        epoch_idx=epoch_idx,
+                        batch_idx=batch_idx,
+                    )
                 grad_norm = self._optimizer_step()
+                if debug_actor_update:
+                    try:
+                        grad_norm_value = float(grad_norm.detach().item())
+                    except Exception:
+                        grad_norm_value = float("nan")
+                    _debug_actor_update_event(
+                        label="after_optimizer_step",
+                        pad_token_id=pad_token_id,
+                        epoch_idx=epoch_idx,
+                        batch_idx=batch_idx,
+                        extra=f"grad_norm={grad_norm_value:.8g}",
+                    )
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        if debug_actor_update:
+            _debug_actor_update_event(label="end", pad_token_id=pad_token_id)
         return metrics

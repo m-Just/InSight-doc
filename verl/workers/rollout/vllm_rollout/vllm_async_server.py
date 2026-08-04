@@ -17,6 +17,8 @@ import inspect
 import json
 import logging
 import os
+import time
+import warnings
 from concurrent.futures import Future
 from pprint import pprint
 from typing import Any, Callable, Optional
@@ -74,11 +76,17 @@ if _VLLM_VERSION > version.parse("0.11.0"):
     if _VLLM_VERSION == version.parse("0.12.0"):
         from vllm.entrypoints.harmony_utils import get_encoding
 
-        get_encoding()
+        try:
+            get_encoding()
+        except Exception as exc:
+            warnings.warn(f"Skipping optional Harmony encoding preload: {exc}", RuntimeWarning)
     elif _VLLM_VERSION >= version.parse("0.13.0"):
         from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 
-        get_encoding()
+        try:
+            get_encoding()
+        except Exception as exc:
+            warnings.warn(f"Skipping optional Harmony encoding preload: {exc}", RuntimeWarning)
 else:
     from vllm.utils import FlexibleArgumentParser, get_tcp_uri
 if _VLLM_VERSION >= version.parse("0.12.0"):
@@ -210,7 +218,15 @@ class vLLMHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
+        try:
+            self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
+        except ValueError:
+            if self.config.max_model_len is None:
+                raise
+            logger.warning(
+                "max_position_embeddings not found in HFModelConfig; using configured max_model_len=%s",
+                self.config.max_model_len,
+            )
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -519,7 +535,7 @@ class vLLMHttpServer:
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        prompt_ids = _dedup_vllm_multimodal_placeholder_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         if image_data is not None:
             multi_modal_data["image"] = image_data
@@ -538,6 +554,7 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
+        request_start = time.perf_counter()
         generator = self.engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -548,9 +565,23 @@ class vLLMHttpServer:
 
         # Get final response
         final_res: Optional[RequestOutput] = None
+        first_output_elapsed_s: float | None = None
+        time_to_first_token_s: float | None = None
+        stream_output_count = 0
+        max_observed_generated_tokens = 0
         async for output in generator:
+            now = time.perf_counter()
+            stream_output_count += 1
+            if first_output_elapsed_s is None:
+                first_output_elapsed_s = now - request_start
+            if output.outputs:
+                observed_tokens = len(output.outputs[0].token_ids or [])
+                max_observed_generated_tokens = max(max_observed_generated_tokens, observed_tokens)
+                if observed_tokens > 0 and time_to_first_token_s is None:
+                    time_to_first_token_s = now - request_start
             final_res = output
         assert final_res is not None
+        request_elapsed_s = time.perf_counter() - request_start
 
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
@@ -581,6 +612,13 @@ class vLLMHttpServer:
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
+            metrics={
+                "vllm_request_elapsed_s": request_elapsed_s,
+                "vllm_first_output_elapsed_s": first_output_elapsed_s if first_output_elapsed_s is not None else -1.0,
+                "vllm_time_to_first_token_s": time_to_first_token_s if time_to_first_token_s is not None else -1.0,
+                "vllm_stream_output_count": float(stream_output_count),
+                "vllm_max_observed_generated_tokens": float(max_observed_generated_tokens),
+            },
         )
 
     async def wake_up(self):
@@ -881,9 +919,13 @@ class vLLMReplica(RolloutReplica):
         return {"aborted": False, "request_id": request_id, "error": "Request not found on any server"}
 
 
-def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
-    """Deduplicate consecutive image tokens in prompt_ids for Qwen2.5-VL, since vLLM will replicate the
-    <|image_pad|> and <|video_pad|> token by image_data.
+def _dedup_vllm_multimodal_placeholder_tokens(prompt_ids: list[int], processor):
+    """Deduplicate repeated multimodal placeholder tokens before sending a TokensPrompt to vLLM.
+
+    Some HF multimodal processors expand a single image/video placeholder into one token per visual feature.
+    vLLM expects the token-level request to contain one placeholder token per image/video and uses
+    ``multi_modal_data`` to replicate the placeholder internally. Passing the already-expanded token runs can
+    break vLLM's multimodal position accounting, including GLM4V M-RoPE.
 
     For example,
     ```
@@ -892,18 +934,33 @@ def _qwen2_5_vl_dedup_image_tokens(prompt_ids: list[int], processor):
     <|vision_start|><|image_pad|><|vision_end|>
     ```
     """
-    if processor is not None and "Qwen2VLImageProcessor" in processor.image_processor.__class__.__name__:
-        prompt_ids = np.array(prompt_ids)
-
-        # Create a mask where True indicates elements to keep
-        mask = np.ones(len(prompt_ids), dtype=bool)
-
-        # Find where the array equals the value
-        is_value = (prompt_ids == processor.image_token_id) | (prompt_ids == processor.video_token_id)
-
-        # Find consecutive duplicates by checking if previous element is also the value
-        mask[1:] &= ~(is_value[1:] & is_value[:-1])
-
-        return prompt_ids[mask].tolist()
-    else:
+    if processor is None or getattr(processor, "image_processor", None) is None:
         return prompt_ids
+
+    image_processor_name = processor.image_processor.__class__.__name__
+    if not image_processor_name.startswith(
+        ("Qwen2VLImageProcessor", "Qwen3VLImageProcessor", "Glm4vImageProcessor")
+    ):
+        return prompt_ids
+
+    placeholder_token_ids = {
+        token_id
+        for token_id in (
+            getattr(processor, "image_token_id", None),
+            getattr(processor, "video_token_id", None),
+        )
+        if token_id is not None
+    }
+    if not placeholder_token_ids:
+        return prompt_ids
+
+    prompt_ids_array = np.array(prompt_ids)
+
+    # Keep the first token in each consecutive placeholder run.
+    mask = np.ones(len(prompt_ids_array), dtype=bool)
+    is_value = np.isin(prompt_ids_array, list(placeholder_token_ids))
+    mask[1:] &= ~(is_value[1:] & is_value[:-1])
+    return prompt_ids_array[mask].tolist()
+
+
+_qwen2_5_vl_dedup_image_tokens = _dedup_vllm_multimodal_placeholder_tokens

@@ -8,8 +8,8 @@ https_openai_chat:
   # Null means the standalone HTTPS rollout path reads OPENAI_BASE_URL at runtime.
   base_url: null
   api_key_env: OPENAI_API_KEY
-  timeout: 180
-  max_retries: 1
+  timeout: 3600
+  max_retries: default
   image_format: png
   image_detail: high
   reasoning_effort: high

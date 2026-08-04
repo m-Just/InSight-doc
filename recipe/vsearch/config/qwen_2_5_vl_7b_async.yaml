@@ -37,6 +37,8 @@ data:
     class_path: ${project_root}/verl/experimental/dataset/vsearch_sampler.py
     class_name: VSearchBatchSampler
     weights: null
+    weights_file: null
+    stop_after: null
 
 actor_rollout_ref:
   model:

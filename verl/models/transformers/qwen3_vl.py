@@ -232,6 +232,32 @@ class Qwen3VLCausalLMOutputForPPO(Qwen3VLCausalLMOutputWithPast):
     entropy: Optional[torch.FloatTensor] = None
 
 
+def _prepare_fused_labels(
+    hidden_states: torch.Tensor,
+    input_ids: Optional[torch.LongTensor],
+    labels: Optional[torch.LongTensor],
+    shifted_labels: Optional[torch.LongTensor],
+) -> torch.LongTensor:
+    if shifted_labels is not None:
+        fused_labels = shifted_labels
+    elif labels is not None:
+        fused_labels = torch.roll(labels, shifts=-1, dims=-1)
+    elif input_ids is not None:
+        fused_labels = torch.roll(input_ids, shifts=-1, dims=-1)
+    else:
+        raise RuntimeError("To use fused Qwen3-VL forward, input_ids, labels, or shifted_labels must be provided.")
+
+    target_shape = hidden_states.shape[:-1]
+    target_numel = hidden_states.numel() // hidden_states.shape[-1]
+    if fused_labels.numel() != target_numel:
+        raise AssertionError(
+            f"Fused Qwen3-VL label/token mismatch: hidden tokens={target_numel}, "
+            f"label tokens={fused_labels.numel()}, hidden shape={tuple(hidden_states.shape)}, "
+            f"label shape={tuple(fused_labels.shape)}"
+        )
+    return fused_labels.reshape(target_shape).to(torch.int64)
+
+
 def qwen3_vl_base_forward(
     self: "Qwen3VLForConditionalGeneration",
     input_ids: torch.LongTensor,
@@ -278,16 +304,11 @@ def forward_with_torch_backend(
 ) -> "Qwen3VLCausalLMOutputForPPO":
     from verl.utils.experimental.torch_functional import FusedLinearForPPO
 
+    shifted_labels = kwargs.pop("shifted_labels", None)
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
 
-    # Loss calculations
-    if labels is not None:
-        rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
-    elif input_ids is not None:
-        rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
-    else:
-        raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
+    rolled_labels = _prepare_fused_labels(hidden_states, input_ids, labels, shifted_labels)
 
     fused_linear_for_ppo = FusedLinearForPPO()
     log_probs, entropy = fused_linear_for_ppo.forward(
@@ -312,16 +333,11 @@ def forward_with_triton_backend(
 ) -> "Qwen3VLCausalLMOutputForPPO":
     from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 
+    shifted_labels = kwargs.pop("shifted_labels", None)
     outputs = self.model(input_ids, **kwargs)
     hidden_states = outputs[0]
 
-    # Loss calculations
-    if labels is not None:
-        rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
-    elif input_ids is not None:
-        rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
-    else:
-        raise RuntimeError("To use forward_with_triton_backend, either labels or input_ids must be provided.")
+    rolled_labels = _prepare_fused_labels(hidden_states, input_ids, labels, shifted_labels)
 
     log_probs, entropy = linear_cross_entropy(
         hidden_states,

@@ -111,3 +111,6 @@ verl = [
   "trainer/config/*.yaml",
   "trainer/config/*/*.yaml",
 ]
+insight_agent_core = [
+  "configs/*.yaml",
+]

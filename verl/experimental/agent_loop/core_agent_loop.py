@@ -11,6 +11,7 @@ from insight_agent_core import (
     InSightQwenAgentConfig,
     InSightQwenAgentRunner,
 )
+from insight_agent_core.prompt_length import PromptLengthEstimate
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopMetrics,
     AgentLoopOutput,
@@ -19,11 +20,12 @@ from verl.experimental.agent_loop.agent_loop import (
     register,
 )
 from verl.experimental.agent_loop.insight_o3_agent_loop import VReasonerLoopV2
-from verl.experimental.agent_loop.qwen_agent_loop import (
-    QwenAgentLoop,
-    _build_insight_export_conversation,
+from verl.experimental.agent_loop.qwen_agent_loop import QwenAgentLoop
+from verl.utils.vreasoner_v2_conversation_export import (
+    build_export_record,
+    build_insight_export_conversation as _build_insight_export_conversation,
+    export_conversation,
 )
-from verl.utils.vreasoner_v2_conversation_export import build_export_record, export_conversation
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,23 @@ class VerlCoreRuntime:
     async def extract_tool_calls(self, response_ids: list[int]) -> list[CoreFunctionCall]:
         _, tool_calls = await self.loop.tool_parser.extract_tool_calls(response_ids)
         return [CoreFunctionCall(name=call.name, arguments=call.arguments) for call in tool_calls]
+
+    async def estimate_prompt_length(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        images: list[Any] | None = None,
+        videos: list[Any] | None = None,
+        prompt_ids: list[int],
+    ) -> PromptLengthEstimate:
+        del messages, tools, images, videos
+        return PromptLengthEstimate(
+            token_count=len(prompt_ids),
+            estimator_name="tokenized",
+            supported=True,
+            metadata={"prompt_ids_tokens": len(prompt_ids)},
+        )
 
 
 @register("insight_qwen_agent_core")

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from .prompt_length import PromptLengthEstimate
+
 
 @dataclass
 class CoreFunctionCall:
@@ -55,5 +57,19 @@ class CoreRuntime(Protocol):
     async def decode(self, token_ids: list[int], *, skip_special_tokens: bool = True) -> str:
         ...
 
+    async def decode_display_chunks(self, token_ids: list[int], *, skip_special_tokens: bool = True) -> list[str]:
+        ...
+
     async def extract_tool_calls(self, response_ids: list[int]) -> list[CoreFunctionCall]:
+        ...
+
+    async def estimate_prompt_length(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        images: list[Any] | None = None,
+        videos: list[Any] | None = None,
+        prompt_ids: list[int],
+    ) -> PromptLengthEstimate:
         ...

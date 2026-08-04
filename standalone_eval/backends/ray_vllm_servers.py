@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Any
 
@@ -39,7 +40,7 @@ def ray_rollout_config(args: Any) -> Any:
             "scheduling_policy": args.ray_scheduling_policy,
             "max_model_len": args.max_model_len,
             "max_num_seqs": args.ray_max_num_seqs,
-            "disable_log_stats": True,
+            "disable_log_stats": args.ray_disable_log_stats,
             "enable_chunked_prefill": args.ray_enable_chunked_prefill,
             "enable_prefix_caching": args.ray_enable_prefix_caching,
             "load_format": args.ray_load_format,
@@ -110,15 +111,23 @@ async def launch_ray_vllm_servers(args: Any) -> tuple[list[Any], list[str], list
         handles.append(server)
         actor_names.append(actor_name)
 
-    for replica_rank, server in enumerate(handles):
-        master_address, master_port = await server.get_master_address.remote()
+    master_addresses = await asyncio.gather(*[server.get_master_address.remote() for server in handles])
+    for replica_rank, (master_address, master_port) in enumerate(master_addresses):
         print(
             f"launching Ray vLLM server replica={replica_rank} "
             f"actor={actor_names[replica_rank]} master={master_address}:{master_port}",
             flush=True,
         )
-        await server.launch_server.remote(master_address=master_address, master_port=master_port)
-        server_address, server_port = await server.get_server_address.remote()
+
+    await asyncio.gather(
+        *[
+            server.launch_server.remote(master_address=master_address, master_port=master_port)
+            for server, (master_address, master_port) in zip(handles, master_addresses, strict=True)
+        ]
+    )
+
+    server_addresses = await asyncio.gather(*[server.get_server_address.remote() for server in handles])
+    for replica_rank, (server_address, server_port) in enumerate(server_addresses):
         metadata.append(
             {
                 "endpoint_type": "verl_ray_vllm",

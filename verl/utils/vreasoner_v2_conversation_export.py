@@ -17,6 +17,7 @@ import verl.utils.vreasoner_v2_prompt as prompts
 
 
 _EXPORT_ID_SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+_IMAGE_LABEL_RE = re.compile(r"^Image (\d+):$")
 
 
 def _slugify_export_component(value: Any, *, fallback: str) -> str:
@@ -340,6 +341,153 @@ def parse_user_message(content: Any, *, initial_question: str) -> dict[str, Any]
     if secondary_types:
         out["secondary_types"] = secondary_types
     return out
+
+
+def _message_text_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
+        return "".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, Mapping) and item.get("type") == "text"
+        )
+    return "" if content is None else str(content)
+
+
+def _text_before_tag(text: str, tag: str) -> str:
+    marker = f"<{tag}>"
+    if marker not in text:
+        return text.strip()
+    return text.split(marker, 1)[0].strip()
+
+
+def _convert_insight_export_multimodal_content(content: Any, *, next_presented_idx: int) -> tuple[Any, int]:
+    if not isinstance(content, Sequence) or isinstance(content, (str, bytes, bytearray)):
+        return _message_text_content(content), next_presented_idx
+
+    converted_content: list[dict[str, Any]] = []
+    pending_presented_idx: int | None = None
+    for item in content:
+        if not isinstance(item, Mapping):
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text", "")
+            converted_content.append({"type": "text", "text": text})
+            match = _IMAGE_LABEL_RE.match(str(text).strip())
+            if match:
+                pending_presented_idx = int(match.group(1))
+            continue
+
+        if item_type == "image":
+            presented_idx = pending_presented_idx if pending_presented_idx is not None else next_presented_idx
+            converted_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"presented://{presented_idx}",
+                        "detail": "high",
+                    },
+                }
+            )
+            next_presented_idx = max(next_presented_idx, presented_idx + 1)
+            pending_presented_idx = None
+            continue
+
+        if "text" in item and isinstance(item["text"], str):
+            converted_content.append({"type": "text", "text": item["text"]})
+
+    return converted_content, next_presented_idx
+
+
+def build_insight_export_conversation(messages: list[dict[str, Any]], *, initial_question: str) -> list[dict[str, Any]]:
+    conversation: list[dict[str, Any]] = []
+    next_presented_idx = 0
+    last_assistant_idx = max((idx for idx, message in enumerate(messages) if message.get("role") == "assistant"), default=-1)
+
+    for idx, message in enumerate(messages):
+        role = message.get("role")
+        content = message.get("content")
+
+        if role == "system":
+            conversation.append(
+                {
+                    "message_idx": idx,
+                    "role": "system",
+                    "type": "system_prompt",
+                    "content": {"text": _message_text_content(content)},
+                }
+            )
+            continue
+
+        if role == "assistant":
+            text = _message_text_content(content)
+            parsed = parse_assistant_message(text)
+            extracted_tags = parsed.get("content", {}).get("extracted_tags", {})
+            parsed_tool_call = extracted_tags.get("tool_call")
+            if parsed.get("type") == "others" and parsed_tool_call is not None:
+                tool_call_parse_error = parsed.get("tool_call_parse_error")
+                parsed = {
+                    "type": "tool_call",
+                    "content": {
+                        "think": _text_before_tag(text, "tool_call"),
+                        "tool_call": parsed_tool_call,
+                    },
+                    "tag_counts": parsed.get("tag_counts", {}),
+                }
+                if tool_call_parse_error is not None:
+                    parsed["tool_call_parse_error"] = tool_call_parse_error
+            elif parsed.get("type") == "others" and idx == last_assistant_idx and text.strip():
+                parsed = {
+                    "type": "answer",
+                    "content": {
+                        "think": "",
+                        "answer": text.strip(),
+                    },
+                    "tag_counts": parsed.get("tag_counts", {}),
+                }
+            conversation.append({"message_idx": idx, "role": "assistant", **parsed})
+            continue
+
+        if role == "user":
+            converted_content, next_presented_idx = _convert_insight_export_multimodal_content(
+                content,
+                next_presented_idx=next_presented_idx,
+            )
+            parsed = parse_user_message(converted_content, initial_question=initial_question)
+            conversation.append({"message_idx": idx, "role": "user", **parsed})
+            continue
+
+        if role == "tool":
+            converted_content, next_presented_idx = _convert_insight_export_multimodal_content(
+                content,
+                next_presented_idx=next_presented_idx,
+            )
+            parsed = parse_user_message(converted_content, initial_question=initial_question)
+            if parsed.get("type") == "others":
+                text = parsed.get("content", {}).get("text", "").strip()
+                parsed = {
+                    "type": "tool_result_fail_hint",
+                    "content": {
+                        "error_message": text,
+                        "hint": "",
+                    },
+                }
+            conversation.append({"message_idx": idx, "role": "user", **parsed})
+            continue
+
+        conversation.append(
+            {
+                "message_idx": idx,
+                "role": role,
+                "type": "others",
+                "content": {"value": _message_text_content(content)},
+            }
+        )
+
+    return conversation
 
 
 def parse_answer_verification_hint_message(content: Any) -> dict[str, Any]:

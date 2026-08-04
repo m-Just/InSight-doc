@@ -16,9 +16,12 @@ The main entry point to run the PPO algorithm
 """
 
 import datetime
+import faulthandler
 import json
 import logging
 import os
+import threading
+import time
 import warnings
 from dataclasses import asdict, is_dataclass
 from enum import Enum
@@ -95,6 +98,152 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+_ACTOR_UPDATE_DEBUG_ENABLED = os.environ.get(
+    "VERL_DEBUG_ACTOR_UPDATE", os.environ.get("VERL_DEBUG_MEM", "")
+).lower() in {"1", "true", "yes", "on"}
+_REF_LOG_PROB_DEBUG_ENABLED = os.environ.get(
+    "VERL_DEBUG_REF_LOG_PROB_OUTER", os.environ.get("VERL_DEBUG_MEM", "")
+).lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_tensor_size_gb(tensor) -> float:
+    if not hasattr(tensor, "element_size") or not hasattr(tensor, "numel"):
+        return 0.0
+    return tensor.element_size() * tensor.numel() / (1024**3)
+
+
+def _debug_dist_rank() -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return -1
+    return int(dist.get_rank())
+
+
+def _debug_cuda_mem() -> str:
+    if not torch.cuda.is_available():
+        return "cuda=unavailable"
+    try:
+        device = torch.cuda.current_device()
+        return (
+            f"cuda_device={device} "
+            f"alloc_gb={torch.cuda.memory_allocated(device) / (1024**3):.3f} "
+            f"reserved_gb={torch.cuda.memory_reserved(device) / (1024**3):.3f} "
+            f"max_alloc_gb={torch.cuda.max_memory_allocated(device) / (1024**3):.3f} "
+            f"max_reserved_gb={torch.cuda.max_memory_reserved(device) / (1024**3):.3f}"
+        )
+    except Exception as exc:
+        return f"cuda_mem_error={type(exc).__name__}:{exc}"
+
+
+def _debug_dataproto_summary(data: DataProto | None) -> str:
+    if data is None:
+        return "batch=none"
+
+    tensor_gb = sum(_debug_tensor_size_gb(tensor) for tensor in data.batch.values()) if data.batch is not None else 0.0
+    non_tensor_keys = list(data.non_tensor_batch.keys()) if data.non_tensor_batch is not None else []
+    parts = [f"batch_len={len(data)} tensor_gb={tensor_gb:.3f} non_tensor_keys={non_tensor_keys}"]
+
+    if data.non_tensor_batch is not None and "multi_modal_inputs" in data.non_tensor_batch:
+        image_count = 0
+        image_tokens_sum = 0
+        image_tokens_max = 0
+        pixel_values_gb = 0.0
+        for item in data.non_tensor_batch["multi_modal_inputs"]:
+            if not isinstance(item, dict) or not item:
+                continue
+            grid = item.get("image_grid_thw")
+            if grid is not None:
+                try:
+                    if hasattr(grid, "detach"):
+                        grid_tensor = grid.detach().reshape(-1, 3)
+                    else:
+                        grid_tensor = torch.as_tensor(grid).reshape(-1, 3)
+                    per_image_tokens = grid_tensor.prod(dim=1)
+                    image_count += int(per_image_tokens.numel())
+                    if per_image_tokens.numel() > 0:
+                        image_tokens_sum += int(per_image_tokens.sum().item())
+                        image_tokens_max = max(image_tokens_max, int(per_image_tokens.max().item()))
+                except Exception:
+                    pass
+            pixel_values = item.get("pixel_values")
+            if pixel_values is not None:
+                pixel_values_gb += _debug_tensor_size_gb(pixel_values)
+        parts.append(
+            f"images={image_count} image_tokens_sum={image_tokens_sum} "
+            f"image_tokens_max={image_tokens_max} pixel_values_gb={pixel_values_gb:.3f}"
+        )
+
+    return " ".join(parts)
+
+
+def _debug_actor_update_outer(label: str, data: DataProto | None = None) -> None:
+    if not _ACTOR_UPDATE_DEBUG_ENABLED:
+        return
+    parts = [
+        f"DEBUG_ACTOR_UPDATE_OUTER {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"pid={os.getpid()} rank={_debug_dist_rank()} local_rank={os.environ.get('LOCAL_RANK', '?')}",
+        label,
+        _debug_cuda_mem(),
+        f"rss_gb={psutil.Process(os.getpid()).memory_info().rss / (1024**3):.3f}",
+    ]
+    if data is not None:
+        parts.append(_debug_dataproto_summary(data))
+    print(" | ".join(parts), flush=True)
+
+
+def _debug_ref_log_prob_outer(label: str, data: DataProto | None = None) -> None:
+    if not _REF_LOG_PROB_DEBUG_ENABLED:
+        return
+    parts = [
+        f"DEBUG_REF_LOG_PROB_OUTER {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"pid={os.getpid()} rank={_debug_dist_rank()} local_rank={os.environ.get('LOCAL_RANK', '?')}",
+        label,
+        _debug_cuda_mem(),
+        f"rss_gb={psutil.Process(os.getpid()).memory_info().rss / (1024**3):.3f}",
+    ]
+    if data is not None:
+        parts.append(_debug_dataproto_summary(data))
+    print(" | ".join(parts), flush=True)
+
+
+class _DebugRefLogProbHeartbeat:
+    def __init__(self, data: DataProto | None = None) -> None:
+        self.data = data
+        self.phase = "created"
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._started_at = time.monotonic()
+        self._interval_s = float(os.environ.get("VERL_DEBUG_REF_HEARTBEAT_INTERVAL", "5"))
+
+    def __enter__(self):
+        if not _REF_LOG_PROB_DEBUG_ENABLED:
+            return self
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            pass
+        self._thread = threading.Thread(target=self._run, name="ref-log-prob-debug-heartbeat", daemon=True)
+        self._thread.start()
+        self.set_phase("heartbeat_started", self.data)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not _REF_LOG_PROB_DEBUG_ENABLED:
+            return
+        self.set_phase("heartbeat_stopping", self.data)
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def set_phase(self, phase: str, data: DataProto | None = None) -> None:
+        if data is not None:
+            self.data = data
+        self.phase = phase
+        _debug_ref_log_prob_outer(phase, self.data)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_s):
+            elapsed = time.monotonic() - self._started_at
+            _debug_ref_log_prob_outer(f"heartbeat elapsed_s={elapsed:.1f} active_phase={self.phase}", self.data)
 
 
 def _jsonable_peft_config(peft_config) -> dict:
@@ -933,17 +1082,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        _debug_actor_update_outer("start", data)
         if self._is_offload_param:
+            _debug_actor_update_outer("before_load_fsdp_model_to_gpu", data)
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            _debug_actor_update_outer("after_load_fsdp_model_to_gpu", data)
         if self._is_offload_optimizer:
+            _debug_actor_update_outer("before_load_fsdp_optimizer", data)
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+            _debug_actor_update_outer("after_load_fsdp_optimizer", data)
 
         with self.ulysses_sharding_manager:
+            _debug_actor_update_outer("before_data_to_cpu", data)
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+            _debug_actor_update_outer("after_data_to_cpu", data)
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
+                _debug_actor_update_outer("before_update_policy", data)
                 metrics = self.actor.update_policy(data=data)
+                _debug_actor_update_outer("after_update_policy", data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             images_seqlens = data.meta_info.get("images_seqlens", None)
@@ -967,11 +1125,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             output = output.to("cpu")
 
         if self._is_offload_param:
+            _debug_actor_update_outer("before_offload_fsdp_model_to_cpu", data)
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            _debug_actor_update_outer("after_offload_fsdp_model_to_cpu", data)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
         if self._is_offload_optimizer:
+            _debug_actor_update_outer("before_offload_fsdp_optimizer", data)
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            _debug_actor_update_outer("after_offload_fsdp_optimizer", data)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+        _debug_actor_update_outer("end", data)
 
         return output
 
@@ -1080,36 +1243,50 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
-        if self._is_lora:
-            # if _is_lora, actor without lora applied is the ref
-            data.meta_info["is_lora"] = True
-            return self.compute_log_prob(data)
-        assert self._is_ref
-        # else:
-        # otherwise, the class have a standalone ref model
+        with _DebugRefLogProbHeartbeat(data) as debug_probe:
+            debug_probe.set_phase("start", data)
+            if self._is_lora:
+                # if _is_lora, actor without lora applied is the ref
+                data.meta_info["is_lora"] = True
+                debug_probe.set_phase("lora_before_compute_log_prob", data)
+                return self.compute_log_prob(data)
+            assert self._is_ref
+            # else:
+            # otherwise, the class have a standalone ref model
 
-        micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
-        data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
-        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
+            debug_probe.set_phase("before_meta_info_setup", data)
+            micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
+            data.meta_info["micro_batch_size"] = micro_batch_size
+            data.meta_info["temperature"] = self.config.rollout.temperature
+            data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+            data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+            data.meta_info["debug_ref_log_prob_microbatch"] = True
+            debug_probe.set_phase("after_meta_info_setup_before_ulysses_context", data)
+            with self.ulysses_sharding_manager:
+                debug_probe.set_phase("entered_ulysses_context_before_data_to_cpu", data)
+                data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
+                debug_probe.set_phase("after_data_to_cpu_before_compute_log_prob", data)
+                outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+                debug_probe.set_phase("after_compute_log_prob", data)
+                output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
+                debug_probe.set_phase("after_output_dataproto_from_dict", data)
 
-        output = output.to("cpu")
+            output = output.to("cpu")
+            debug_probe.set_phase("after_output_to_cpu", data)
 
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if self.world_size > 1:
-            if fsdp_version(self.ref_policy.actor_module) == 1:
-                self.ref_policy.actor_module._handle.reshard(True)
-            elif fsdp_version(self.ref_policy.actor_module) == 2:
-                self.ref_policy.actor_module.reshard()
+            # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+            # unshard the root FSDP module
+            if self.world_size > 1:
+                debug_probe.set_phase("before_ref_reshard", data)
+                if fsdp_version(self.ref_policy.actor_module) == 1:
+                    self.ref_policy.actor_module._handle.reshard(True)
+                elif fsdp_version(self.ref_policy.actor_module) == 2:
+                    self.ref_policy.actor_module.reshard()
+                debug_probe.set_phase("after_ref_reshard", data)
 
-        return output
+            debug_probe.set_phase("end", data)
+            return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

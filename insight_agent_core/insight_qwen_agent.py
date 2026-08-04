@@ -26,6 +26,7 @@ from .images import (
     translate_bbox_to_original,
     validate_qwen_image_aspect_ratio,
 )
+from .prompt_length import PromptLengthEstimate, available_new_tokens, prompt_fits_context
 from .runtime import CoreFunctionCall, CoreRuntime
 
 
@@ -57,11 +58,15 @@ class InSightQwenAgentConfig:
     crop_image_max_area: int = 1280 * 1280
     initial_input_pixels_lower_bound: int = 0
     region_zoom_in_factor: float = 4.0
+    max_tool_response_length: int = 256
+    tool_response_truncate_side: str = "middle"
     train_initial_rescale_randomization_prob: float = 0.0
     train_initial_rescale_randomization_min: float = 0.25
     train_initial_rescale_randomization_max: float = 0.25
     train_initial_rescale_randomization_text_budget: int = 1024
     agent_name: str = "insight_qwen_agent"
+    prompt_length_estimator: str = "tokenized"
+    prompt_length_safety_margin: int = 0
 
 
 @dataclass
@@ -90,6 +95,45 @@ class CoreAgentData:
     turn_scores: list[float] = field(default_factory=list)
     tool_rewards: list[float] = field(default_factory=list)
     extra_fields: dict[str, Any] = field(default_factory=dict)
+
+
+def _content_text_length(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    total += len(text)
+            elif isinstance(item, str):
+                total += len(item)
+        return total
+    if isinstance(content, dict):
+        text = content.get("text")
+        return len(text) if isinstance(text, str) else 0
+    return 0
+
+
+def _relative_time_s(agent_data: CoreAgentData, timestamp: float | None = None) -> float | None:
+    start = agent_data.extra_fields.get("_conversation_start_perf_counter")
+    if not isinstance(start, (int, float)):
+        return None
+    if timestamp is None:
+        timestamp = time.perf_counter()
+    return float(timestamp - start)
+
+
+def truncate_tool_response_text(text: str, max_length: int, truncate_side: str = "middle") -> str:
+    if max_length <= 0 or len(text) <= max_length:
+        return text
+    if truncate_side == "left":
+        return text[:max_length] + "...(truncated)"
+    if truncate_side == "right":
+        return "(truncated)..." + text[-max_length:]
+    length = max_length // 2
+    return text[:length] + "...(truncated)..." + text[-length:]
 
 
 @dataclass
@@ -216,6 +260,64 @@ class InSightQwenAgentRunner:
         self.runtime = runtime
         self.fallback_tool_executor = fallback_tool_executor
 
+    async def estimate_prompt_length(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        prompt_ids: list[int],
+        images: list[Any] | None = None,
+        videos: list[Any] | None = None,
+    ) -> PromptLengthEstimate:
+        return await self.runtime.estimate_prompt_length(
+            messages=messages,
+            tools=self.config.tool_schemas,
+            images=images,
+            videos=videos,
+            prompt_ids=prompt_ids,
+        )
+
+    def prompt_fits_length(self, estimate: PromptLengthEstimate, *, max_new_tokens: int = 0) -> bool:
+        return prompt_fits_context(
+            prompt_tokens=estimate.token_count,
+            max_model_len=self.config.prompt_length,
+            max_new_tokens=max_new_tokens,
+            safety_margin=self.config.prompt_length_safety_margin,
+        )
+
+    def record_prompt_overflow_before_generate(
+        self,
+        agent_data: CoreAgentData,
+        estimate: PromptLengthEstimate,
+        *,
+        requested_max_tokens: int,
+        available_tokens: int,
+    ) -> None:
+        failure_reason = (
+            "prompt_context_overflow_before_generate: "
+            f"prompt_tokens={estimate.token_count} max_new_tokens={requested_max_tokens} "
+            f"available_new_tokens={available_tokens} max_model_len={self.config.prompt_length} "
+            f"safety_margin={self.config.prompt_length_safety_margin} estimator={estimate.estimator_name}"
+        )
+        agent_data.extra_fields["response_truncated"] = True
+        agent_data.extra_fields["failure_reasons"] = [failure_reason]
+        agent_data.extra_fields.setdefault("export_failure_events", []).append(
+            {
+                "kind": "prompt_length_preflight",
+                "status": "overflow_before_generate",
+                "error_message": failure_reason,
+                "prompt_tokens": estimate.token_count,
+                "requested_max_tokens": requested_max_tokens,
+                "available_new_tokens": available_tokens,
+                "prompt_length_limit": self.config.prompt_length,
+                "prompt_length_safety_margin": self.config.prompt_length_safety_margin,
+                "prompt_length_estimator": estimate.estimator_name,
+                "prompt_length_estimate_metadata": estimate.metadata,
+            }
+        )
+        if not agent_data.messages or agent_data.messages[-1].get("role") != "assistant":
+            agent_data.messages.append({"role": "assistant", "content": ""})
+            agent_data.assistant_turns += 1
+
     async def run(
         self,
         sampling_params: dict[str, Any],
@@ -264,6 +366,8 @@ class InSightQwenAgentRunner:
             tools_kwargs=tools_kwargs or {},
         )
         agent_data.extra_fields["response_truncated"] = False
+        agent_data.extra_fields["turn_trace"] = []
+        agent_data.extra_fields["_conversation_start_perf_counter"] = conversation_wall_time_start
         agent_data.extra_fields["initial_prompt_tokens"] = initial_prompt_fit_metadata.get("prompt_tokens_after_shrink")
         agent_data.extra_fields["initial_prompt_tokens_before_shrink"] = initial_prompt_fit_metadata.get(
             "prompt_tokens_before_shrink"
@@ -280,6 +384,11 @@ class InSightQwenAgentRunner:
         )
         agent_data.extra_fields["initial_prompt_shrink_warning"] = initial_prompt_fit_metadata.get("prompt_shrink_warning")
         agent_data.extra_fields["initial_prompt_fit_time"] = initial_prompt_fit_time
+        agent_data.extra_fields["prompt_length_estimator"] = initial_prompt_fit_metadata.get("prompt_length_estimator")
+        agent_data.extra_fields["prompt_length_safety_margin"] = self.config.prompt_length_safety_margin
+        agent_data.extra_fields["initial_prompt_length_estimate_metadata"] = initial_prompt_fit_metadata.get(
+            "prompt_length_estimate_metadata"
+        )
         extra_info["agent_name"] = self.config.agent_name
         agent_data.extra_fields["agent_name"] = self.config.agent_name
         agent_data.extra_fields["extra_info"] = extra_info
@@ -337,8 +446,9 @@ class InSightQwenAgentRunner:
             agent_data.assistant_turns = 1
             failure_reason = (
                 "initial_prompt_overflow_after_shrink: "
-                f"{agent_data.extra_fields['initial_prompt_tokens']} > "
-                f"{initial_prompt_fit_metadata.get('prompt_length_limit')}"
+                f"prompt_tokens={agent_data.extra_fields['initial_prompt_tokens']} "
+                f"safety_margin={initial_prompt_fit_metadata.get('prompt_length_safety_margin')} "
+                f"max_model_len={initial_prompt_fit_metadata.get('prompt_length_limit')}"
             )
             agent_data.extra_fields["failure_reasons"] = [failure_reason]
             agent_data.extra_fields.setdefault("export_failure_events", []).append(
@@ -349,6 +459,11 @@ class InSightQwenAgentRunner:
                     "shrink_count": agent_data.extra_fields.get("initial_prompt_shrink_count", 0),
                     "prompt_tokens": agent_data.extra_fields.get("initial_prompt_tokens"),
                     "prompt_length_limit": initial_prompt_fit_metadata.get("prompt_length_limit"),
+                    "prompt_length_safety_margin": initial_prompt_fit_metadata.get("prompt_length_safety_margin"),
+                    "prompt_length_estimator": initial_prompt_fit_metadata.get("prompt_length_estimator"),
+                    "prompt_length_estimate_metadata": initial_prompt_fit_metadata.get(
+                        "prompt_length_estimate_metadata"
+                    ),
                 }
             )
 
@@ -364,7 +479,12 @@ class InSightQwenAgentRunner:
         response_tokens_total = len(response_ids)
         response_tokens_generated = int(sum(agent_data.response_mask))
         response_tokens_tool = response_tokens_total - response_tokens_generated
-        agent_data.extra_fields["prompt_tokens"] = len(prompt_ids)
+        agent_data.extra_fields["prompt_tokens_tokenized"] = len(prompt_ids)
+        agent_data.extra_fields["prompt_tokens"] = (
+            agent_data.extra_fields.get("last_prompt_tokens_estimated")
+            or agent_data.extra_fields.get("initial_prompt_tokens")
+            or len(prompt_ids)
+        )
         agent_data.extra_fields["response_tokens_total"] = response_tokens_total
         agent_data.extra_fields["response_tokens_generated"] = response_tokens_generated
         agent_data.extra_fields["response_tokens_tool"] = response_tokens_tool
@@ -394,6 +514,7 @@ class InSightQwenAgentRunner:
 
         agent_data.extra_fields.pop("insight_original_images", None)
         agent_data.extra_fields.pop("insight_presented_images", None)
+        agent_data.extra_fields.pop("_conversation_start_perf_counter", None)
 
         return InSightQwenAgentResult(
             prompt_ids=prompt_ids,
@@ -440,7 +561,59 @@ class InSightQwenAgentRunner:
         if turn_max_tokens <= 0:
             agent_data.extra_fields["response_truncated"] = True
             return CoreAgentState.TERMINATED
+
+        prompt_length_estimate = await self.estimate_prompt_length(
+            messages=agent_data.messages,
+            prompt_ids=agent_data.prompt_ids,
+            images=agent_data.image_data if agent_data.image_data else None,
+            videos=agent_data.video_data if agent_data.video_data else None,
+        )
+        available_tokens = available_new_tokens(
+            prompt_tokens=prompt_length_estimate.token_count,
+            max_model_len=self.config.prompt_length,
+            safety_margin=self.config.prompt_length_safety_margin,
+        )
+        agent_data.extra_fields["last_prompt_tokens_estimated"] = prompt_length_estimate.token_count
+        agent_data.extra_fields["last_prompt_length_estimator"] = prompt_length_estimate.estimator_name
+        agent_data.extra_fields["last_prompt_length_estimate_metadata"] = prompt_length_estimate.metadata
+        if available_tokens is not None:
+            if available_tokens <= 0:
+                self.record_prompt_overflow_before_generate(
+                    agent_data,
+                    prompt_length_estimate,
+                    requested_max_tokens=turn_max_tokens,
+                    available_tokens=available_tokens,
+                )
+                return CoreAgentState.TERMINATED
+            turn_max_tokens = min(turn_max_tokens, available_tokens)
+            if turn_max_tokens <= 0:
+                self.record_prompt_overflow_before_generate(
+                    agent_data,
+                    prompt_length_estimate,
+                    requested_max_tokens=turn_max_tokens,
+                    available_tokens=available_tokens,
+                )
+                return CoreAgentState.TERMINATED
         generation_sampling_params["max_tokens"] = turn_max_tokens
+        turn_trace = agent_data.extra_fields.setdefault("turn_trace", [])
+        trace_entry: dict[str, Any] = {
+            "event": "assistant",
+            "turn_index": len(turn_trace),
+            "assistant_turn_index_before": agent_data.assistant_turns,
+            "user_turn_index_before": agent_data.user_turns,
+            "prompt_tokens_tokenized_before_generate": len(agent_data.prompt_ids),
+            "prompt_tokens_estimated_before_generate": prompt_length_estimate.token_count,
+            "prompt_length_estimator": prompt_length_estimate.estimator_name,
+            "available_new_tokens_before_generate": available_tokens,
+            "requested_max_tokens": requested_max_tokens,
+            "turn_max_tokens": turn_max_tokens,
+            "response_tokens_total_before_generate": len(agent_data.response_mask),
+            "image_count_before_generate": len(agent_data.image_data) if isinstance(agent_data.image_data, list) else 0,
+            "video_count_before_generate": len(agent_data.video_data) if isinstance(agent_data.video_data, list) else 0,
+            "message_count_before_generate": len(agent_data.messages),
+        }
+        generate_start = time.perf_counter()
+        trace_entry["start_s"] = _relative_time_s(agent_data, generate_start)
 
         with _timer(agent_data.metrics, "generate_sequences"):
             output = await self.runtime.generate(
@@ -452,6 +625,25 @@ class InSightQwenAgentRunner:
                 messages=agent_data.messages,
                 tools=self.config.tool_schemas,
             )
+        generate_end = time.perf_counter()
+        generate_elapsed = generate_end - generate_start
+        trace_entry["generate_elapsed_s"] = generate_elapsed
+        trace_entry["generated_tokens"] = len(output.token_ids)
+        if output.num_preempted is not None:
+            trace_entry["num_preempted"] = output.num_preempted
+        if output.metrics:
+            trace_entry["output_metrics"] = dict(output.metrics)
+            ttft_s = output.metrics.get("vllm_time_to_first_token_s")
+            if isinstance(ttft_s, (int, float)) and ttft_s >= 0 and trace_entry.get("start_s") is not None:
+                trace_entry["time_to_first_token_s"] = float(ttft_s)
+                trace_entry["first_token_s"] = float(trace_entry["start_s"]) + float(ttft_s)
+            first_output_s = output.metrics.get("vllm_first_output_elapsed_s")
+            if (
+                isinstance(first_output_s, (int, float))
+                and first_output_s >= 0
+                and trace_entry.get("start_s") is not None
+            ):
+                trace_entry["first_output_s"] = float(trace_entry["start_s"]) + float(first_output_s)
         if output.metrics:
             for key, value in output.metrics.items():
                 try:
@@ -470,23 +662,53 @@ class InSightQwenAgentRunner:
             agent_data.response_logprobs += output.log_probs
 
         assistant_message = await self.runtime.decode(agent_data.response_ids, skip_special_tokens=True)
+        assistant_message_idx = len(agent_data.messages)
         agent_data.messages.append({"role": "assistant", "content": assistant_message})
+        trace_entry["message_idx"] = assistant_message_idx
+        trace_entry["message_role"] = "assistant"
+        trace_entry["assistant_message_chars"] = len(assistant_message)
+        try:
+            display_chunks = await self.runtime.decode_display_chunks(
+                agent_data.response_ids,
+                skip_special_tokens=True,
+            )
+        except Exception as exc:
+            logger.debug("failed to build display chunks for request_id=%s: %s", agent_data.request_id, exc)
+            display_chunks = [assistant_message] if assistant_message else []
+        trace_entry["display_chunks"] = display_chunks
+        trace_entry["display_chunks_count"] = len(display_chunks)
+        trace_entry["end_s"] = _relative_time_s(agent_data, generate_end)
+        if trace_entry.get("start_s") is not None and trace_entry.get("end_s") is not None:
+            trace_entry["duration_s"] = float(trace_entry["end_s"]) - float(trace_entry["start_s"])
 
         if len(agent_data.response_mask) >= self.config.response_length:
             agent_data.extra_fields["response_truncated"] = True
+            trace_entry["termination_reason"] = "response_length_reached"
+            turn_trace.append(trace_entry)
             return CoreAgentState.TERMINATED
         if self.config.max_assistant_turns and agent_data.assistant_turns >= self.config.max_assistant_turns:
+            trace_entry["termination_reason"] = "max_assistant_turns"
+            turn_trace.append(trace_entry)
             return CoreAgentState.TERMINATED
         if self.config.max_user_turns and agent_data.user_turns >= self.config.max_user_turns:
+            trace_entry["termination_reason"] = "max_user_turns"
+            turn_trace.append(trace_entry)
             return CoreAgentState.TERMINATED
         if self.config.tool_schemas is None:
+            trace_entry["termination_reason"] = "no_tool_schemas"
+            turn_trace.append(trace_entry)
             return CoreAgentState.TERMINATED
 
         with _timer(agent_data.metrics, "tool_parsing"):
             agent_data.tool_calls = await self.runtime.extract_tool_calls(agent_data.response_ids)
+        trace_entry["parsed_tool_calls"] = len(agent_data.tool_calls)
+        trace_entry["tool_call_names"] = [call.name for call in agent_data.tool_calls]
 
         if agent_data.tool_calls:
+            turn_trace.append(trace_entry)
             return CoreAgentState.PROCESSING_TOOLS
+        trace_entry["termination_reason"] = "no_tool_calls"
+        turn_trace.append(trace_entry)
         return CoreAgentState.TERMINATED
 
     async def handle_processing_tools_state(self, agent_data: CoreAgentData) -> CoreAgentState:
@@ -495,16 +717,68 @@ class InSightQwenAgentRunner:
         base_image_count = len(agent_data.image_data) if isinstance(agent_data.image_data, list) else 0
         new_presented_this_turn: list[PresentedImageState] = []
         new_presented_refs_this_turn: list[dict[str, Any]] = []
+        turn_trace = agent_data.extra_fields.get("turn_trace") or []
+        trace_entry = turn_trace[-1] if turn_trace else None
+
+        async def call_tool_with_trace(
+            tool_call_index: int,
+            tool_call: CoreFunctionCall,
+        ) -> tuple[CoreToolExecutionResult | Exception, dict[str, Any]]:
+            start = time.perf_counter()
+            trace: dict[str, Any] = {
+                "event": "tool_call",
+                "tool_call_index": tool_call_index,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+                "start_s": _relative_time_s(agent_data, start),
+                "assistant_message_idx": trace_entry.get("message_idx") if trace_entry is not None else None,
+            }
+            try:
+                response = await self.call_tool(tool_call, agent_data)
+                end = time.perf_counter()
+                trace.update(
+                    {
+                        "end_s": _relative_time_s(agent_data, end),
+                        "duration_s": end - start,
+                        "ok": True,
+                        "new_images": len(response.images),
+                        "new_presented_images": len(response.presented_images),
+                        "text_chars": len(response.text_result or ""),
+                    }
+                )
+                return response, trace
+            except Exception as exc:
+                end = time.perf_counter()
+                trace.update(
+                    {
+                        "end_s": _relative_time_s(agent_data, end),
+                        "duration_s": end - start,
+                        "ok": False,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                )
+                return exc, trace
 
         tasks = []
-        for tool_call in agent_data.tool_calls[: self.config.max_parallel_calls]:
-            tasks.append(self.call_tool(tool_call, agent_data))
+        for i, tool_call in enumerate(agent_data.tool_calls[: self.config.max_parallel_calls]):
+            tasks.append(call_tool_with_trace(i, tool_call))
 
+        tool_start = time.perf_counter()
         with _timer(agent_data.metrics, "tool_calls"):
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            wrapped_responses = await asyncio.gather(*tasks)
+        tool_elapsed = time.perf_counter() - tool_start
+        responses = [response for response, _trace in wrapped_responses]
+        tool_call_traces = [_trace for _response, _trace in wrapped_responses]
+        if trace_entry is not None:
+            trace_entry["tool_execution_elapsed_s"] = tool_elapsed
+            trace_entry["tool_calls_attempted"] = len(tasks)
+            trace_entry["tool_call_traces"] = tool_call_traces
 
         for i, response in enumerate(responses):
             tool_call = agent_data.tool_calls[i]
+            if i < len(tool_call_traces):
+                tool_call_traces[i]["tool_result_message_idx"] = len(agent_data.messages) + len(add_messages)
             if isinstance(response, Exception):
                 logger.warning("Tool call %s failed: %s", tool_call.name, response)
                 agent_data.extra_fields.setdefault("export_failure_events", []).append(
@@ -517,29 +791,34 @@ class InSightQwenAgentRunner:
                 )
                 message = {"role": "tool", "content": f"Error executing tool: {response}"}
             else:
+                text_result = truncate_tool_response_text(
+                    response.text_result,
+                    self.config.max_tool_response_length,
+                    self.config.tool_response_truncate_side,
+                )
                 if response.images:
                     content = []
                     for offset, _ in enumerate(response.images):
                         new_index = base_image_count + len(new_images_this_turn) + offset
                         content.append({"type": "text", "text": f"Image {new_index}:"})
                         content.append({"type": "image"})
-                    if response.text_result:
-                        content.append({"type": "text", "text": response.text_result})
+                    if text_result:
+                        content.append({"type": "text", "text": text_result})
                     new_images_this_turn.extend(response.images)
                     new_presented_this_turn.extend(response.presented_images)
                     new_presented_refs_this_turn.extend(response.presented_image_refs)
                     message = {"role": "tool", "content": content}
                 else:
-                    if response.text_result:
+                    if text_result:
                         agent_data.extra_fields.setdefault("export_failure_events", []).append(
                             {
                                 "kind": "tool_execution",
                                 "status": "error",
                                 "tool_name": tool_call.name,
-                                "error_message": response.text_result,
+                                "error_message": text_result,
                             }
                         )
-                    message = {"role": "tool", "content": response.text_result or ""}
+                    message = {"role": "tool", "content": text_result or ""}
             add_messages.append(message)
 
         agent_data.messages.extend(add_messages)
@@ -550,9 +829,16 @@ class InSightQwenAgentRunner:
             videos=None,
             remove_system_prompt=True,
         )
+        if trace_entry is not None:
+            trace_entry["tool_response_tokens"] = len(response_ids)
+            trace_entry["new_images_from_tools"] = len(new_images_this_turn)
+            trace_entry["new_presented_images_from_tools"] = len(new_presented_this_turn)
+            trace_entry["tool_response_text_chars"] = sum(_content_text_length(m.get("content")) for m in add_messages)
 
         if len(agent_data.response_mask) + len(response_ids) >= self.config.response_length:
             agent_data.extra_fields["response_truncated"] = True
+            if trace_entry is not None:
+                trace_entry["termination_reason"] = "tool_response_length_reached"
             return CoreAgentState.TERMINATED
 
         if new_images_this_turn:
@@ -760,12 +1046,18 @@ class InSightQwenAgentRunner:
             images=images if images else None,
             videos=videos if videos else None,
         )
-        prompt_tokens_before = len(prompt_ids)
+        prompt_length_estimate = await self.estimate_prompt_length(
+            messages=messages,
+            prompt_ids=prompt_ids,
+            images=images if images else None,
+            videos=videos if videos else None,
+        )
+        prompt_tokens_before = prompt_length_estimate.token_count
         prompt_tokens_after = prompt_tokens_before
         shrink_count = 0
 
         while (
-            prompt_tokens_after > prompt_length_limit
+            not self.prompt_fits_length(prompt_length_estimate)
             and shrink_count < INITIAL_PROMPT_MAX_SHRINK_STEPS
             and presented_images
         ):
@@ -780,22 +1072,31 @@ class InSightQwenAgentRunner:
                 images=images if images else None,
                 videos=videos if videos else None,
             )
-            prompt_tokens_after = len(prompt_ids)
+            prompt_length_estimate = await self.estimate_prompt_length(
+                messages=messages,
+                prompt_ids=prompt_ids,
+                images=images if images else None,
+                videos=videos if videos else None,
+            )
+            prompt_tokens_after = prompt_length_estimate.token_count
 
-        fits_prompt_length = prompt_tokens_after <= prompt_length_limit
+        fits_prompt_length = self.prompt_fits_length(prompt_length_estimate)
         warning = None
         if shrink_count > 0:
             warning = (
                 "initial prompt exceeded prompt_length; shrank presented image area by 50% "
                 f"{shrink_count} time(s) (max {INITIAL_PROMPT_MAX_SHRINK_STEPS}) "
-                f"from {prompt_tokens_before} to {prompt_tokens_after} tokens with prompt_length={prompt_length_limit}"
+                f"from {prompt_tokens_before} to {prompt_tokens_after} tokens with prompt_length={prompt_length_limit} "
+                f"safety_margin={self.config.prompt_length_safety_margin} "
+                f"estimator={prompt_length_estimate.estimator_name}"
             )
             logger.warning(warning)
             print(f"[InSightQwenAgentRunner] WARNING: {warning}")
-        if not fits_prompt_length and prompt_tokens_after > prompt_length_limit:
+        if not fits_prompt_length:
             overflow_warning = (
                 f"initial prompt still exceeds prompt_length after {shrink_count} shrink step(s): "
-                f"{prompt_tokens_after} > {prompt_length_limit}"
+                f"{prompt_tokens_after} + safety_margin={self.config.prompt_length_safety_margin} > "
+                f"{prompt_length_limit}"
             )
             logger.warning(overflow_warning)
             print(f"[InSightQwenAgentRunner] WARNING: {overflow_warning}")
@@ -810,6 +1111,9 @@ class InSightQwenAgentRunner:
             "prompt_shrink_warning": warning,
             "prompt_shrink_area_factor": INITIAL_PROMPT_SHRINK_AREA_FACTOR,
             "prompt_max_shrink_steps": INITIAL_PROMPT_MAX_SHRINK_STEPS,
+            "prompt_length_estimator": prompt_length_estimate.estimator_name,
+            "prompt_length_estimate_metadata": prompt_length_estimate.metadata,
+            "prompt_length_safety_margin": self.config.prompt_length_safety_margin,
         }
 
     def shrink_presented_prompt_images(

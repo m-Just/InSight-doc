@@ -1,0 +1,22 @@
+model: /home/ywxzml3j/ywxzml3juser40/mms1_rl/ckpts/insight_doc/insight_doc_rl_balanced_dude_reduced_u25_qwen3_insight_qwen_agent_rl_t0_7_def_sparams_new_sft_2ep_new_data_sp4_rl16k_prompt24k_weighted_refill_simple_source_judge_single_call_v1/global_step_1000__actor_merged_hf
+backend: ray_vllm
+
+generation:
+  max_tokens_after_initial_prompt: 16384
+
+ray_vllm:
+  num_replicas: 4
+  gpus_per_replica: 1
+  max_model_len: 262144
+  max_num_seqs: 64
+  max_num_batched_tokens: 32768
+  gpu_memory_utilization: 0.8
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  enforce_eager: true
+  sampling:
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    presence_penalty: 1.5
+    repetition_penalty: 1.0

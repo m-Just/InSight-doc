@@ -14,6 +14,8 @@
 
 import copy
 import heapq
+import os
+import time
 from itertools import chain
 
 import torch
@@ -22,6 +24,39 @@ from torch import distributed as dist
 from verl.protocol import DataProto
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
+
+_DEBUG_SEQLEN_BALANCING_ENABLED = os.environ.get(
+    "VERL_DEBUG_SEQLEN_BALANCING", os.environ.get("VERL_DEBUG_MEM", "")
+).lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_seqlen_rank() -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return -1
+    return int(dist.get_rank())
+
+
+def _debug_partition_stats(partitions: list[list[int]], token_lengths: list[int]) -> str:
+    if not partitions:
+        return "partitions=0"
+    sums = [_partition_token_sum(partition, token_lengths) for partition in partitions]
+    sizes = [len(partition) for partition in partitions]
+    return (
+        f"partitions={len(partitions)} token_sum_min={min(sums)} token_sum_max={max(sums)} "
+        f"token_sum_mean={sum(sums) / len(sums):.1f} size_min={min(sizes)} size_max={max(sizes)}"
+    )
+
+
+def _debug_seqlen_boundary(label: str, **kwargs) -> None:
+    if not _DEBUG_SEQLEN_BALANCING_ENABLED:
+        return
+    parts = [
+        f"DEBUG_SEQLEN_BALANCING {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"pid={os.getpid()} rank={_debug_seqlen_rank()}",
+        label,
+    ]
+    parts.extend(f"{key}={value}" for key, value in kwargs.items())
+    print(" | ".join(parts), flush=True)
 
 
 def calculate_workload(seqlen_list: torch.Tensor) -> torch.Tensor:
@@ -345,6 +380,87 @@ def roundup_divisible(a: int, b: int) -> int:
     return ((a + b - 1) // b) * b
 
 
+def _partition_token_sum(partition: list[int], token_lengths: list[int]) -> int:
+    return sum(token_lengths[idx] for idx in partition)
+
+
+def _split_partition_by_token_cap(
+    partition: list[int], token_lengths: list[int], max_token_len: int
+) -> list[list[int]]:
+    """Split one partition into best-fit bins that respect the token cap."""
+    if _partition_token_sum(partition, token_lengths) <= max_token_len:
+        return [partition]
+
+    bins: list[tuple[int, list[int]]] = []
+    for idx in sorted(partition, key=lambda i: (token_lengths[i], i), reverse=True):
+        token_len = token_lengths[idx]
+        assert token_len <= max_token_len, (
+            f"single sample token length exceeds max_token_len. Got {token_len=} and {max_token_len=}"
+        )
+
+        best_bin_idx = None
+        best_bin_sum = -1
+        for bin_idx, (bin_sum, _) in enumerate(bins):
+            if bin_sum + token_len <= max_token_len and bin_sum > best_bin_sum:
+                best_bin_idx = bin_idx
+                best_bin_sum = bin_sum
+
+        if best_bin_idx is None:
+            bins.append((token_len, [idx]))
+        else:
+            bin_sum, bin_items = bins[best_bin_idx]
+            bin_items.append(idx)
+            bins[best_bin_idx] = (bin_sum + token_len, bin_items)
+
+    return [sorted(bin_items) for _, bin_items in bins]
+
+
+def _split_partition_once_for_count(partition: list[int], token_lengths: list[int]) -> tuple[list[int], list[int]]:
+    """Split a partition into two roughly balanced non-empty partitions."""
+    assert len(partition) > 1
+    left: list[int] = []
+    right: list[int] = []
+    left_sum = 0
+    right_sum = 0
+
+    for idx in sorted(partition, key=lambda i: (token_lengths[i], i), reverse=True):
+        if left_sum <= right_sum:
+            left.append(idx)
+            left_sum += token_lengths[idx]
+        else:
+            right.append(idx)
+            right_sum += token_lengths[idx]
+
+    return sorted(left), sorted(right)
+
+
+def _split_partitions_to_count(
+    partitions: list[list[int]], token_lengths: list[int], target_count: int
+) -> list[list[int]]:
+    """Increase the partition count without violating an existing token cap."""
+    while len(partitions) < target_count:
+        candidate_idx = None
+        candidate_sum = -1
+        candidate_len = -1
+        for idx, partition in enumerate(partitions):
+            partition_len = len(partition)
+            if partition_len <= 1:
+                continue
+            partition_sum = _partition_token_sum(partition, token_lengths)
+            if (partition_sum, partition_len) > (candidate_sum, candidate_len):
+                candidate_idx = idx
+                candidate_sum = partition_sum
+                candidate_len = partition_len
+
+        assert candidate_idx is not None, (
+            f"cannot split {len(partitions)} partitions to requested {target_count=} with only singleton partitions"
+        )
+        left, right = _split_partition_once_for_count(partitions[candidate_idx], token_lengths)
+        partitions[candidate_idx : candidate_idx + 1] = [left, right]
+
+    return partitions
+
+
 def rearrange_micro_batches(
     batch,
     max_token_len,
@@ -370,39 +486,97 @@ def rearrange_micro_batches(
         List[TensorDict]: the micro-batches.
         List[List[int]]: index lists mapping each micro-batch back to original positions.
     """
+    _debug_seqlen_boundary(
+        "start",
+        batch_len=len(batch),
+        max_token_len=max_token_len,
+        same_micro_num_in_dp=same_micro_num_in_dp,
+        min_num_micro_batch=min_num_micro_batch,
+        num_batches_divided_by=num_batches_divided_by,
+        use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+    )
     # this is per local micro_bsz
     input_ids = batch["input_ids"]
     if input_ids.is_nested:
+        _debug_seqlen_boundary("before_nested_offsets_diff")
         seq_len_effective: torch.Tensor = input_ids.offsets().diff()
         max_seq_len = max(seq_len_effective)
+        _debug_seqlen_boundary("after_nested_offsets_diff", max_seq_len=int(max_seq_len))
     else:
         max_seq_len = batch["attention_mask"].shape[-1]
+        _debug_seqlen_boundary("before_attention_mask_sum", max_seq_len=max_seq_len)
         seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
+        _debug_seqlen_boundary("after_attention_mask_sum", rows=int(seq_len_effective.shape[0]))
 
     assert max_token_len >= max_seq_len, (
         f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
     )
-    total_seqlen = seq_len_effective.sum().item()
+    _debug_seqlen_boundary("before_seq_len_to_cpu")
+    seq_len_list = [int(value) for value in seq_len_effective.cpu().tolist()]
+    total_seqlen = sum(seq_len_list)
+    _debug_seqlen_boundary(
+        "after_seq_len_to_cpu",
+        total_seqlen=total_seqlen,
+        seq_len_min=min(seq_len_list) if seq_len_list else 0,
+        seq_len_max=max(seq_len_list) if seq_len_list else 0,
+    )
     # NOTE: num_microbatches <= batch_size, so take the min of this two.
     num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
     if min_num_micro_batch is not None:
         # used to support pp
         num_micro_batches = max(min_num_micro_batch, num_micro_batches)
     if dist.is_initialized() and same_micro_num_in_dp:
+        _debug_seqlen_boundary("before_initial_num_micro_batches_all_reduce", local_num_micro_batches=num_micro_batches)
         num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
         dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
         num_micro_batches = num_micro_batches.cpu().item()
+        _debug_seqlen_boundary("after_initial_num_micro_batches_all_reduce", num_micro_batches=num_micro_batches)
     if num_batches_divided_by is not None:
         num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
+        _debug_seqlen_boundary("after_initial_roundup_divisible", num_micro_batches=num_micro_batches)
 
     assert num_micro_batches <= len(seq_len_effective)
 
-    # note that seq_len_effective is a GPU tensor. We need to make it a list to avoid D2H!
+    # Balance by approximate attention workload, then split any overflowing partitions by true token count.
+    _debug_seqlen_boundary("before_calculate_workload")
     workloads = calculate_workload(seq_len_effective).cpu().tolist()
+    _debug_seqlen_boundary("after_calculate_workload", workloads=len(workloads))
+    _debug_seqlen_boundary("before_get_seqlen_balanced_partitions", num_micro_batches=num_micro_batches)
     micro_bsz_idx = get_seqlen_balanced_partitions(workloads, num_micro_batches, equal_size=False)
+    _debug_seqlen_boundary(
+        "after_get_seqlen_balanced_partitions",
+        stats=_debug_partition_stats(micro_bsz_idx, seq_len_list),
+    )
+    micro_bsz_idx = [
+        split_partition
+        for partition in micro_bsz_idx
+        for split_partition in _split_partition_by_token_cap(partition, seq_len_list, max_token_len)
+    ]
+    _debug_seqlen_boundary("after_token_cap_split", stats=_debug_partition_stats(micro_bsz_idx, seq_len_list))
+
+    target_num_micro_batches = len(micro_bsz_idx)
+    if dist.is_initialized() and same_micro_num_in_dp:
+        _debug_seqlen_boundary(
+            "before_target_num_micro_batches_all_reduce", local_target_num_micro_batches=target_num_micro_batches
+        )
+        target_num_micro_batches = torch.tensor([target_num_micro_batches], device=get_device_name())
+        dist.all_reduce(target_num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
+        target_num_micro_batches = target_num_micro_batches.cpu().item()
+        _debug_seqlen_boundary(
+            "after_target_num_micro_batches_all_reduce", target_num_micro_batches=target_num_micro_batches
+        )
+    if num_batches_divided_by is not None:
+        target_num_micro_batches = roundup_divisible(target_num_micro_batches, num_batches_divided_by)
+        _debug_seqlen_boundary("after_target_roundup_divisible", target_num_micro_batches=target_num_micro_batches)
+
+    assert target_num_micro_batches <= len(seq_len_effective)
+    _debug_seqlen_boundary("before_split_partitions_to_count", target_num_micro_batches=target_num_micro_batches)
+    micro_bsz_idx = _split_partitions_to_count(micro_bsz_idx, seq_len_list, target_num_micro_batches)
+    _debug_seqlen_boundary("after_split_partitions_to_count", stats=_debug_partition_stats(micro_bsz_idx, seq_len_list))
 
     if use_dynamic_bsz_balance:
         # Use the sum of squared sequence lengths to approximate attention computation workload
+        _debug_seqlen_boundary("before_dynamic_bsz_sort")
         micro_bsz_idx.sort(
             key=lambda partition: (
                 sum(workloads[idx] for idx in partition),
@@ -412,12 +586,15 @@ def rearrange_micro_batches(
         )
         # Place smaller micro-batches at both ends to reduce the bubbles exposed during the warm-up and cool-down.
         micro_bsz_idx = micro_bsz_idx[::2][::-1] + micro_bsz_idx[1::2]
+        _debug_seqlen_boundary("after_dynamic_bsz_sort", stats=_debug_partition_stats(micro_bsz_idx, seq_len_list))
 
     micro_batches = []
 
+    _debug_seqlen_boundary("before_index_select_loop", partitions=len(micro_bsz_idx))
     for partition in micro_bsz_idx:
         curr_micro_batch = tu.index_select_tensor_dict(batch, partition)
         micro_batches.append(curr_micro_batch)
+    _debug_seqlen_boundary("after_index_select_loop", micro_batches=len(micro_batches))
 
     return micro_batches, micro_bsz_idx
 

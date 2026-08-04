@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from standalone_eval.backends.base import RolloutJob
+from standalone_eval.config.model import semantic_model_config_sha256
 from standalone_eval.core.utils import json_safe
 
 
@@ -70,10 +71,12 @@ def build_basic_config(
         "schema_version": 1,
         "backend": backend_name,
         "model": args.model,
-        "model_config_sha256": getattr(args, "_model_config_sha256", None),
+        "model_config_semantic_sha256": getattr(args, "_model_config_semantic_sha256", None),
         "val_files": list(canonical_val_files),
         "max_samples": int(args.max_samples),
         "num_trials": int(args.num_trials),
+        "shuffle_rows": bool(getattr(args, "shuffle_rows", True)),
+        "shuffle_seed": int(getattr(args, "shuffle_seed", 42)),
         "agent": {
             "name": agent_name,
             "settings": agent_settings,
@@ -91,6 +94,27 @@ def build_basic_config(
 
 def _as_path_set(paths: list[Any]) -> set[str]:
     return {str(Path(str(path)).expanduser().resolve(strict=False)) for path in paths}
+
+
+def _with_semantic_model_config_identity(config: dict[str, Any], *, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    normalized = dict(config)
+    backend_extra = normalized.get("backend_extra")
+    if isinstance(backend_extra, dict):
+        backend_extra = dict(backend_extra)
+        ray_manifest = backend_extra.get("ray_server_manifest")
+        if isinstance(ray_manifest, dict):
+            ray_manifest = dict(ray_manifest)
+            ray_manifest.pop("model_config_sha256", None)
+            backend_extra["ray_server_manifest"] = ray_manifest
+        normalized["backend_extra"] = backend_extra
+    manifest_data = ((manifest or {}).get("model_config") or {}).get("data") if isinstance(manifest, dict) else None
+    if isinstance(manifest_data, dict):
+        normalized["model_config_semantic_sha256"] = semantic_model_config_sha256(manifest_data)
+        normalized.pop("model_config_sha256", None)
+        return normalized
+    if normalized.get("model_config_semantic_sha256"):
+        normalized.pop("model_config_sha256", None)
+    return normalized
 
 
 def compare_basic_config(existing: dict[str, Any], current: dict[str, Any]) -> tuple[bool, str | None]:
@@ -123,6 +147,7 @@ def compare_basic_config(existing: dict[str, Any], current: dict[str, Any]) -> t
 
 def ensure_basic_config_compatible(output_dir: Path, *, basic_config: dict[str, Any]) -> None:
     basic_config_path = output_dir / "basic_config.json"
+    manifest_path = output_dir / "manifest.json"
     def has_content(path: Path) -> bool:
         if not path.exists():
             return False
@@ -143,7 +168,16 @@ def ensure_basic_config_compatible(output_dir: Path, *, basic_config: dict[str, 
     ]
     if basic_config_path.exists():
         existing = json.loads(basic_config_path.read_text(encoding="utf-8"))
-        ok, reason = compare_basic_config(existing, basic_config)
+        manifest = None
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                manifest = None
+        ok, reason = compare_basic_config(
+            _with_semantic_model_config_identity(existing, manifest=manifest),
+            _with_semantic_model_config_identity(basic_config),
+        )
         if not ok:
             raise RuntimeError(
                 f"resume basic_config mismatch for {basic_config_path}: {reason}; "

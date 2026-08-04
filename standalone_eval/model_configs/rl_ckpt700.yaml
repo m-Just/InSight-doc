@@ -10,7 +10,7 @@ ray_vllm:
   max_model_len: 262144
   max_num_seqs: 64
   max_num_batched_tokens: 32768
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.8
   enable_prefix_caching: true
   enable_chunked_prefill: true
   enforce_eager: true

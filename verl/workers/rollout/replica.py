@@ -41,6 +41,8 @@ class TokenOutput(BaseModel):
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None
     """number of preempted times for metric calculation"""
+    metrics: Optional[dict[str, float]] = None
+    """backend timing/diagnostic metrics for this generation call"""
 
 
 class RolloutMode(Enum):

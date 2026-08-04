@@ -4,6 +4,7 @@ import asyncio
 import time
 from typing import Any, Awaitable, Callable, Protocol
 
+from .prompt_length import PromptLengthEstimate, PromptLengthEstimator, TokenizedPromptLengthEstimator
 from .runtime import CoreFunctionCall, CoreGenerationOutput
 
 
@@ -37,6 +38,8 @@ class StandaloneInSightRuntime:
         tool_call_extractor: ToolCallExtractor,
         apply_chat_template_kwargs: dict[str, Any] | None = None,
         processor_concurrency: int = 8,
+        image_patch_size: int | None = None,
+        prompt_length_estimator: PromptLengthEstimator | None = None,
     ) -> None:
         if processor_concurrency < 1:
             raise ValueError(f"processor_concurrency must be >= 1, got {processor_concurrency}")
@@ -46,6 +49,8 @@ class StandaloneInSightRuntime:
         self.tool_call_extractor = tool_call_extractor
         self.apply_chat_template_kwargs = dict(apply_chat_template_kwargs or {})
         self.processor_concurrency = processor_concurrency
+        self.image_patch_size = image_patch_size
+        self.prompt_length_estimator = prompt_length_estimator or TokenizedPromptLengthEstimator()
         self._processor_semaphore = asyncio.Semaphore(processor_concurrency)
         self._validate_processor_state()
         self.system_prompt = self._initialize_system_prompt()
@@ -75,11 +80,18 @@ class StandaloneInSightRuntime:
     async def process_vision_info(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         from qwen_vl_utils import process_vision_info
 
-        patch_size = self.processor.image_processor.patch_size
+        patch_size = self.image_patch_size
+        if patch_size is None:
+            image_processor = getattr(self.processor, "image_processor", None)
+            patch_size = getattr(image_processor, "patch_size", None)
+        if patch_size is None:
+            raise ValueError(
+                "Cannot infer image patch size from processor; pass image_patch_size to StandaloneInSightRuntime."
+            )
         images, videos = await asyncio.to_thread(
             process_vision_info,
             messages,
-            image_patch_size=patch_size,
+            image_patch_size=int(patch_size),
             return_video_metadata=True,
         )
         multi_modal_data: dict[str, Any] = {}
@@ -113,14 +125,17 @@ class StandaloneInSightRuntime:
                 video_values = list(video_values)
                 video_metadatas = list(video_metadatas)
 
-            model_inputs = self.processor(
-                text=[raw_prompt],
-                images=images,
-                videos=video_values,
-                video_metadatas=video_metadatas,
-                return_tensors="pt",
-                do_sample_frames=False,
-            )
+            if getattr(self.processor, "image_processor", None) is None:
+                model_inputs = self.tokenizer(text=[raw_prompt], return_tensors="pt")
+            else:
+                model_inputs = self.processor(
+                    text=[raw_prompt],
+                    images=images,
+                    videos=video_values,
+                    video_metadatas=video_metadatas,
+                    return_tensors="pt",
+                    do_sample_frames=False,
+                )
             return model_inputs.pop("input_ids").squeeze(0).tolist()
 
         async with self._processor_semaphore:
@@ -150,12 +165,53 @@ class StandaloneInSightRuntime:
             tools=tools,
         )
 
+    async def estimate_prompt_length(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        images: list[Any] | None = None,
+        videos: list[Any] | None = None,
+        prompt_ids: list[int],
+    ) -> PromptLengthEstimate:
+        def estimate() -> PromptLengthEstimate:
+            return self.prompt_length_estimator.estimate(
+                messages=messages,
+                tools=tools,
+                images=images,
+                videos=videos,
+                prompt_ids=prompt_ids,
+                processor=self.processor,
+                tokenizer=self.tokenizer,
+                apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+            )
+
+        async with self._processor_semaphore:
+            return await asyncio.to_thread(estimate)
+
     async def decode(self, token_ids: list[int], *, skip_special_tokens: bool = True) -> str:
         return await asyncio.to_thread(
             self.tokenizer.decode,
             token_ids,
             skip_special_tokens=skip_special_tokens,
         )
+
+    async def decode_display_chunks(self, token_ids: list[int], *, skip_special_tokens: bool = True) -> list[str]:
+        def decode() -> list[str]:
+            if not token_ids:
+                return []
+            batch = [[int(token_id)] for token_id in token_ids]
+            try:
+                chunks = self.tokenizer.batch_decode(
+                    batch,
+                    skip_special_tokens=skip_special_tokens,
+                    clean_up_tokenization_spaces=False,
+                )
+            except TypeError:
+                chunks = self.tokenizer.batch_decode(batch, skip_special_tokens=skip_special_tokens)
+            return [chunk for chunk in chunks if chunk]
+
+        return await asyncio.to_thread(decode)
 
     async def extract_tool_calls(self, response_ids: list[int]) -> list[CoreFunctionCall]:
         start = time.perf_counter()
