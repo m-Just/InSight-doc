@@ -239,7 +239,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-answer-rewrite-progress-every", type=int, default=50)
     parser.add_argument(
         "--final-answer-rewrite-openai-base-url",
-        default=os.environ.get("OPENAI_BASE_URL", "https://az.gptplus5.com/v1"),
+        default=os.environ.get("OPENAI_BASE_URL"),
     )
     parser.add_argument(
         "--api-logger-save-dir",

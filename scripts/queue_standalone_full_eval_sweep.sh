@@ -2,9 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="${REPO_ROOT:-/scratch/ywxzml3j/likaican/src/verl-qwen3-vl}"
+REPO_ROOT="${REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-if [[ "${TELEGRAM_NOTIFY_ON_FINISH:-1}" == "1" && "${TELEGRAM_WRAPPED:-0}" != "1" && -x "$SCRIPT_DIR/run_with_telegram_notification.sh" ]]; then
+if [[ "${TELEGRAM_NOTIFY_ON_FINISH:-0}" == "1" && "${TELEGRAM_WRAPPED:-0}" != "1" && -x "$SCRIPT_DIR/run_with_telegram_notification.sh" ]]; then
   export TELEGRAM_WRAPPED=1
   exec "$SCRIPT_DIR/run_with_telegram_notification.sh" \
     --label "${TELEGRAM_NOTIFY_LABEL:-standalone_full_eval_sweep}" \
@@ -13,9 +13,16 @@ fi
 
 cd "$REPO_ROOT"
 
-PYTHON_BIN="${PYTHON_BIN:-/home/ywxzml3j/ywxzml3juser40/.conda/envs/vllm-latest/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 export PATH="$(dirname "$PYTHON_BIN"):$PATH"
-export PYTHONPATH="$REPO_ROOT:/scratch/ywxzml3j/likaican/src/InSight-o3:/scratch/ywxzml3j/likaican/src/Qwen-Agent:${PYTHONPATH:-}"
+PYTHONPATH_ENTRIES="$REPO_ROOT"
+if [[ -n "${INSIGHT_O3_ROOT:-}" ]]; then
+  PYTHONPATH_ENTRIES="$PYTHONPATH_ENTRIES:$INSIGHT_O3_ROOT"
+fi
+if [[ -n "${QWEN_AGENT_ROOT:-}" ]]; then
+  PYTHONPATH_ENTRIES="$PYTHONPATH_ENTRIES:$QWEN_AGENT_ROOT"
+fi
+export PYTHONPATH="$PYTHONPATH_ENTRIES${PYTHONPATH:+:$PYTHONPATH}"
 export VERL_PROJ_DIR="${VERL_PROJ_DIR:-$REPO_ROOT}"
 export HYDRA_FULL_ERROR=1
 export TOKENIZERS_PARALLELISM=false
@@ -61,31 +68,11 @@ HTTPS_TIMEOUT_OVERRIDE="${HTTPS_TIMEOUT_OVERRIDE:-}"
 HTTPS_MAX_RETRIES_OVERRIDE="${HTTPS_MAX_RETRIES_OVERRIDE:-}"
 
 DEFAULT_MODEL_CONFIGS=(
-  "standalone_eval/model_configs/gpt_5_4_mini.yaml"
-  "standalone_eval/model_configs/gpt_5_4_nano.yaml"
-  "standalone_eval/model_configs/gpt_5_mini.yaml"
-  "standalone_eval/model_configs/gemini_3_1_flash_lite.yaml"
-  "standalone_eval/model_configs/gemini_3_flash.yaml"
-  "standalone_eval/model_configs/base_no_tool_no_system.yaml"
-  "standalone_eval/model_configs/base.yaml"
-  "standalone_eval/model_configs/rl_ckpt700.yaml"
+  "standalone_eval/model_configs/release_ray_vllm.yaml"
 )
 
-DEFAULT_VAL_FILES=(
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets/dude_full-insight_qwen_agent.parquet"
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets/longdocurl_full-insight_qwen_agent.parquet"
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets/mmlite_full-insight_qwen_agent.parquet"
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets/mmlongbench_full-insight_qwen_agent.parquet"
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets/mpdocvqa_full-insight_qwen_agent.parquet"
-)
-
-DEFAULT_VAL_FILES_NO_TOOL_NO_SYSTEM=(
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets_no_tool_no_system/dude_full-insight_qwen_agent_no_tool_no_system.parquet"
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets_no_tool_no_system/longdocurl_full-insight_qwen_agent_no_tool_no_system.parquet"
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets_no_tool_no_system/mmlite_full-insight_qwen_agent_no_tool_no_system.parquet"
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets_no_tool_no_system/mmlongbench_full-insight_qwen_agent_no_tool_no_system.parquet"
-  "$REPO_ROOT/notes/generated/testcase_0504_full_parquets_no_tool_no_system/mpdocvqa_full-insight_qwen_agent_no_tool_no_system.parquet"
-)
+DEFAULT_VAL_FILES=()
+DEFAULT_VAL_FILES_NO_TOOL_NO_SYSTEM=()
 
 split_env_list() {
   printf '%s\n' "$1" | tr ',\n' '  '
@@ -596,6 +583,12 @@ PY
 }
 
 mkdir -p "$OUTPUT_ROOT"
+
+if [[ "${#VAL_FILE_ARRAY[@]}" == "0" ]]; then
+  echo "VAL_FILES must be set to one or more eval parquet paths." >&2
+  echo "Example: VAL_FILES=/path/a.parquet,/path/b.parquet MODEL_CONFIGS=standalone_eval/model_configs/release_ray_vllm.yaml scripts/queue_standalone_full_eval_sweep.sh" >&2
+  exit 1
+fi
 
 echo "output_root=$OUTPUT_ROOT"
 echo "model_configs=${MODEL_CONFIG_ARRAY[*]}"

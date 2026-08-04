@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -9,10 +10,14 @@ import numpy as np
 from tqdm.auto import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-for extra_path in (
-    REPO_ROOT,
-    Path("/scratch/ywxzml3j/likaican/src/InSight-o3"),
-):
+
+extra_paths = [REPO_ROOT]
+for env_name in ("INSIGHT_O3_ROOT", "QWEN_AGENT_ROOT"):
+    value = os.getenv(env_name)
+    if value:
+        extra_paths.append(Path(value).expanduser())
+
+for extra_path in extra_paths:
     if extra_path.exists() and str(extra_path) not in sys.path:
         sys.path.insert(0, str(extra_path))
 

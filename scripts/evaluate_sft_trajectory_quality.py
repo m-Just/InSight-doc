@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -22,9 +23,9 @@ from typing import Any
 import pyarrow.parquet as pq
 
 
-GENERATED_ROOT = Path("/home/ywxzml3j/ywxzml3juser40/data/insight_doc/generated")
-OUTPUT_ROOT = Path("notes/generated/sft_trajectory_quality_20260713")
-INSIGHT_DOC_DATA_ROOT = Path("/scratch/ywxzml3j/likaican/src/InSight-doc/data")
+GENERATED_ROOT = Path(os.environ.get("INSIGHT_DOC_GENERATED_ROOT", "data/insight_doc/generated")).expanduser()
+OUTPUT_ROOT = Path("notes/generated/sft_trajectory_quality")
+INSIGHT_DOC_DATA_ROOT = Path(os.environ.get("INSIGHT_DOC_DATA_ROOT", "data/insight_doc")).expanduser()
 
 O3_FINAL_OUTPUT_BY_PART = {
     "train_part1": INSIGHT_DOC_DATA_ROOT / "final_output_0426_selected_train_part1.json",

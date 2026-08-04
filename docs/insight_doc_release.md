@@ -1,0 +1,116 @@
+# InSight-Doc Release Recipes
+
+This repository is a `verl` fork with InSight-Doc agent training and evaluation
+extensions. The public surface is intentionally small: one SFT launcher, one RL
+launcher, one standalone evaluation launcher, and a few inspection/export tools.
+
+## Environment
+
+Install the repository and the runtime dependencies required by your vLLM/verl
+environment. The launchers assume that `torchrun`, `ray`, `vllm`, `transformers`,
+`qwen-vl-utils`, `pyarrow`, `omegaconf`, and `openai` are available.
+
+Optional external code roots can be supplied without editing scripts:
+
+```bash
+export INSIGHT_O3_ROOT=/path/to/InSight-o3        # optional
+export QWEN_AGENT_ROOT=/path/to/Qwen-Agent        # optional
+export OPENAI_API_KEY=...                         # required for judge/reward
+export OPENAI_BASE_URL=https://.../v1             # OpenAI-compatible endpoint
+```
+
+## SFT Training
+
+The released SFT checkpoint `sft_v2_ckpt1118` was trained as full-parameter SFT
+from `Qwen/Qwen3-VL-8B-Instruct`, with the vision tower frozen, sequence
+parallelism 4, max sequence length 65,536, global batch size 32, cosine LR
+`5e-6 -> 5e-7`, and two epochs.
+
+Use released SFT-format parquet files with at least `messages` and `tools`
+columns. If the parquet has a `message_loss_mask` column, the launcher uses it
+by default to match the original training path; set `MESSAGE_LOSS_MASK_KEY=` to
+train on all assistant messages.
+
+```bash
+TRAIN_FILES='[/path/to/sft_train.parquet]' \
+VAL_FILES='[/path/to/sft_val.parquet]' \
+OUTPUT_ROOT=/path/to/runs/sft \
+EXP_NAME=insight_doc_sft_qwen3vl8b \
+CUDA_DEVICES=0,1,2,3,4,5,6,7 \
+NPROC_PER_NODE=8 \
+bash scripts/train_sft_qwen3vl_insight_doc.sh
+```
+
+The resulting HF checkpoint is written under:
+
+```text
+$OUTPUT_ROOT/$EXP_NAME/sft_checkpoints/global_step_*/huggingface
+```
+
+## RL Training
+
+The released RL checkpoint
+`rl_v4_unans014_mc_false_e05_arxiv_struct1k_legacy_prompt_v2_ckpt800` starts
+from the released SFT checkpoint and trains with the InSight Qwen agent loop,
+the image zoom-in tool, weighted refill source sampling, temperature 0.7,
+top-p 0.8, top-k 20, presence penalty 1.5, and 2,000 total RL steps. The final
+sampling weights are in:
+
+```text
+recipe/vsearch/config/insight_doc_rl_sampling_weights_release.yaml
+```
+
+```bash
+MODEL_PATH=/path/to/sft_hf_checkpoint \
+TRAIN_FILES='[/path/to/rl_train.parquet]' \
+VAL_FILES='[/path/to/eval_a.parquet,/path/to/eval_b.parquet]' \
+WORK_DIR=/path/to/runs/rl \
+EXP_NAME=insight_doc_rl_qwen3vl8b \
+OPENAI_API_KEY=... \
+OPENAI_BASE_URL=https://.../v1 \
+bash scripts/train_rl_qwen3vl_insight_doc.sh
+```
+
+Checkpoints are written under:
+
+```text
+$WORK_DIR/ckpts/insight_doc/$EXP_NAME
+```
+
+## Standalone Evaluation
+
+The standalone evaluator assumes the model is served through the included
+Ray/vLLM server wrapper or an OpenAI-compatible HTTPS endpoint. For local HF
+checkpoints, set `MODEL_PATH` and use the default release model config.
+
+```bash
+MODEL_PATH=/path/to/hf_checkpoint \
+VAL_FILES='/path/to/dude.parquet,/path/to/longdocurl.parquet,/path/to/mmlongbench.parquet' \
+RESCALES='0.25 0.35 0.5' \
+EVAL_CUDA_VISIBLE_DEVICES=0,1,2,3 \
+OPENAI_API_KEY=... \
+OPENAI_BASE_URL=https://.../v1 \
+bash scripts/evaluate_insight_doc.sh
+```
+
+Important vLLM defaults are in `standalone_eval/model_configs/release_ray_vllm.yaml`:
+4 replicas, 1 GPU per replica, `max_model_len=262144`, `max_num_seqs=64`,
+chunked prefill enabled, prefix caching enabled, and the same sampling settings
+used by RL validation.
+
+## Useful Utilities
+
+- `scripts/export_conversation_image_source_bundle.py`: packs exported
+  conversations with source images for portable inspection.
+- `scripts/evaluate_exported_conversation_trajectory_quality.py`: computes crop
+  count, evidence-page/region hits, overlap, stuck-rate, and crop-area metrics
+  when evidence metadata is available.
+- `scripts/evaluate_sft_trajectory_quality.py`: computes analogous metrics for
+  SFT parquets.
+- `notebooks/visualize_vreasoner_v2_export.ipynb`: browse exported eval
+  conversations.
+- `notebooks/visualize_converted_sft_parquet.ipynb`: inspect SFT-format rows.
+- `notebooks/visualize_rl_parquet.ipynb`: inspect RL-format rows.
+
+Historical one-off experiment launchers are intentionally not part of the public
+API. Use the release launchers above for reproducible runs.

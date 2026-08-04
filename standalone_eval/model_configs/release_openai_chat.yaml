@@ -1,0 +1,15 @@
+# Generic release config for OpenAI-compatible chat/vision endpoints.
+# Set OPENAI_API_KEY and OPENAI_BASE_URL before launching evaluation.
+model: ${oc.env:MODEL_NAME}
+backend: https_openai_chat
+
+generation:
+  max_tokens_after_initial_prompt: ${oc.env:MAX_TOKENS_AFTER_INITIAL_PROMPT,16384}
+
+https_openai_chat:
+  base_url: ${oc.env:OPENAI_BASE_URL}
+  api_key_env: OPENAI_API_KEY
+  timeout: ${oc.env:OPENAI_CLIENT_TIMEOUT,180}
+  max_retries: ${oc.env:OPENAI_MAX_RETRIES,1}
+  image_format: ${oc.env:OPENAI_IMAGE_FORMAT,png}
+  image_detail: ${oc.env:OPENAI_IMAGE_DETAIL,high}

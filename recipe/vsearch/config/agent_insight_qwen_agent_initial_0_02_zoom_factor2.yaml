@@ -1,8 +1,0 @@
-- name: qwen_agent
-  _target_: verl.experimental.agent_loop.qwen_agent_loop.QwenAgentLoop
-
-- name: insight_qwen_agent
-  _target_: verl.experimental.agent_loop.qwen_agent_loop.InSightQwenAgentLoop
-  initial_rescale: 0.02
-  gpt_image_max_area: 1638400
-  region_zoom_in_factor: 2.0

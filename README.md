@@ -25,6 +25,10 @@ verl is a flexible, efficient and production-ready RL training library for large
 
 verl is the open-source version of **[HybridFlow: A Flexible and Efficient RLHF Framework](https://arxiv.org/abs/2409.19256v2)** paper.
 
+## InSight-Doc Release
+
+This fork contains the InSight-Doc Qwen3-VL agent training and evaluation code used for the released SFT/RL models. Start from [`docs/insight_doc_release.md`](docs/insight_doc_release.md) for the supported SFT training, RL training, standalone evaluation, and conversation-visualization entry points.
+
 verl is flexible and easy to use with:
 
 - **Easy extension of diverse RL algorithms**: The hybrid-controller programming model enables flexible representation and efficient execution of complex post-training dataflows. Build RL dataflows such as GRPO, PPO in a few lines of code.

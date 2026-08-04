@@ -830,74 +830,16 @@ if __name__ == "__main__":
         --agent_name vsearcher_qwen3_vl \
         --num_workers 32
 
-    python verl/recipe/vsearch/create_parquet_dataset.py \
-        --dataset InSightDocRegionLocalization \
-        --data_root /scratch/ywxzml3j/likaican/data/InSightDocRegionLocalization \
-        --split all \
-        --prompt vsearcher_qwen3_vl \
-        --output_path /scratch/ywxzml3j/likaican/data/InSightDocRegionLocalization/all-vsearcher_qwen3vl.parquet \
-        --agent_name vsearcher_qwen3_vl \
-        --num_workers 32
-
-    python verl/recipe/vsearch/create_parquet_dataset.py \
-        --dataset InSightDoc \
-        --data_root /scratch/ywxzml3j/likaican/temp/0207select234 \
-        --split all \
-        --prompt vreasoner \
-        --output_path /scratch/ywxzml3j/likaican/temp/0207select234-vreasoner.parquet \
-        --agent_name vreasoner \
-        --num_workers 32
-
-    python verl/recipe/vsearch/create_parquet_dataset.py \
-        --dataset InSightDoc \
-        --data_root /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_filtered_cs_reduced_sample_50_max_pages_50 \
-        --split all \
-        --prompt vreasoner \
-        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_filtered_cs_reduced_sample_50_max_pages_50-vreasoner_v2.parquet \
-        --agent_name vreasoner_v2 \
-        --num_workers 32
-
+    # Generic InSight-Doc style example:
     python verl/recipe/vsearch/create_parquet_dataset.py \
         --dataset InSightDoc0352 \
-        --data_root /home/ywxzml3j/ywxzml3juser40/data/insight_doc/arxiv_0307_sample/qa_gen/postprocess/veqa_batch_0350_mveqa_batch_0352/dpi200_aug_noaug_maxp40 \
+        --data_root /path/to/insight_doc_manifest_root \
         --split all \
         --prompt insight_qwen_agent \
-        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_veqa_batch_0350_mveqa_batch_0352_maxp40-insight_qwen_agent.parquet \
+        --output_path /path/to/output-insight_qwen_agent.parquet \
         --agent_name insight_qwen_agent \
         --num_workers 32 \
-        --extra_options "{\"manifest_file\": \"manifest.jsonl\"}" \
-        --test_size 0.2
-
-    python verl/recipe/vsearch/create_parquet_dataset.py \
-        --dataset InSightDoc0352 \
-        --data_root /home/ywxzml3j/ywxzml3juser40/data/insight_doc/arxiv_0307_sample/qa_gen/postprocess/veqa_batch_0350_mveqa_batch_0352/dpi200_aug_noaug_maxp40 \
-        --split all \
-        --prompt insight_qwen_agent \
-        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_veqa_batch_0350_mveqa_batch_0352_sample_50_maxp40-insight_qwen_agent.parquet \
-        --agent_name insight_qwen_agent \
-        --num_workers 32 \
-        --extra_options "{\"manifest_file\": \"manifest_sample_50.jsonl\"}"
-
-    python verl/recipe/vsearch/create_parquet_dataset.py \
-        --dataset InSightDoc0352 \
-        --data_root /home/ywxzml3j/ywxzml3juser40/data/insight_doc/arxiv_0307_sample/qa_gen/postprocess/veqa_batch_0350_mveqa_batch_0352/dpi200_aug_noaug_maxp40 \
-        --split all \
-        --prompt vreasoner \
-        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_veqa_batch_0350_mveqa_batch_0352_maxp40-vreasoner_v2.parquet \
-        --agent_name vreasoner_v2 \
-        --num_workers 32 \
-        --extra_options "{\"manifest_file\": \"manifest.jsonl\"}" \
-        --test_size 0.2
-
-    python verl/recipe/vsearch/create_parquet_dataset.py \
-        --dataset InSightDoc0352 \
-        --data_root /home/ywxzml3j/ywxzml3juser40/data/insight_doc/arxiv_0307_sample/qa_gen/postprocess/veqa_batch_0350_mveqa_batch_0352/dpi200_aug_noaug_maxp40 \
-        --split all \
-        --prompt vreasoner \
-        --output_path /scratch/ywxzml3j/likaican/temp/arxiv_0307_sample_veqa_batch_0350_mveqa_batch_0352_sample_50_maxp40-vreasoner_v2.parquet \
-        --agent_name vreasoner_v2 \
-        --num_workers 32 \
-        --extra_options "{\"manifest_file\": \"manifest_sample_50.jsonl\"}"
+        --extra_options "{"manifest_file": "manifest.jsonl"}"
     """
 
     parser = argparse.ArgumentParser()
