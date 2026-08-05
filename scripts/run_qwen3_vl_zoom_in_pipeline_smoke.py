@@ -47,11 +47,14 @@ import ray
 from hydra import compose, initialize_config_dir
 from PIL import Image
 
-# Ensure local companion repos are importable in this workspace.
+# Optional companion repos can be supplied explicitly without editing this script.
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE_SRC = REPO_ROOT.parent
-EXTRA_REPOS = (WORKSPACE_SRC / "InSight-o3", WORKSPACE_SRC / "Qwen-Agent")
-for extra_repo in EXTRA_REPOS:
+extra_repos = []
+for env_name in ("INSIGHT_O3_ROOT", "QWEN_AGENT_ROOT"):
+    value = os.environ.get(env_name)
+    if value:
+        extra_repos.append(Path(value).expanduser())
+for extra_repo in extra_repos:
     extra_repo_str = str(extra_repo)
     if extra_repo.exists() and extra_repo_str not in sys.path:
         sys.path.insert(0, extra_repo_str)

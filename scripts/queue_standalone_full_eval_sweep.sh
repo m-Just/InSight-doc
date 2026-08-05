@@ -4,12 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
-if [[ "${TELEGRAM_NOTIFY_ON_FINISH:-0}" == "1" && "${TELEGRAM_WRAPPED:-0}" != "1" && -x "$SCRIPT_DIR/run_with_telegram_notification.sh" ]]; then
-  export TELEGRAM_WRAPPED=1
-  exec "$SCRIPT_DIR/run_with_telegram_notification.sh" \
-    --label "${TELEGRAM_NOTIFY_LABEL:-standalone_full_eval_sweep}" \
-    -- "$0" "$@"
-fi
 
 cd "$REPO_ROOT"
 

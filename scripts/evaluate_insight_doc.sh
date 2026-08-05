@@ -17,7 +17,6 @@ export NUM_TRIALS="${NUM_TRIALS:-1}"
 export GROUP_VAL_FILES="${GROUP_VAL_FILES:-1}"
 export JUDGE_MODEL="${JUDGE_MODEL:-gpt-5-nano}"
 export INSIGHT_QWEN_JUDGE_MODE="${INSIGHT_QWEN_JUDGE_MODE:-legacy_prompt_v2}"
-export TELEGRAM_NOTIFY_ON_FINISH="${TELEGRAM_NOTIFY_ON_FINISH:-0}"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-$REPO_ROOT/outputs/eval/$(date -u +%Y%m%d_%H%M%S)}"
 
 echo "[eval] repo=$REPO_ROOT"
