@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insight-doc-release"
+version = "0.1.0"
+description = "InSight-Doc training and evaluation release wrapper"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["insight_agent_core*", "evals*"]

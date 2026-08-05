@@ -1,0 +1,24 @@
+# this config will override the default ppo_trainer.yaml
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  rollout:
+    name: vllm
+    mode: async
+    multi_turn:
+      enable: True
+      max_user_turns: 6
+      max_assistant_turns: 7
+      qwen_tool_list:
+        - image_zoom_in_tool_qwen3vl
+    agent:
+      _target_: verl.workers.config.AgentLoopConfig
+      default_agent_loop: insight_qwen_agent
+      agent_loop_config_path: "recipe/vsearch/config/agent_insight_qwen_agent.yaml"
