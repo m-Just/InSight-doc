@@ -1,3 +1,4 @@
 [submodule "verl"]
 	path = verl
 	url = git@github.com:m-Just/verl-public.git
+	branch = insight_doc
