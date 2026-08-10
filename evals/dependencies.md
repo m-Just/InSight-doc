@@ -10,10 +10,16 @@ The evaluator is intended to run against an already-available model endpoint or 
 
 ## Python Package Dependencies
 
-- `transformers`, `omegaconf`, `numpy`, `pandas`, `Pillow`, `tqdm`, and `pyarrow`.
-- `qwen-agent>=0.0.31` is required for the legacy VERL tool-agent training path.
-- Ray/vLLM packages are required only for the `ray_vllm` backend.
-- The `openai` Python SDK is required for HTTPS model or judge backends.
+Install the evaluation extra from the repository root:
+
+```bash
+pip install -e ".[eval]"
+pip install -e ./verl
+```
+
+The `eval` extra includes `transformers`, `omegaconf`, `numpy`, `pandas`,
+`Pillow`, `tqdm`, `pyarrow`, `openai`, `qwen-vl-utils`, `qwen-agent`, Ray,
+and vLLM. CUDA-sensitive packages must still match your local driver/runtime.
 
 ## Runtime Inputs
 

@@ -94,14 +94,21 @@ If you cloned without submodules, initialize them with:
 git submodule update --init --recursive
 ```
 
-Install the top-level package and the VERL backend in your CUDA/vLLM environment:
+Install the top-level package with the extras needed for evaluation, training, notebooks, and development, then install the pinned VERL backend:
 
 ```sh
-pip install -e .
+pip install -e ".[eval,train,notebooks,dev]"
 pip install -e ./verl
 ```
 
-The legacy VERL tool-agent path uses the `qwen-agent` Python package; it is installed as a normal pip dependency of this release package.
+For evaluation-only environments, use:
+
+```sh
+pip install -e ".[eval]"
+pip install -e ./verl
+```
+
+The legacy VERL tool-agent path uses the `qwen-agent` Python package; it is installed as a normal pip dependency of this release package. CUDA-sensitive packages such as `torch`, `vllm`, `flash-attn`, and Ray should be installed with wheels compatible with your cluster. The version ranges in `pyproject.toml` are based on the tested `vllm-latest` environment below.
 
 ### Tested Environment
 

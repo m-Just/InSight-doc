@@ -6,10 +6,25 @@ launcher, one evaluation launcher, and a few inspection/export tools.
 
 ## Environment
 
-Install the repository and the runtime dependencies required by your vLLM/verl
-environment. The launchers assume that `torchrun`, `ray`, `vllm`, `transformers`,
-`qwen-vl-utils`, `pyarrow`, `omegaconf`, `openai`, and `qwen-agent` are available.
-The release uses a local OpenAI-compatible helper and does not require external companion source checkouts.
+Install the release package with the extras for your use case, then install the
+pinned VERL backend submodule. For a full training/evaluation environment:
+
+```bash
+pip install -e ".[eval,train,notebooks,dev]"
+pip install -e ./verl
+```
+
+For evaluation-only environments:
+
+```bash
+pip install -e ".[eval]"
+pip install -e ./verl
+```
+
+The launchers assume that CUDA-compatible `torch`, `ray`, `vllm`, `flash-attn`,
+`transformers`, `qwen-vl-utils`, `pyarrow`, `omegaconf`, `openai`, and
+`qwen-agent` are available. The release uses a local OpenAI-compatible helper
+and does not require external companion source checkouts.
 
 ```bash
 export OPENAI_API_KEY=...                         # required for judge/reward
