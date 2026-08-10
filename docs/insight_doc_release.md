@@ -10,7 +10,7 @@ Install the release package with the extras for your use case, then install the
 pinned VERL backend submodule. For a full training/evaluation environment:
 
 ```bash
-pip install -e ".[eval,train,notebooks,dev]"
+pip install -e ".[eval,train]"
 pip install -e ./verl
 ```
 
