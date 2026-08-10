@@ -117,8 +117,8 @@ original training path.
 
 ## Useful Utilities
 
-- `scripts/export_conversation_image_source_bundle.py`: packs exported
-  conversations with source images for portable inspection.
+- `scripts/pack_exported_conversation_viewer.py`: packs exported
+  conversations with source images and a portable viewer notebook.
 - `scripts/evaluate_exported_conversation_trajectory_quality.py`: computes crop
   count, evidence-page/region hits, overlap, stuck-rate, and crop-area metrics
   when evidence metadata is available.
