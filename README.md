@@ -115,20 +115,6 @@ InSight-doc/
 
 `insight_agent_core/` is shared by the standalone evaluation path and the newer VERL wrapper agent. The released RL launcher still defaults to the legacy VERL `insight_qwen_agent` path to preserve the original checkpoint training setup; the `insight_qwen_agent_core` wrapper is included as a migration path for tighter training/evaluation alignment.
 
-## Data And Inspection
-
-The released SFT and RL datasets will be Hugging Face parquet datasets with embedded images, multimodal `messages`, `tools` where applicable, `data_source`, and metadata in `extra_info`.
-
-Useful viewers and analysis utilities:
-
-```sh
-jupyter lab notebooks/visualize_converted_sft_parquet.ipynb
-jupyter lab notebooks/visualize_rl_parquet.ipynb
-python scripts/evaluate_sft_trajectory_quality.py --help
-python scripts/evaluate_exported_conversation_trajectory_quality.py --help
-python scripts/export_conversation_image_source_bundle.py --help
-```
-
 ## License
 
 Recommended release plan: use **Apache-2.0** for code. Model and dataset licenses should be finalized separately on Hugging Face after source-data constraints are checked.
