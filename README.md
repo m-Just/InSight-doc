@@ -1,42 +1,48 @@
 <p align="center">
-  <img src="assets/insight_doc_logo.png" alt="InSight-doc" width="720">
+  <img alt="InSight-doc" src="assets/insight_doc_logo.png" width="650" style="max-width: 100%;">
 </p>
 
 <p align="center">
-  <a href="https://example.com/insight-doc-paper"><img src="https://img.shields.io/badge/Paper-coming%20soon-blue" alt="Paper"></a>
-  <a href="https://example.com/insight-doc-model"><img src="https://img.shields.io/badge/Model-coming%20soon-5c7cfa" alt="Model checkpoint"></a>
-  <a href="https://example.com/insight-doc-data"><img src="https://img.shields.io/badge/Datasets-coming%20soon-00a884" alt="Datasets"></a>
-  <a href="https://example.com/insight-doc-demo"><img src="https://img.shields.io/badge/Demo-coming%20soon-purple" alt="Demo"></a>
+  <strong>Tool-Augmented Visual Search for High-Resolution Long-Document Understanding</strong>
 </p>
 
-# InSight-doc
+<div align="center">
 
-InSight-doc is a document-understanding agent for high-resolution, long-context visual question answering. It combines a Qwen3-VL policy with an image zoom-in tool so the model can first inspect compressed document pages, then crop relevant regions before answering.
+🤗 **[Models and Datasets](https://example.com/insight-doc-hf-collection)** |
+📄 **[Paper](https://example.com/insight-doc-paper)** |
+🚀 **[Demo](https://example.com/insight-doc-demo)** |
+🌐 **[Project Page](https://example.com/insight-doc-project)**
 
-This repository packages the release code for:
+</div>
 
-- SFT and RL training of the InSight-doc agent.
-- Evaluation with local Ray/vLLM serving or OpenAI-compatible endpoints.
-- Conversation export, visualization, and trajectory-quality analysis.
-- Shared agent logic in `insight_agent_core/`, with a pinned VERL backend in `verl/`.
+## What's new
 
-## Resources
+- [x] [2026/08/10] Initial release repository prepared with training, evaluation, visualization, and data-conversion utilities.
+- [ ] Paper link coming soon.
+- [ ] Model checkpoints coming soon.
+- [ ] SFT/RL datasets coming soon.
+- [ ] Interactive demos coming soon.
 
-| Resource | Link |
-| --- | --- |
-| Paper | [Coming soon](https://example.com/insight-doc-paper) |
-| Project page | [Coming soon](https://example.com/insight-doc-project) |
-| Demo | [Coming soon](https://example.com/insight-doc-demo) |
-| Model checkpoint | [Coming soon](https://example.com/insight-doc-model) |
-| SFT dataset | [Coming soon](https://example.com/insight-doc-sft-data) |
-| RL dataset | [Coming soon](https://example.com/insight-doc-rl-data) |
+---
 
-## What Is Included
+**Long documents are information-dense, high-resolution, and often too large to inspect at full fidelity in a single model call.**
+InSight-doc is a document-understanding agent that combines a Qwen3-VL policy with an image zoom-in tool. The agent first reads compressed document pages, then selectively crops high-resolution regions before producing an answer.
+
+In this repository, we release the code for:
+
+- **Training** InSight-doc with supervised fine-tuning (SFT) and reinforcement learning (RL).
+- **Evaluating** checkpoints with a local Ray/vLLM backend or OpenAI-compatible endpoints.
+- **Exporting and visualizing** tool-use conversations for manual inspection.
+- **Analyzing trajectory quality**, including crop counts, evidence-page hits, overlap, stuck-rate, and crop-area metrics when evidence annotations are available.
+
+The code is organized as a lightweight release wrapper around a pinned [VERL](https://github.com/volcengine/verl) backend submodule. Release-facing agent and evaluation code lives at the repository root; backend training infrastructure lives under `verl/`.
+
+## Repository layout
 
 ```text
 InSight-doc/
 |-- insight_agent_core/     # Shared agent runtime, image handling, tool parsing, prompt-length logic
-|-- evals/                  # Rollout, vLLM/Ray backends, judging, metrics, and export code
+|-- evals/                  # Rollout, Ray/vLLM backends, judging, metrics, and export code
 |-- recipe/                 # Release training configs and dataset construction utilities
 |-- scripts/                # Public launchers and analysis/conversion utilities
 |-- notebooks/              # Notebook viewers for SFT/RL rows and exported conversations
@@ -44,42 +50,41 @@ InSight-doc/
 `-- verl/                   # Pinned VERL backend submodule with InSight-doc integration patches
 ```
 
-The top-level package is the intended public interface. The `verl/` submodule contains the modified training backend and is pinned to the commit used by this release.
-
 ## Installation
 
-Clone with submodules:
+Clone the repository with the pinned backend submodule:
 
-```bash
+```sh
 git clone --recurse-submodules https://github.com/m-Just/InSight-doc.git
 cd InSight-doc
 ```
 
-If you already cloned the repository without submodules:
+If you cloned without submodules, initialize them with:
 
-```bash
+```sh
 git submodule update --init --recursive
 ```
 
-Install the Python packages in your CUDA/vLLM environment:
+Install the top-level package and the VERL backend in your CUDA/vLLM environment:
 
-```bash
+```sh
 pip install -e .
 pip install -e ./verl
 ```
 
-The launchers assume that `torchrun`, `ray`, `vllm`, `transformers`, `qwen-vl-utils`, `pyarrow`, `omegaconf`, and `openai` are available. Depending on your setup, you may also need optional companion code roots:
+The launchers assume the following packages are available: `torch`, `ray`, `vllm`, `transformers`, `qwen-vl-utils`, `pyarrow`, `omegaconf`, and `openai`.
+Depending on your environment, you may also need to expose optional companion code roots:
 
-```bash
+```sh
 export INSIGHT_O3_ROOT=/path/to/InSight-o3        # optional, needed for legacy InSight-o3 paths
-export QWEN_AGENT_ROOT=/path/to/Qwen-Agent        # optional, needed if not installed as a package
+export QWEN_AGENT_ROOT=/path/to/Qwen-Agent        # optional, needed if Qwen-Agent is not installed
 ```
 
-## Quick Evaluation
+## Evaluation
 
 Evaluate a local Hugging Face checkpoint with the release Ray/vLLM backend:
 
-```bash
+```sh
 export MODEL_PATH=/path/to/hf_checkpoint
 export VAL_FILES='/path/to/longdocurl.parquet,/path/to/mmlongbench.parquet'
 export RESCALES='0.25 0.35 0.5'
@@ -90,19 +95,29 @@ export OPENAI_BASE_URL=https://.../v1
 bash scripts/evaluate_insight_doc.sh
 ```
 
-By default this uses:
+By default, evaluation uses:
 
 - `evals/model_configs/release_ray_vllm.yaml` for local Ray/vLLM serving.
 - `evals/agent_configs/insight_qwen_agent_core_zoom_factor2_area3500_rescale025.yaml` for the agent/tool configuration.
 - `gpt-5-nano` through an OpenAI-compatible judge endpoint.
 
-Generated conversations, scores, and sweep summaries are written under `outputs/eval/` unless `OUTPUT_ROOT` is set.
+Outputs are written under `outputs/eval/` unless `OUTPUT_ROOT` is set. The evaluator exports both machine-readable scores and inspectable conversations:
 
-## SFT Training
+- `samples*.jsonl`: rollout records with prompts, responses, tool calls, timing, and score fields.
+- `exported_conversations/`: conversation JSON files with image references for manual inspection.
+- `eval_summary*.tsv`: benchmark-level and trial-level summary tables.
 
-The release SFT launcher trains Qwen3-VL with full-parameter SFT, a frozen vision tower, and the same data fields used by the released SFT dataset.
+For more detailed evaluation settings, see [`docs/insight_doc_release.md`](docs/insight_doc_release.md).
 
-```bash
+## Training
+
+We provide separate launchers for SFT and RL. Both expect VERL-compatible parquet files and use the top-level wrapper scripts rather than scripts inside the `verl/` submodule.
+
+### Supervised fine-tuning
+
+The SFT launcher trains Qwen3-VL with full-parameter SFT, a frozen vision tower, and the same data fields used by the released SFT dataset.
+
+```sh
 TRAIN_FILES='[/path/to/sft_train.parquet]' \
 VAL_FILES='[/path/to/sft_val.parquet]' \
 OUTPUT_ROOT=/path/to/runs/sft \
@@ -112,17 +127,17 @@ NPROC_PER_NODE=8 \
 bash scripts/train_sft_qwen3vl_insight_doc.sh
 ```
 
-The default key settings are max sequence length 65,536, sequence parallel size 4, global batch size 32, cosine LR `5e-6 -> 5e-7`, and two epochs. Checkpoints are exported to:
+Default key settings: max sequence length 65,536, sequence parallel size 4, global batch size 32, cosine LR `5e-6 -> 5e-7`, and two epochs. Checkpoints are exported to:
 
 ```text
 $OUTPUT_ROOT/$EXP_NAME/sft_checkpoints/global_step_*/huggingface
 ```
 
-## RL Training
+### Reinforcement learning
 
 The RL launcher starts from an SFT checkpoint and trains the InSight Qwen agent loop with the image zoom-in tool and weighted refill source sampling.
 
-```bash
+```sh
 MODEL_PATH=/path/to/sft_hf_checkpoint \
 TRAIN_FILES='[/path/to/rl_train.parquet]' \
 VAL_FILES='[/path/to/eval_a.parquet,/path/to/eval_b.parquet]' \
@@ -139,43 +154,45 @@ The release sampling weights are stored in:
 recipe/vsearch/config/insight_doc_rl_sampling_weights_release.yaml
 ```
 
-See `docs/insight_doc_release.md` for more detailed training and evaluation settings.
+For additional training details, see [`docs/insight_doc_release.md`](docs/insight_doc_release.md).
 
-## Data Format
+## Data
 
-The released SFT and RL datasets will be published as Hugging Face datasets. The training code expects parquet rows with the standard VERL-compatible fields used in this repository, including multimodal `messages`, embedded `images`, `tools` where applicable, `data_source`, and task metadata in `extra_info`.
+The released SFT and RL datasets will be published on Hugging Face:
 
-For inspection and debugging, use:
+- SFT dataset: [coming soon](https://example.com/insight-doc-sft-data)
+- RL dataset: [coming soon](https://example.com/insight-doc-rl-data)
 
-```bash
+The training code expects parquet rows with VERL-compatible fields used in this repository, including multimodal `messages`, embedded `images`, `tools` where applicable, `data_source`, and task metadata in `extra_info`.
+
+To inspect released or locally constructed data, open:
+
+```sh
 jupyter lab notebooks/visualize_converted_sft_parquet.ipynb
 jupyter lab notebooks/visualize_rl_parquet.ipynb
 ```
 
-## Evaluation Outputs
+## Useful utilities
 
-Evaluation produces both machine-readable metrics and inspectable conversations:
-
-- `samples*.jsonl`: rollout records with prompts, responses, tool calls, timing, and score fields.
-- `exported_conversations/`: conversation JSON files with image references for manual inspection.
-- `eval_summary*.tsv`: benchmark-level and trial-level summary tables.
-
-Useful utilities:
-
-```bash
+```sh
 python scripts/export_conversation_image_source_bundle.py --help
 python scripts/evaluate_exported_conversation_trajectory_quality.py --help
 python scripts/evaluate_sft_trajectory_quality.py --help
+python scripts/eval_sweep.py --help
 ```
 
-## Development Notes
+The notebook [`notebooks/visualize_vreasoner_v2_export.ipynb`](notebooks/visualize_vreasoner_v2_export.ipynb) can be used to browse exported conversations.
 
-- The top-level `insight_agent_core/` is shared by the eval path and the newer VERL wrapper agent.
-- The released RL launcher still defaults to the legacy VERL `insight_qwen_agent` rollout path to preserve the checkpoint training setup.
+## Development notes
+
+- `insight_agent_core/` is shared by the evaluation path and the newer VERL wrapper agent.
+- The released RL launcher still defaults to the legacy VERL `insight_qwen_agent` rollout path to preserve the original checkpoint training setup.
 - The `insight_qwen_agent_core` VERL wrapper is included as a migration path for tighter training/evaluation alignment.
-- The `verl/` submodule should be treated as backend infrastructure; release-facing scripts and configs live at the repository root.
+- `verl/` should be treated as backend infrastructure. Release-facing scripts and configs live at the repository root.
 
 ## Citation
+
+If you find this repository useful, please consider citing our paper:
 
 ```bibtex
 @article{insightdoc2026,
@@ -189,4 +206,4 @@ python scripts/evaluate_sft_trajectory_quality.py --help
 
 ## License
 
-License information for the InSight-doc release will be added before public release. The bundled VERL backend is provided as a submodule; see `verl/LICENSE` for the VERL license.
+License information for the InSight-doc release will be added before public release. The bundled VERL backend is provided as a submodule; see [`verl/LICENSE`](verl/LICENSE) for the VERL license.
