@@ -6,18 +6,10 @@ launcher, one evaluation launcher, and a few inspection/export tools.
 
 ## Environment
 
-Install the release package with the extras for your use case, then install the
-pinned VERL backend submodule. For a full training/evaluation environment:
+Install the release package, then install the pinned VERL backend submodule:
 
 ```bash
-pip install -e ".[eval,train]"
-pip install -e ./verl
-```
-
-For evaluation-only environments:
-
-```bash
-pip install -e ".[eval]"
+pip install -e .
 pip install -e ./verl
 ```
 

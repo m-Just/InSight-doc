@@ -10,16 +10,14 @@ The evaluator is intended to run against an already-available model endpoint or 
 
 ## Python Package Dependencies
 
-Install the evaluation extra from the repository root:
+Install the package from the repository root:
 
 ```bash
-pip install -e ".[eval]"
+pip install -e .
 pip install -e ./verl
 ```
 
-The `eval` extra includes `transformers`, `omegaconf`, `numpy`, `pandas`,
-`Pillow`, `tqdm`, `pyarrow`, `openai`, `qwen-vl-utils`, `qwen-agent`, Ray,
-and vLLM. CUDA-sensitive packages must still match your local driver/runtime.
+The base package includes evaluation, training, notebook, conversion, and development dependencies. CUDA-sensitive packages such as `torch`, `vllm`, and `flash-attn` must still match your local driver/runtime.
 
 ## Runtime Inputs
 

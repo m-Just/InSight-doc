@@ -94,17 +94,10 @@ If you cloned without submodules, initialize them with:
 git submodule update --init --recursive
 ```
 
-Install the top-level package with the extras needed for evaluation and training, then install the pinned VERL backend:
+Install the top-level package, then install the pinned VERL backend:
 
 ```sh
-pip install -e ".[eval,train]"
-pip install -e ./verl
-```
-
-For evaluation-only environments, use:
-
-```sh
-pip install -e ".[eval]"
+pip install -e .
 pip install -e ./verl
 ```
 
