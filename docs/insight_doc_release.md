@@ -126,8 +126,6 @@ original training path.
   SFT parquets.
 - `notebooks/visualize_vreasoner_v2_export.ipynb`: browse exported eval
   conversations.
-- `notebooks/visualize_converted_sft_parquet.ipynb`: inspect SFT-format rows.
-- `notebooks/visualize_rl_parquet.ipynb`: inspect RL-format rows.
 
 Historical one-off experiment launchers are intentionally not part of the public
 API. Use the release launchers above for reproducible runs.
