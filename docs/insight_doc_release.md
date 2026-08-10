@@ -124,7 +124,7 @@ original training path.
   when evidence metadata is available.
 - `scripts/evaluate_sft_trajectory_quality.py`: computes analogous metrics for
   SFT parquets.
-- `notebooks/visualize_vreasoner_v2_export.ipynb`: browse exported eval
+- `notebooks/visualize_exported_conversations.ipynb`: browse exported eval
   conversations.
 
 Historical one-off experiment launchers are intentionally not part of the public
