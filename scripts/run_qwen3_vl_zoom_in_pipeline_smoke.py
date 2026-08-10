@@ -47,14 +47,9 @@ import ray
 from hydra import compose, initialize_config_dir
 from PIL import Image
 
-# Optional companion repos can be supplied explicitly without editing this script.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VERL_ROOT = Path(os.environ.get("VERL_ROOT", REPO_ROOT / "verl")).resolve()
 extra_repos = [REPO_ROOT, VERL_ROOT]
-for env_name in ("INSIGHT_O3_ROOT", "QWEN_AGENT_ROOT"):
-    value = os.environ.get(env_name)
-    if value:
-        extra_repos.append(Path(value).expanduser())
 for extra_repo in extra_repos:
     extra_repo_str = str(extra_repo)
     if extra_repo.exists() and extra_repo_str not in sys.path:

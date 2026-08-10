@@ -13,10 +13,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 VERL_ROOT = Path(os.environ.get("VERL_ROOT", REPO_ROOT / "verl")).resolve()
 extra_paths = [REPO_ROOT, VERL_ROOT]
-for env_name in ("INSIGHT_O3_ROOT", "QWEN_AGENT_ROOT"):
-    value = os.getenv(env_name)
-    if value:
-        extra_paths.append(Path(value).expanduser())
 
 for extra_path in extra_paths:
     if extra_path.exists() and str(extra_path) not in sys.path:

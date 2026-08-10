@@ -173,23 +173,16 @@ class OpenAIChatEndpointPool:
         send_tool_schema: bool = True,
         coerce_tool_role_to_user: bool = False,
     ) -> None:
-        from insight_o3.utils import api as insight_api
+        from insight_agent_core.openai_api import create_async_openai_client, complete_chat_and_maybe_log
 
-        if insight_api.log_chat_completion is None:
-            try:
-                from insight_o3.utils.api_logger import log_chat_completion
-            except Exception as exc:
-                raise RuntimeError("API logging is required for HTTPS generation but api_logger is unavailable") from exc
-            insight_api.log_chat_completion = log_chat_completion
-
-        client = insight_api.create_async_openai_client(
+        client = create_async_openai_client(
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
         )
         self.client = client.with_options(max_retries=max_retries)
-        self.complete_chat_and_maybe_log = insight_api.complete_chat_and_maybe_log
-        self.api_logging_enabled = insight_api.log_chat_completion is not None
+        self.complete_chat_and_maybe_log = complete_chat_and_maybe_log
+        self.api_logging_enabled = False
         self.base_url = base_url
         self.model = model
         self.timeout = timeout
@@ -200,7 +193,7 @@ class OpenAIChatEndpointPool:
         self.send_tool_schema = send_tool_schema
         self.coerce_tool_role_to_user = coerce_tool_role_to_user
         print(
-            "https_openai_chat api_stack_ready "
+            "https_openai_chat local_api_stack_ready "
             f"base_url={base_url} model={model} api_logging_enabled={self.api_logging_enabled} "
             f"image_detail={self.image_detail} reasoning_effort={self.reasoning_effort}",
             flush=True,

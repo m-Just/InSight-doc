@@ -261,22 +261,16 @@ def build_https_export_record(
 
 
 async def create_https_client(args: argparse.Namespace):
-    from insight_o3.utils import api as insight_api
+    from insight_agent_core.openai_api import create_async_openai_client, complete_chat_and_maybe_log
 
-    if insight_api.log_chat_completion is None:
-        try:
-            from insight_o3.utils.api_logger import log_chat_completion
-        except Exception as exc:
-            raise RuntimeError("API logging is required for HTTPS generation but api_logger is unavailable") from exc
-        insight_api.log_chat_completion = log_chat_completion
-    client = insight_api.create_async_openai_client(
+    client = create_async_openai_client(
         api_key=resolve_https_api_key(args),
         base_url=args.https_base_url,
         timeout=args.https_timeout,
     )
     if not isinstance(args.https_max_retries, NotGiven):
         client = client.with_options(max_retries=args.https_max_retries)
-    return client, insight_api.complete_chat_and_maybe_log
+    return client, complete_chat_and_maybe_log
 
 
 class HTTPSOpenAIChatBackend:
@@ -303,8 +297,8 @@ class HTTPSOpenAIChatBackend:
                 "image_format": args.https_image_format,
                 "image_detail": optional_https_string(args.https_image_detail),
                 "reasoning_effort": optional_https_string(args.https_reasoning_effort),
-                "api_stack": "insight_o3.utils.api",
-                "api_logging": "enabled_required",
+                "api_stack": "insight_agent_core.openai_api",
+                "api_logging": "disabled",
                 "api_key_env": args.https_api_key_env,
                 "api_key_provided": bool(os.getenv(args.https_api_key_env or "OPENAI_API_KEY")),
             }

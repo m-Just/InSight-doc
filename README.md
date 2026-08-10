@@ -101,12 +101,7 @@ pip install -e .
 pip install -e ./verl
 ```
 
-Optional companion repositories can be exposed explicitly when needed by legacy scripts:
-
-```sh
-export INSIGHT_O3_ROOT=/path/to/InSight-o3
-export QWEN_AGENT_ROOT=/path/to/Qwen-Agent
-```
+The legacy VERL tool-agent path uses the `qwen-agent` Python package; it is installed as a normal pip dependency of this release package.
 
 ### Tested Environment
 
@@ -125,6 +120,7 @@ The current release branch was tested in the `vllm-latest` conda environment:
 | PyArrow | 23.0.0 |
 | OmegaConf | 2.3.0 |
 | PEFT | 0.18.1 |
+| qwen-agent | 0.0.31 |
 
 CUDA, driver, and NCCL versions still need to match your cluster setup. For reproducible training, prefer using the same base image or conda environment across all nodes.
 

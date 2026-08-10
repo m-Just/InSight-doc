@@ -8,13 +8,10 @@ launcher, one evaluation launcher, and a few inspection/export tools.
 
 Install the repository and the runtime dependencies required by your vLLM/verl
 environment. The launchers assume that `torchrun`, `ray`, `vllm`, `transformers`,
-`qwen-vl-utils`, `pyarrow`, `omegaconf`, and `openai` are available.
-
-Optional external code roots can be supplied without editing scripts:
+`qwen-vl-utils`, `pyarrow`, `omegaconf`, `openai`, and `qwen-agent` are available.
+The release uses a local OpenAI-compatible helper and does not require external companion source checkouts.
 
 ```bash
-export INSIGHT_O3_ROOT=/path/to/InSight-o3        # optional
-export QWEN_AGENT_ROOT=/path/to/Qwen-Agent        # optional
 export OPENAI_API_KEY=...                         # required for judge/reward
 export OPENAI_BASE_URL=https://.../v1             # OpenAI-compatible endpoint
 ```

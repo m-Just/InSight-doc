@@ -5,14 +5,15 @@ The evaluator is intended to run against an already-available model endpoint or 
 ## Local Source Dependencies
 
 - This repository must be on `PYTHONPATH`.
-- If `insight_agent_core` / InSight-o3 utilities are checked out separately, set `INSIGHT_O3_ROOT=/path/to/InSight-o3`.
-- If Qwen-Agent utilities are required by your environment, set `QWEN_AGENT_ROOT=/path/to/Qwen-Agent`.
+- The pinned `verl/` submodule must be initialized for Ray/vLLM evaluation.
+- No external companion source checkout is required.
 
 ## Python Package Dependencies
 
 - `transformers`, `omegaconf`, `numpy`, `pandas`, `Pillow`, `tqdm`, and `pyarrow`.
+- `qwen-agent>=0.0.31` is required for the legacy VERL tool-agent training path.
 - Ray/vLLM packages are required only for the `ray_vllm` backend.
-- An OpenAI-compatible client stack is required only for HTTPS model or judge backends.
+- The `openai` Python SDK is required for HTTPS model or judge backends.
 
 ## Runtime Inputs
 
