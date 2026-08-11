@@ -1,0 +1,6 @@
+InSight-doc
+Copyright 2026 The InSight-doc Authors
+
+This repository includes a pinned VERL submodule under `verl/`.
+VERL is licensed under the Apache License, Version 2.0, with copyright
+notices retained in `verl/LICENSE` and `verl/Notice.txt`.

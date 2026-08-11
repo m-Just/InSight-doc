@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "InSight-doc training, evaluation, and agentic document-understanding utilities"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
+license = "Apache-2.0"
 keywords = [
     "document-understanding",
     "vision-language-models",
@@ -23,6 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
 ]
 dependencies = [
     "accelerate>=1.12.0",
