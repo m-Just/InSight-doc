@@ -17,7 +17,9 @@ pip install -e .
 pip install -e ./verl
 ```
 
-The base package includes evaluation, training, notebook, conversion, and development dependencies. CUDA-sensitive packages such as `torch`, `vllm`, and `flash-attn` must still match your local driver/runtime.
+The base package includes the dependencies needed by the released evaluation,
+training, conversion, and viewer utilities. CUDA-sensitive packages such as
+`torch`, `vllm`, and `flash-attn` must still match your local driver/runtime.
 
 ## Runtime Inputs
 

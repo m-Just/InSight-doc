@@ -108,7 +108,7 @@ InSight-doc/
 |-- evals/               # Rollout backends, judging, metrics, resume, and export code
 |-- recipe/              # Training configs and dataset construction utilities
 |-- scripts/             # Public launchers and conversion/analysis utilities
-|-- notebooks/           # Dataset and conversation viewers
+|-- notebooks/           # Exported conversation viewer
 |-- assets/              # README figures
 `-- verl/                # Pinned VERL backend submodule with InSight-doc patches
 ```
