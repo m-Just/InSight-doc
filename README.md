@@ -35,7 +35,10 @@ Human readers handle complex documents by *scanning broadly*, then *looking clos
   <img alt="InSight-doc teaser" src="assets/teaser.png" width="900" style="max-width: 100%;">
 </p>
 
-**Better performance at higher efficiency.** InSight-doc-8B improves over Qwen3-VL-8B by **4.3-16.4 accuracy points** under medium-to-low resolution (100 to 50 DPI), averaged over DUDE, MP-DocVQA, MMLongBench-Doc, and LongDocURL.
+## Results
+
+**Better performance at higher efficiency.**
+InSight-doc-8B improves over Qwen3-VL-8B by **4.3-16.4 accuracy points** under medium-to-low resolution (100 to 50 DPI), averaged over DUDE, MP-DocVQA, MMLongBench-Doc, and LongDocURL.
 
 On MMLongBench-Doc and LongDocURL, it reduces hallucination on unanswerable questions by **40%+** and lowers latency by **41%-68%** (**1.7x-3.1x speedup**) while maintaining an accuracy lead (see below).
 
@@ -43,7 +46,8 @@ On MMLongBench-Doc and LongDocURL, it reduces hallucination on unanswerable ques
   <img alt="Long-document efficiency comparison" src="assets/longdoc_efficiency.png" width="450" style="max-width: 100%;">
 </p>
 
-**Accuracy-efficiency tradeoff.** Across the four document VQA benchmarks, InSight-doc shifts the *Pareto frontier* upward and leftward, achieving **higher accuracy** with **shorter sequences** and **lower latency** (darker points indicate higher initial input DPI).
+**Improved accuracy-efficiency tradeoff.**
+Across the four document VQA benchmarks, InSight-doc shifts the *Pareto frontier* upward and leftward, achieving **higher accuracy** with **shorter sequences** and **lower latency** (darker points indicate higher initial input DPI).
 
 <p align="center">
   <img alt="Accuracy-efficiency Pareto frontier" src="assets/accuracy_efficiency_pareto.png" width="900" style="max-width: 100%;">
