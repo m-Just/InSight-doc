@@ -1,6 +1,6 @@
-# InSight-Doc Release Recipes
+# InSight-doc Release Recipes
 
-This repository is a small InSight-Doc release wrapper around a pinned `verl/`
+This repository is a small InSight-doc release wrapper around a pinned `verl/`
 submodule. The public surface is intentionally small: one SFT launcher, one RL
 launcher, one evaluation launcher, and a few inspection/export tools.
 
@@ -25,10 +25,10 @@ export OPENAI_BASE_URL=https://.../v1             # OpenAI-compatible endpoint
 
 ## SFT Training
 
-The released SFT checkpoint `sft_v2_ckpt1118` was trained as full-parameter SFT
-from `Qwen/Qwen3-VL-8B-Instruct`, with the vision tower frozen, sequence
-parallelism 4, max sequence length 65,536, global batch size 32, cosine LR
-`5e-6 -> 5e-7`, and two epochs.
+The SFT stage for InSight-doc-8B was trained as full-parameter SFT from
+`Qwen/Qwen3-VL-8B-Instruct`, with the vision tower frozen, sequence parallelism
+4, max sequence length 65,536, global batch size 32, cosine LR `5e-6 -> 5e-7`,
+and two epochs.
 
 Use released SFT-format parquet files with at least `messages` and `tools`
 columns. If the parquet has a `message_loss_mask` column, the launcher uses it
@@ -53,12 +53,10 @@ $OUTPUT_ROOT/$EXP_NAME/sft_checkpoints/global_step_*/huggingface
 
 ## RL Training
 
-The released RL checkpoint
-`rl_v4_unans014_mc_false_e05_arxiv_struct1k_legacy_prompt_v2_ckpt800` starts
-from the released SFT checkpoint and trains with the InSight Qwen agent loop,
-the image zoom-in tool, weighted refill source sampling, temperature 0.7,
-top-p 0.8, top-k 20, presence penalty 1.5, and 2,000 total RL steps. The final
-sampling weights are in:
+The released InSight-doc-8B checkpoint starts from the SFT checkpoint and trains
+with the InSight-doc Qwen agent loop, the image zoom-in tool, weighted refill
+source sampling, temperature 0.7, top-p 0.8, top-k 20, presence penalty 1.5,
+and 2,000 total RL steps. The final sampling weights are in:
 
 ```text
 recipe/vsearch/config/insight_doc_rl_sampling_weights_release.yaml
@@ -83,12 +81,13 @@ $WORK_DIR/ckpts/insight_doc/$EXP_NAME
 
 ## Evaluation
 
-The evaluator assumes the model is served through the included
-Ray/vLLM server wrapper or an OpenAI-compatible HTTPS endpoint. For local HF
-checkpoints, set `MODEL_PATH` and use the default release model config.
+The evaluator assumes the model is served through the included Ray/vLLM server
+wrapper or an OpenAI-compatible HTTPS endpoint. For the released checkpoint, set
+`MODEL_PATH=InSight-doc/InSight-doc-8B` and use the default release model
+config.
 
 ```bash
-MODEL_PATH=/path/to/hf_checkpoint \
+MODEL_PATH=InSight-doc/InSight-doc-8B \
 VAL_FILES='/path/to/dude.parquet,/path/to/longdocurl.parquet,/path/to/mmlongbench.parquet' \
 RESCALES='0.25 0.35 0.5' \
 EVAL_CUDA_VISIBLE_DEVICES=0,1,2,3 \
