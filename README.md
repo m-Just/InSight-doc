@@ -19,6 +19,12 @@
   <i>Understand the big picture.&nbsp; Focus on the right details.&nbsp; Answer from the evidence.</i>
 </p>
 
+<p align="center">
+  <a href="https://paperswithcode.co/api/v1/papers/2608.10628/leaderboard-badge-link?eval=26104">
+    <img src="https://paperswithcode.co/api/v1/papers/2608.10628/leaderboard-badge.svg?eval=26104&live=1" alt="Papers with Code: SOTA on MMLongBench-Doc">
+  </a>
+</p>
+
 ---
 
 ## Overview
