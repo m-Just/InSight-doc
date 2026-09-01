@@ -138,6 +138,10 @@ InSight-doc/
 
 `insight_agent_core/` is shared by the standalone evaluation path and the newer VERL wrapper agent. The released RL launcher still defaults to the legacy VERL `insight_qwen_agent` path to preserve the original checkpoint training setup; the `insight_qwen_agent_core` wrapper is included as a migration path for tighter training/evaluation alignment.
 
+## Limitations and Future Work
+
+While InSight-doc demonstrates the value of adaptive visual resolution, its role within a broader document agent remains underexplored. In practical large-scale settings, retrieval and text-based search can first narrow a large corpus to a high-recall set of candidate pages, while InSight-style perception can allocate higher resolution only to visually relevant regions, potentially allowing larger retrieval sets and richer neighboring context at manageable cost. Future work should therefore study InSight-style perception as part of a hybrid, code- or tool-driven general agent, and compare it with other strong alternatives under matched accuracy, latency, and compute budgets.
+
 ## License
 
 The code in this repository is released under the **Apache License 2.0**. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
